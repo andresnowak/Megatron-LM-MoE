@@ -24,6 +24,7 @@ from megatron.inference.utils import (
     get_model_for_inference,
 )
 from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
 
 # pylint: disable=line-too-long
 
@@ -202,12 +203,11 @@ if __name__ == "__main__":
     # enable inference mode in the very beginning as some fp8 optimizations
     # check for it.
     with torch.inference_mode():
-        initialize_megatron(
+        args = parse_and_validate_args(
             extra_args_provider=add_inference_args,
             args_defaults={'no_load_rng': True, 'no_load_optim': True},
         )
-
-        args = get_args()
+        initialize_megatron()
         tokenizer = get_tokenizer()
 
         # Sampling params.

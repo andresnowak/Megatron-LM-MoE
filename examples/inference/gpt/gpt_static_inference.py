@@ -30,6 +30,7 @@ from typing import List
 
 from examples.inference.gpt.utils import build_requests
 from megatron.inference.utils import add_inference_args, get_model_for_inference
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.initialize import initialize_megatron
 
@@ -121,7 +122,7 @@ def main():
 
     # Note: The default args passed here can be overwritten by using appropriate params (check arguments.py file)
     # Micro batch size is not needed to be set by user. (It is calculated based on inference-batch-times-seqlen-threshold argument)
-    initialize_megatron(
+    args = parse_and_validate_args(
         extra_args_provider=add_static_inference_args,
         args_defaults={
             'no_load_rng': True,
@@ -130,8 +131,7 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
-
-    args = get_args()
+    initialize_megatron()
 
     model = get_model_for_inference()
 

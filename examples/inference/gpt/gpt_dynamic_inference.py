@@ -49,6 +49,7 @@ import logging
 import megatron
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -279,10 +280,11 @@ def run_inference(
 def main():
     """Run dynamic inference."""
     # Initialize Megatron.
-    initialize_megatron(
+    args = parse_and_validate_args(
         extra_args_provider=add_inference_args,
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
+    initialize_megatron()
 
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
@@ -293,8 +295,6 @@ def main():
     logging.basicConfig(level=level, force=True)
 
     configure_nvtx_profiling(True)
-
-    args = get_args()
 
     # Build tokenizer
     tokenizer = build_tokenizer(args)
