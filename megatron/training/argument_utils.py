@@ -11,6 +11,21 @@ import builtins
 import ast
 import enum
 from dataclasses import Field, fields
+from argparse import Namespace
+
+from megatron.training.config import (
+    CheckpointConfig,
+    DistributedInitConfig,
+    LoggerConfig,
+    PretrainConfigContainer,
+    ProfilingConfig,
+    RNGConfig,
+    RerunStateMachineConfig,
+    SchedulerConfig,
+    StragglerDetectionConfig,
+    TrainingConfig,
+    ValidationConfig,
+)
 
 # TODO: support arg renames
 
@@ -248,3 +263,49 @@ class ArgumentGroupFactory:
                 field_docstrings.update(self._get_field_docstrings(base_classes[0]))
 
         return field_docstrings
+
+
+
+def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
+    """Create a config dataclass from matching values in an argparse namespace."""
+    kwargs = {f.name: getattr(args, f.name) for f in fields(cls) if hasattr(args, f.name)}
+    return cls(**kwargs) if return_instance else kwargs
+
+
+def pretrain_cfg_container_from_args(args: Namespace) -> PretrainConfigContainer:
+    """Build a :class:`PretrainConfigContainer` from parsed arguments."""
+    from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
+
+    ckpt_kwargs = _default_config_from_args(CheckpointConfig, args, return_instance=False)
+    ckpt_kwargs.update(
+        save_optim=not args.no_save_optim,
+        save_rng=not args.no_save_rng,
+        load_optim=not args.no_load_optim,
+        load_rng=not args.no_load_rng,
+        fully_parallel_save=args.ckpt_fully_parallel_save,
+        fully_parallel_load=args.ckpt_fully_parallel_load,
+    )
+
+    prof_kwargs = _default_config_from_args(ProfilingConfig, args, return_instance=False)
+    prof_kwargs["use_nsys_profiler"] = args.profile
+
+    rerunsm_kwargs = _default_config_from_args(RerunStateMachineConfig, args, return_instance=False)
+    rerunsm_kwargs["check_for_nan_in_loss"] = args.check_for_nan_in_loss_and_grad
+
+    optim_cfg, _ = get_megatron_optimizer_config(args)
+    ddp_config = get_megatron_ddp_config(args)
+
+    return PretrainConfigContainer(
+        train=_default_config_from_args(TrainingConfig, args),
+        validation=_default_config_from_args(ValidationConfig, args),
+        optimizer=optim_cfg,
+        scheduler=_default_config_from_args(SchedulerConfig, args),
+        ddp=ddp_config,
+        dist=_default_config_from_args(DistributedInitConfig, args),
+        rng=_default_config_from_args(RNGConfig, args),
+        logger=_default_config_from_args(LoggerConfig, args),
+        checkpoint=CheckpointConfig(**ckpt_kwargs),
+        profiling=ProfilingConfig(**prof_kwargs),
+        rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
+        straggler=_default_config_from_args(StragglerDetectionConfig, args),
+    )
