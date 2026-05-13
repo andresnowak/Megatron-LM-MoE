@@ -1571,22 +1571,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         config = get_model_config(model[0])
 
-        if getattr(args, "use_torch_fsdp2", False):
-            reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-            ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
-        else:
-            if args.ddp_num_buckets is not None:
-                assert args.ddp_bucket_size is None, \
-                    "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
-                assert args.ddp_num_buckets > 0, \
-                    "--ddp-num-buckets must be greater than 0"
-                bucket_size = num_parameters // args.ddp_num_buckets
-            else:
-                bucket_size = args.ddp_bucket_size
-
-            # Initialize DDPConfig.
-            ddp_config = get_megatron_ddp_config(args)
-            ddp_config.bucket_size = bucket_size
+        ddp_config = get_megatron_ddp_config(args)
+        if not getattr(args, "use_torch_fsdp2", False):
+            if ddp_config.num_buckets is not None:
+                ddp_config.bucket_size = num_parameters // ddp_config.num_buckets
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             # If bucket_size is not provided as an input, use sane default.
@@ -1718,6 +1706,10 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 
 def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallelConfig:
     """Return an MCore DDP config from Megatron's arguments."""
+    if getattr(args, "use_torch_fsdp2", False):
+        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
+        return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+
     ddp_fields = {f.name for f in dataclasses.fields(DistributedDataParallelConfig)}
     kwargs = {
         f.name: getattr(args, f.name)
@@ -1728,6 +1720,8 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         "grad_reduce_in_fp32": getattr(args, "accumulate_allreduce_grads_in_fp32", False),
         "check_for_nan_in_grad": getattr(args, "check_for_nan_in_loss_and_grad", False),
         "check_for_large_grads": getattr(args, "check_for_large_grads", False),
+        "num_buckets": getattr(args, "ddp_num_buckets", None),
+        "bucket_size": getattr(args, "ddp_bucket_size", None),
         "pad_buckets_for_high_nccl_busbw": getattr(args, "ddp_pad_buckets_for_high_nccl_busbw", False),
         "reduce_scatter_with_fp32_accumulation": getattr(
             args, "ddp_reduce_scatter_with_fp32_accumulation", False
@@ -1743,6 +1737,7 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
     }
     kwargs.update({name: value for name, value in overrides.items() if name in ddp_fields})
     return DistributedDataParallelConfig(**kwargs)
+
 
 
 def setup_model_and_optimizer(
