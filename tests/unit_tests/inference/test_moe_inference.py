@@ -15,6 +15,7 @@ import torch
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
+from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.initialize import _set_random_seed
@@ -57,6 +58,16 @@ NANOV3_BASE = dict(
     bf16=True,
     params_dtype=torch.bfloat16,
     transformer_impl="inference_optimized",
+    expert_tensor_parallel_size=1,
+    use_cpu_initialization=True,
+    attention_backend=AttnBackend.local,
+    cuda_graph_impl="local",
+    inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+    moe_pad_experts_for_cuda_graph_inference=False,
+    mamba_state_dim=128,
+    mamba_head_dim=64,
+    mamba_num_groups=8,
+    mamba_num_heads=64,
 )
 
 
@@ -350,7 +361,9 @@ class TestInferenceCUDAGraphTokenDispatcher:
             with torch.cuda.stream(s):
                 for _ in range(3):
                     dispatcher.routing_map = static_routing_map
-                    d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
+                    d_hidden, _, d_probs = dispatcher.token_dispatch(
+                        static_hidden, None, static_probs
+                    )
                     d_hidden = d_hidden.clone()
                     d_probs = d_probs.clone()
                     dispatcher.routing_map = dispatcher.routing_map.clone()
@@ -361,7 +374,7 @@ class TestInferenceCUDAGraphTokenDispatcher:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             dispatcher.routing_map = static_routing_map
-            d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
+            d_hidden, _, d_probs = dispatcher.token_dispatch(static_hidden, None, static_probs)
             graph_hidden = d_hidden.clone()
             graph_probs = d_probs.clone()
             graph_routing_map = dispatcher.routing_map.clone()
