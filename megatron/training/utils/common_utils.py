@@ -13,6 +13,17 @@ import torch
 
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
+from megatron.core._slurm_utils import resolve_slurm_local_rank
+try:
+    from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+except ImportError:
+    def has_nvrx_async_support():
+        """Return whether the optional NVRx async checkpointing package is available."""
+        try:
+            import nvidia_resiliency_ext  # noqa: F401
+            return True
+        except (ImportError, ModuleNotFoundError):
+            return False
 
 try:
     from transformer_engine.pytorch.optimizers import multi_tensor_applier, multi_tensor_l2norm
@@ -536,24 +547,6 @@ def get_device_arch_version():
     return torch.cuda.get_device_properties(torch.device("cuda:0")).major
 
 
-def append_to_progress_log(string, barrier=True):
-    """Append given string to progress log."""
-    args = get_args()
-    if args.save is None:
-        return
-    progress_log_filename = os.path.join(args.save, "progress.txt")
-    if barrier:
-        torch.distributed.barrier()
-    if torch.distributed.get_rank() == 0:
-        with open_file(progress_log_filename, 'a') as f:
-            job_id = os.getenv('SLURM_JOB_ID', '')
-            num_gpus = args.world_size
-            f.write(
-                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\tJob ID: {job_id}\t"
-                f"# GPUs: {num_gpus}\t{string}\n"
-            )
-
-
 def get_blend_and_blend_per_split(args):
     """Get blend and blend_per_split from passed-in arguments."""
     use_data_path = args.data_path is not None or args.data_args_path is not None
@@ -916,6 +909,22 @@ def get_nvtx_range():
         def dummy_range(msg, time=False, log_level=1):
             yield
         return dummy_range
+
+
+def has_nvrx_checkpointing_async_support():
+    """Checks whether the installed NVRx package exposes async checkpointing."""
+    return has_nvrx_async_support()
+
+
+def get_local_rank_preinit() -> int:
+    """Get local rank before distributed initialization."""
+    if "LOCAL_RANK" in os.environ:
+        return int(os.environ["LOCAL_RANK"])
+    slurm_local_rank = resolve_slurm_local_rank()
+    if slurm_local_rank is not None:
+        return slurm_local_rank
+    warnings.warn("Could not determine local rank from LOCAL_RANK or SLURM_LOCALID. Defaulting to local rank 0.")
+    return 0
 
 
 def has_nvrx_installed():

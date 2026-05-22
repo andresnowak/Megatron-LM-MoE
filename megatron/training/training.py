@@ -145,6 +145,7 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_rank,
     StragglerDetector,
+    unwrap_model,
 )
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -253,7 +254,6 @@ from .utils import (
     print_rank_last,
     report_memory,
     report_host_memory,
-    unwrap_model,
     update_use_dist_ckpt,
     to_empty_if_meta_device,
 )
@@ -1014,7 +1014,7 @@ def pretrain(
 
 
     if cfg_container.logger.log_progress:
-        append_to_progress_log("Starting job")
+        append_to_progress_log(args.save, "Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
@@ -2609,6 +2609,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
     append_to_progress_log(
+        args.save,
         f"{saved_ckpt_prefix}\tIteration: {iteration}\t"
         f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
         f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
