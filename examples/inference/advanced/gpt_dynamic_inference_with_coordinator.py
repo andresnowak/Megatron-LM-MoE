@@ -12,7 +12,7 @@ from typing import List
 import torch
 import torch.distributed as dist
 
-from examples.inference.gpt.utils import Request, build_dynamic_engine_setup_prefix, build_requests
+from examples.inference.utils import Request, build_dynamic_engine_setup_prefix, build_requests
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
