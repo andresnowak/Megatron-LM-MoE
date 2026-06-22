@@ -2242,6 +2242,14 @@ def _add_inference_args(parser):
                        help='Dtype for the Mamba inference SSM states tensor')
     group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
+    group.add_argument('--inference-shards', type=str, default=None, metavar='SPEC',
+                       help='Partition the world into independent inference models, each with '
+                            'its own parallelism, e.g. "tp=2,role=prefill+tp=1,dp=2,role=decode". '
+                            'Shards are separated by "+" or ";"; per-shard keys are '
+                            'tp,pp,ep,expt_tp,dp (each defaults to 1) and must partition the full '
+                            'world. Tagging shards role=prefill|decode enables disaggregated '
+                            'inference (prefill hands KV to the decode pool); a dp>1 decode shard '
+                            'is several independent decode instances.')
     return parser
 
 
