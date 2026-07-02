@@ -1516,15 +1516,28 @@ def validate_args(args, defaults={}):
             assert not args.overlap_param_gather, (
                 "md_decoupling without --use-layer-wise-distributed-optimizer does not support "
                 "--overlap-param-gather; enable the layer-wise optimizer.")
-        gains_enabled = (
-            args.hypersphere_gains_mode is not None
-            or args.hypersphere_gains_mode_output is not None
-            or args.hypersphere_gains_mode_embedding is not None
-        )
+        gains_overrides = [
+            name
+            for name in (
+                "hypersphere_gains_mode_output",
+                "hypersphere_gains_mode_embedding",
+                "hypersphere_gains_mode_router",
+            )
+            if getattr(args, name, None) not in (None, "none")
+        ]
+        assert args.hypersphere_gains_mode is not None or not gains_overrides, (
+            "md_decoupling gains overrides require --hypersphere-gains-mode to be used; got "
+            f"{', '.join(gains_overrides)}.")
+        gains_enabled = args.hypersphere_gains_mode is not None
         if gains_enabled:
             assert args.ckpt_format == "torch", (
                 "md_decoupling with learnable gains requires --ckpt-format torch (gain state "
                 "tensors differ in shape from their parameter, which torch_dist cannot round-trip).")
+        if args.gains_no_clamp_min and args.gain_parametrization == "softplus":
+            warn_rank_0(
+                "--gains-no-clamp-min has little effect with --gain-parametrization softplus; "
+                "softplus gains are positive, so the clamp only changes values below 1e-8."
+            )
         assert not (args.hypersphere_scale_out_proj_init and args.residual_output_scaling), (
             "--hypersphere-scale-out-proj-init and --residual-output-scaling both apply the "
             "1/sqrt(2*num_layers) residual-branch depth scaling to the out-projections (the first "
@@ -2647,10 +2660,10 @@ def _add_training_args(parser):
     group.add_argument('--gains-lr', type=float, default=None,
                        help='Absolute LR for the per-axis gains AdamW under md_decoupling. When '
                        'unset, falls back to --lr (and still tracks the schedule shape of --lr).')
-    group.add_argument('--gain-parametrization', type=str, default='direct',
+    group.add_argument('--gain-parametrization', type=str, default='softplus',
                        choices=['direct', 'softplus'],
                        help='Reparametrize the stored gain g; effective multiplier is phi(g). '
-                       '"direct" (default) keeps phi(g)=g. "softplus" uses phi(g)=softplus(g) '
+                       '"direct" keeps phi(g)=g. "softplus" (default) uses phi(g)=softplus(g) '
                        '(always positive). Applied uniformly to row/col/flat gains.')
     group.add_argument('--gains-no-clamp-min', action='store_true', default=False,
                        help='Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in '
