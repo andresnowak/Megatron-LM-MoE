@@ -401,6 +401,34 @@ class MegatronOptimizer(ABC):
                         state_dict[k] = v.cuda()
 
     @staticmethod
+    def _param_group_key(group: Dict) -> Tuple[Any, ...]:
+        return tuple(
+            group[key] if key in group else group[f"pre_{key}"]
+            for key in param_group_identifier_keys
+        )
+
+    @classmethod
+    def _assert_unique_param_group_keys(
+        cls, groups: List[Dict], source: str
+    ) -> List[Tuple[Any, ...]]:
+        keys = [cls._param_group_key(group) for group in groups]
+        seen = set()
+        duplicates = []
+        for key in keys:
+            if key in seen and key not in duplicates:
+                duplicates.append(key)
+            seen.add(key)
+        if duplicates:
+            duplicate_keys = "\n".join(str(key) for key in duplicates)
+            raise ValueError(
+                f"Cannot match optimizer parameter groups from {source}: "
+                f"param-group identity keys {param_group_identifier_keys} are not unique.\n"
+                f"Duplicate keys:\n{duplicate_keys}\n"
+                "Add a disambiguating key before resuming."
+            )
+        return keys
+
+    @staticmethod
     def _filter_and_reorder_param_groups(
         current_groups: List[Dict], state_dict_groups: List[Dict]
     ) -> List[Dict]:
@@ -419,23 +447,17 @@ class MegatronOptimizer(ABC):
             ValueError: If parameter groups in state dict don't match current optimizer.
         """
         # Define groups order that is needed in the current optimizer (coming from runtime)
-        needed_groups = [
-            # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-            tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
-            for g in current_groups
-        ]
+        needed_groups = MegatronOptimizer._assert_unique_param_group_keys(
+            current_groups, "current optimizer"
+        )
+        state_dict_group_keys = MegatronOptimizer._assert_unique_param_group_keys(
+            state_dict_groups, "loaded checkpoint"
+        )
 
         # Keep state_dict param group order since groups are LocalNonpersistentObject
         # and their order is determined at runtime, not from the checkpoint.
         params_in_state_dict_order = [g['params'] for g in state_dict_groups]
-        loaded_groups_map = {
-            tuple(
-                # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-                group[key] if key in group else group[f"pre_{key}"]
-                for key in param_group_identifier_keys
-            ): group
-            for group in state_dict_groups
-        }
+        loaded_groups_map = dict(zip(state_dict_group_keys, state_dict_groups))
 
         final_groups = []
         for key, params in zip(needed_groups, params_in_state_dict_order):
@@ -917,25 +939,13 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             fp32_from_float16_params_key = 'fp32_from_fp16'
         saved_fp32_groups = state_dict[fp32_from_float16_params_key]
 
-        def _group_key(g):
-            return tuple(
-                g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys
-            )
-
         if len(saved_fp32_groups) == len(saved_param_groups):
             key_to_fp32 = {
-                _group_key(g): fp32 for g, fp32 in zip(saved_param_groups, saved_fp32_groups)
+                self._param_group_key(g): fp32
+                for g, fp32 in zip(saved_param_groups, saved_fp32_groups)
             }
-            # Refuse to guess if the identity keys don't uniquely map groups — loading a
-            # mismatched-but-same-shape master weight would silently corrupt training.
-            assert len(key_to_fp32) == len(saved_fp32_groups), (
-                "Cannot reorder fp32 master params on load: param-group identity keys "
-                f"{param_group_identifier_keys} are not unique across the "
-                f"{len(saved_fp32_groups)} groups ({len(key_to_fp32)} unique). Add a "
-                "disambiguating key before resuming."
-            )
             saved_fp32_groups = [
-                key_to_fp32[_group_key(g)] for g in self.optimizer.param_groups
+                key_to_fp32[self._param_group_key(g)] for g in self.optimizer.param_groups
             ]
 
         for current_group, saved_group in zip(self.fp32_from_float16_groups, saved_fp32_groups):

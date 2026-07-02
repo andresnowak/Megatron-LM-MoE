@@ -35,6 +35,7 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_torch_version, is_torch_min_version
 
@@ -588,7 +589,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         and not args.no_save_optim
         and optimizer is not None
         and not optimizer.is_stub_optimizer
-        and hasattr(optimizer, "save_state_dict_to_file")
+        and isinstance(optimizer, LayerWiseDistributedOptimizer)
     ):
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
@@ -1934,7 +1935,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 ckpt_format == 'torch'
                 and optimizer is not None
                 and not optimizer.is_stub_optimizer
-                and hasattr(optimizer, "load_state_dict_from_file")
+                and isinstance(optimizer, LayerWiseDistributedOptimizer)
             ):
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
                 dp_rank = mpu.get_data_parallel_rank()

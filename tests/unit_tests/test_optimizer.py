@@ -23,6 +23,7 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -97,6 +98,33 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
     assert pg0['is_decoupled_lr'] == False
     assert pg0['max_lr'] == 0.01  # from the optimizer config default for lr
     assert pg0['min_lr'] is None  # from the optimizer config default.
+
+
+def test_filter_and_reorder_param_groups_rejects_duplicate_identity_keys():
+    group_a = {
+        'params': [0],
+        'wd_mult': 1.0,
+        'lr_mult': 1.0,
+        'is_expert_parallel': False,
+        'is_decoupled_lr': False,
+    }
+    group_b = {
+        'params': [1],
+        'wd_mult': 0.0,
+        'lr_mult': 1.0,
+        'is_expert_parallel': False,
+        'is_decoupled_lr': False,
+    }
+
+    with pytest.raises(ValueError, match="loaded checkpoint"):
+        MegatronOptimizer._filter_and_reorder_param_groups(
+            [group_a, group_b], [group_a, {**group_a, 'params': [2]}]
+        )
+
+    with pytest.raises(ValueError, match="current optimizer"):
+        MegatronOptimizer._filter_and_reorder_param_groups(
+            [group_a, {**group_a, 'params': [2]}], [group_a, group_b]
+        )
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
