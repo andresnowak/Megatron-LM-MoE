@@ -341,11 +341,17 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     # this breaks dist checkpointing assumption since extract_sharded_base drop list structure
     # for now, we convert it to dict with index as key and convert back in load_state_dict
     def load_state_dict(self, state_dict):
+        # ChainedOptimizer.state_dict() is a plain dict when there's a single
+        # sub-optimizer but a LIST (one entry per sub-optimizer) when there are
+        # several — so normalize to a list of sub-dicts before iterating (the old
+        # `.values()` crashed on the multi-optimizer list, which md_decoupling hits).
         if len(self.chained_optimizers) == 1:
-            wrapped_state_dict = {1: state_dict}
+            sub_state_dicts = [state_dict]
+        elif isinstance(state_dict, dict):
+            sub_state_dicts = state_dict.values()
         else:
-            wrapped_state_dict = state_dict
-        for sd in wrapped_state_dict.values():
+            sub_state_dicts = state_dict
+        for sd in sub_state_dicts:
             if 'fp32_from_fp16_params' in sd and isinstance(sd['fp32_from_fp16_params'], dict):
                 logger.info('[layerwise] converting fp32_from_fp16_params from dict to list')
                 sd['fp32_from_fp16_params'] = [

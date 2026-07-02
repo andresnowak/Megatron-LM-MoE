@@ -883,9 +883,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             common_step = state_dict[optimizer_key]['state'].pop('common_step')
             self._restore_common_per_param_step(state_dict[optimizer_key], common_step)
 
-        # Filter and reorder param groups to match current optimizer
+        # Filter and reorder param groups to match current optimizer. Keep a reference
+        # to the SAVED (pre-reorder) group order — the fp32 master-param copy below is
+        # stored in this order and must be reordered the same way.
+        saved_param_groups = state_dict[optimizer_key]['param_groups']
         state_dict[optimizer_key]['param_groups'] = self._filter_and_reorder_param_groups(
-            self.optimizer.param_groups, state_dict[optimizer_key]['param_groups']
+            self.optimizer.param_groups, saved_param_groups
         )
         self.optimizer.load_state_dict(state_dict[optimizer_key])
 
@@ -903,13 +906,39 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                     'Skipping loading grad scaler ...'
                 )
 
-        # Copy data for the main params.
+        # Copy data for the main params. `self.fp32_from_float16_groups` is in the
+        # CURRENT param-group order, but the saved fp32 master params are stored in the
+        # SAVED order (1:1 with `saved_param_groups`). `param_groups` were reordered to
+        # the current order above, so this list must be reordered the SAME way — else a
+        # param gets its master weights from a differently-ordered saved group, which
+        # crashes on a shape mismatch or (worse) silently loads the wrong state.
         fp32_from_float16_params_key = 'fp32_from_fp16_params'
         if fp32_from_float16_params_key not in state_dict:
             fp32_from_float16_params_key = 'fp32_from_fp16'
-        for current_group, saved_group in zip(
-            self.fp32_from_float16_groups, state_dict[fp32_from_float16_params_key]
-        ):
+        saved_fp32_groups = state_dict[fp32_from_float16_params_key]
+
+        def _group_key(g):
+            return tuple(
+                g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys
+            )
+
+        if len(saved_fp32_groups) == len(saved_param_groups):
+            key_to_fp32 = {
+                _group_key(g): fp32 for g, fp32 in zip(saved_param_groups, saved_fp32_groups)
+            }
+            # Refuse to guess if the identity keys don't uniquely map groups — loading a
+            # mismatched-but-same-shape master weight would silently corrupt training.
+            assert len(key_to_fp32) == len(saved_fp32_groups), (
+                "Cannot reorder fp32 master params on load: param-group identity keys "
+                f"{param_group_identifier_keys} are not unique across the "
+                f"{len(saved_fp32_groups)} groups ({len(key_to_fp32)} unique). Add a "
+                "disambiguating key before resuming."
+            )
+            saved_fp32_groups = [
+                key_to_fp32[_group_key(g)] for g in self.optimizer.param_groups
+            ]
+
+        for current_group, saved_group in zip(self.fp32_from_float16_groups, saved_fp32_groups):
             for current_param, saved_param in zip(current_group, saved_group):
                 current_param.data.copy_(saved_param.data)
 
