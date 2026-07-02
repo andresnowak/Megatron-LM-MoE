@@ -380,6 +380,10 @@ class OptimizerConfig:
     hypersphere_gains_mode_embedding: Optional[str] = None
     """Gains mode override for the embedding. One of 'row'/'col'/'rowcol'/'flat'/'none'."""
 
+    hypersphere_gains_mode_router: Optional[str] = 'none'
+    """Gains mode override for MoE router weights. One of 'row'/'col'/'rowcol'/'flat'/'none'.
+    Defaults to 'none' so router hypersphere normalization is not cancelled by per-expert gains."""
+
     gains_lr: Optional[float] = None
     """Absolute LR for the per-axis gains AdamW. When unset, falls back to --lr (and still tracks
     the schedule shape of the main LR)."""
@@ -387,6 +391,10 @@ class OptimizerConfig:
     gain_parametrization: str = 'softplus'
     """Reparametrize the stored gain g; effective multiplier is phi(g). 'direct' keeps phi(g)=g;
     'softplus' uses phi(g)=softplus(g) (always positive). Applied uniformly to row/col/flat."""
+
+    gains_no_clamp_min: bool = False
+    """Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in MDDecoupling gains.
+    This makes recover/apply exact for nonzero direct gains, including small or negative gains."""
 
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state

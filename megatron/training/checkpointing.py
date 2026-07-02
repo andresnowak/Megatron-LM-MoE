@@ -1590,6 +1590,16 @@ def load_args_from_checkpoint(
     # MoE latent projection.
     _set_arg('moe_latent_size', force=True)
 
+    # Restore forward-affecting Apertus flags from checkpoint args.
+    _set_arg('scale_embeddings_by_sqrt_hidden', force=True)
+    _set_arg('residual_output_scaling', force=True)
+    _set_arg('sandwich_norm', force=True)
+    _set_arg('keel', force=True)
+    _set_arg('keel_alpha', force=True)
+    _set_arg('pnglu', force=True)
+    _set_arg('pnglu_fusion', force=True)
+    _set_arg('qk_layernorm', force=True)
+
     # Tokenizer args.
     if args.use_tokenizer_model_from_checkpoint_args:
         # Using checkpoint version might not always be safe (e.g., if running on different cluster).

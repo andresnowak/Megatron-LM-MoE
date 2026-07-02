@@ -84,6 +84,44 @@ def _assert_qkv_split_tangent(optimizer, param, grad):
     torch.testing.assert_close(residuals, torch.zeros_like(residuals), rtol=1e-5, atol=1e-6)
 
 
+def test_md_decoupling_router_gains_mode_override():
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.is_router = True
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        hypersphere_gains_mode_router="none",
+        pg_collection=None,
+    )
+
+    assert optimizer._resolve_gains_mode(param) == "none"
+
+
+def test_md_decoupling_direct_gains_no_clamp_min_round_trip():
+    param = torch.nn.Parameter(torch.tensor([[2.0, -4.0], [6.0, -8.0]]))
+    original = param.detach().clone()
+    param.grad = torch.ones_like(param)
+    optimizer = MDDecoupling(
+        params=[param],
+        lr=0.01,
+        hypersphere_gains_mode="flat",
+        gain_parametrization="direct",
+        gains_no_clamp_min=True,
+        pg_collection=None,
+    )
+    optimizer.state[param]["flat_gain"] = torch.tensor(-2.0)
+
+    gain_grads = optimizer._preprocess_gains(param)
+
+    torch.testing.assert_close(param, original / -2.0)
+    torch.testing.assert_close(gain_grads["flat_gain"], torch.tensor(2.0))
+
+    optimizer._apply_gains(param)
+
+    torch.testing.assert_close(param, original)
+
+
 @requires_cuda_and_emerging
 def test_md_decoupling_qkv_split():
     qkv_size = 3 * 8 * 4

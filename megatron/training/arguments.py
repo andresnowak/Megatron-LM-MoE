@@ -2639,6 +2639,11 @@ def _add_training_args(parser):
     group.add_argument('--hypersphere-gains-mode-embedding', type=str, default=None,
                        choices=['row', 'col', 'rowcol', 'flat', 'none'],
                        help='Gains mode override for the embedding under md_decoupling.')
+    group.add_argument('--hypersphere-gains-mode-router', type=str, default='none',
+                       choices=['row', 'col', 'rowcol', 'flat', 'none'],
+                       help="Gains mode override for MoE router weights under md_decoupling. "
+                       "Defaults to 'none' so router hypersphere normalization is not cancelled "
+                       'by per-expert gains.')
     group.add_argument('--gains-lr', type=float, default=None,
                        help='Absolute LR for the per-axis gains AdamW under md_decoupling. When '
                        'unset, falls back to --lr (and still tracks the schedule shape of --lr).')
@@ -2647,6 +2652,10 @@ def _add_training_args(parser):
                        help='Reparametrize the stored gain g; effective multiplier is phi(g). '
                        '"direct" (default) keeps phi(g)=g. "softplus" uses phi(g)=softplus(g) '
                        '(always positive). Applied uniformly to row/col/flat gains.')
+    group.add_argument('--gains-no-clamp-min', action='store_true', default=False,
+                       help='Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in '
+                       'md_decoupling gains. Makes recover/apply exact for nonzero direct gains, '
+                       'including small or negative gains.')
     group.add_argument('--use-orthogonal-updates', action='store_true', default=False,
                        help='Use Muon-style orthogonalized updates for matrix params under '
                        'md_decoupling. Embedding + LM head ALWAYS use the Adam branch.')
