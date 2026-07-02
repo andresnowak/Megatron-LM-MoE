@@ -311,7 +311,8 @@ class OptimizerConfig:
     # weight_decay fields above for shared knobs. All defaults are off; existing runs unaffected.
     ###################################################################################
     matrix_lr: Optional[float] = None
-    """Absolute LR for matrix (2D non-embedding/output) params under --optimizer md_decoupling.
+    """Absolute LR for matrix (2D non-embedding/output) params under --optimizer md_decoupling or
+    muon/dist_muon (the Muon-managed matrices; the scalar Adam/Lion group stays on --lr).
     Overrides muon_lr_factor * lr."""
 
     embedding_lr_multiplier: Optional[float] = None
@@ -328,7 +329,8 @@ class OptimizerConfig:
     decays to the same floor (config.min_lr)."""
 
     muon_lr_factor: float = 1.0
-    """When --matrix-lr is unset, matrix-param LR for md_decoupling is muon_lr_factor * lr."""
+    """When --matrix-lr is unset, matrix-param LR for md_decoupling and muon/dist_muon is
+    muon_lr_factor * lr. Default 1.0 (matrices track the base --lr)."""
 
     hypersphere_mode: Optional[str] = 'flat'
     """Hypersphere normalization mode for non-embedding/output 2D matrices. One of
@@ -354,6 +356,12 @@ class OptimizerConfig:
     hypersphere_scale_out_proj_init: bool = True
     """Scale the hypersphere target radius for is_out_proj params (linear_proj, linear_fc2) by
     1/sqrt(2 * num_layers), matching scaled_init_method_normal."""
+
+    hypersphere_radius_from_init: bool = False
+    """Place each flat-mode matrix's sphere at its init Frobenius norm (init_std=1/sqrt(hidden))
+    instead of the shape-native sqrt(max(d_out,d_in)). Rescales both the projection target and the
+    Muon update by sqrt(min(d_out,d_in)/hidden), so narrow matrices (MLA lora, MoE fc2, GQA K/V)
+    stay on their init sphere. No-op for matrices whose smaller dim already equals hidden."""
 
     md_router_use_orthogonal_updates: Optional[bool] = True
     """Per-param-group override for use_orthogonal_updates on MoE router weights. True forces

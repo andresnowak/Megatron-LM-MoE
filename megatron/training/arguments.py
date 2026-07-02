@@ -1525,6 +1525,11 @@ def validate_args(args, defaults={}):
             assert args.ckpt_format == "torch", (
                 "md_decoupling with learnable gains requires --ckpt-format torch (gain state "
                 "tensors differ in shape from their parameter, which torch_dist cannot round-trip).")
+        assert not (args.hypersphere_scale_out_proj_init and args.residual_output_scaling), (
+            "--hypersphere-scale-out-proj-init and --residual-output-scaling both apply the "
+            "1/sqrt(2*num_layers) residual-branch depth scaling to the out-projections (the first "
+            "on the weight-norm/gain, the second as a forward multiplier); enabling both "
+            "double-counts and over-suppresses the residual branches. Enable exactly one.")
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -2570,7 +2575,8 @@ def _add_training_args(parser):
     # tp-mode, extra-scale-factor, coefficient-type, fp32-matmul-prec, split-qkv). All defaults off.
     group.add_argument('--matrix-lr', type=float, default=None,
                        help='Absolute LR for matrix (2D non-embedding/output) params under '
-                       '--optimizer md_decoupling. Overrides muon_lr_factor * lr.')
+                       '--optimizer md_decoupling or muon/dist_muon (the Muon-managed matrices; '
+                       'the scalar Adam/Lion group stays on --lr). Overrides muon_lr_factor * lr.')
     group.add_argument('--embedding-lr-multiplier', type=float, default=None,
                        help='LR multiplier for embedding (and tied LM-head) params under '
                        'md_decoupling. Final max_lr = embedding_lr_multiplier * lr. When unset, '
@@ -2585,8 +2591,8 @@ def _add_training_args(parser):
                        '(config.min_lr / config.lr). "absolute": every group decays to the same '
                        'floor (config.min_lr).')
     group.add_argument('--muon-lr-factor', type=float, default=1.0,
-                       help='When --matrix-lr is unset, matrix-param LR for md_decoupling is '
-                       'muon_lr_factor * lr. Default 1.0.')
+                       help='When --matrix-lr is unset, matrix-param LR for md_decoupling and '
+                       'muon/dist_muon is muon_lr_factor * lr. Default 1.0 (matrices track --lr).')
     group.add_argument('--hypersphere-mode', type=str, default=None,
                        choices=['row', 'col', 'flat', 'embed'],
                        help='Hypersphere normalization mode for non-embedding/output 2D matrices '
@@ -2612,6 +2618,11 @@ def _add_training_args(parser):
                        help='Scale the hypersphere target radius for is_out_proj params '
                        '(linear_proj, linear_fc2) by 1/sqrt(2 * num_layers), matching '
                        'scaled_init_method_normal.')
+    group.add_argument('--hypersphere-radius-from-init', action='store_true', default=False,
+                       help='Place each flat-mode matrix sphere at its init Frobenius norm '
+                       '(init_std=1/sqrt(hidden)) instead of sqrt(max(d_out,d_in)), rescaling both '
+                       'the projection target and the Muon update by sqrt(min(d_out,d_in)/hidden). '
+                       'Keeps narrow matrices (MLA lora, MoE fc2, GQA K/V) on their init sphere.')
     group.add_argument('--md-router-use-orthogonal-updates',
                        type=lambda s: {'true': True, 'false': False}[s.lower()],
                        default=None, choices=[True, False],

@@ -426,8 +426,13 @@ def get_megatron_muon_optimizer(
             else:
                 nonlinear_params.append(param)
 
+    # Separate LR for the Muon-managed matrices. Defaults to the base --lr (matrix_lr unset,
+    # muon_lr_factor == 1.0); the chained scalar Adam/Lion below always stays on config.lr.
+    matrix_lr = (config.matrix_lr if config.matrix_lr is not None
+                 else config.muon_lr_factor * (config.lr or 0.0))
+
     muon_kwargs = {
-        "lr": config.lr,
+        "lr": matrix_lr,
         "momentum_beta": config.muon_momentum,
         "use_nesterov": config.muon_use_nesterov,
         "weight_decay": config.weight_decay,
@@ -455,6 +460,24 @@ def get_megatron_muon_optimizer(
         param.requires_grad = False
 
     linear_param_groups = _get_param_groups(model_chunks, config, config_overrides)
+    # The LR scheduler overwrites each group's 'lr' every step from its 'max_lr'/'min_lr', so the
+    # muon_kwargs["lr"] default above is not enough — set the matrix schedule on the groups too.
+    # Only touch groups on the default LR schedule so explicit decoupled-LR overrides are kept.
+    if config.matrix_lr is not None or config.muon_lr_factor != 1.0:
+        # Per-group min_lr policy (mirrors md_decoupling): keep the decay curve well-formed by
+        # deriving min_lr from this group's max_lr rather than the global config.min_lr.
+        floor = config.min_lr if config.min_lr is not None else 0.0
+        if config.min_lr_mode == 'absolute':
+            matrix_min_lr = min(floor, matrix_lr)
+        else:
+            ratio = (floor / config.lr) if (config.lr and config.lr > 0) else 0.0
+            matrix_min_lr = matrix_lr * ratio
+        for group in linear_param_groups:
+            if group.get('default_config', False):
+                group['max_lr'] = matrix_lr
+                group['min_lr'] = matrix_min_lr
+                group['default_config'] = False
+
     # if layerwise distributed optimizer is not used, need to handle ep params separately
     expert_param_groups = []
     if not layer_wise_distributed_optimizer:
