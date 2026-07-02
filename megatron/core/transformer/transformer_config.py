@@ -248,6 +248,21 @@ class TransformerConfig(ModelParallelConfig):
     while leaving the residual stream itself untouched, which bounds activation growth in deep
     networks. Applies to the self-attention and MLP sublayers."""
 
+    scale_embeddings_by_sqrt_hidden: bool = False
+    """If True, multiply the output of the embedding by ``sqrt(hidden_size)``. Combined with an
+    embedding init std of ``1/sqrt(hidden_size)``, this makes the RMS of the vectors entering the
+    network ~1. This is a fixed (non-learnable) multiplier applied in both forward and backward."""
+
+    residual_output_scaling: bool = False
+    """If True, scale every sublayer output by a fixed ``alpha = 1/sqrt(2 * num_layers)`` before it
+    is added to the residual stream, i.e. each sublayer computes ``x = x + alpha * f(x)`` (2
+    sublayers per layer -> 2*num_layers residual branches). The scale is fixed (non-learnable) and
+    applied in both forward and backward. When ``sandwich_norm`` is also enabled, ``alpha`` is
+    applied to the sandwich-norm output (``x = x + alpha * Norm(f(x))``). Because ``alpha`` already
+    provides the depth scaling, when this is enabled ``output_layer_init_method`` defaults to the
+    (unscaled) ``init_method`` instead of the usual ``1/sqrt(2*num_layers)``-scaled init, to avoid
+    double-counting."""
+
     keel: bool = False
     """If True, use the KEEL architecture (arXiv:2601.19895): a Highway-style Post-LN Transformer
     that stabilizes extreme-depth training. Each sub-layer computes
@@ -1154,6 +1169,20 @@ class TransformerConfig(ModelParallelConfig):
                     "inference kernel folds the residual add into the output projection, leaving "
                     "no point at which to scale the residual and apply the KEEL Post-LN."
                 )
+            if self.residual_output_scaling:
+                raise ValueError(
+                    "keel and residual_output_scaling both rescale the residual branch and are "
+                    "mutually exclusive: KEEL scales the residual (highway) path by keel_alpha, "
+                    "while residual_output_scaling scales the sublayer output by 1/sqrt(2*L). "
+                    "Enable only one."
+                )
+
+        if self.residual_output_scaling and self.inference_fuse_tp_communication:
+            raise ValueError(
+                "residual_output_scaling is not compatible with inference_fuse_tp_communication: "
+                "the fused TP inference kernel folds the residual add into the output projection, "
+                "leaving no point at which to scale the sublayer output."
+            )
 
         if self.num_attention_heads % self.tensor_model_parallel_size != 0:
             raise ValueError(
@@ -1948,7 +1977,14 @@ class TransformerConfig(ModelParallelConfig):
                 self.init_method = init_method_normal(self.init_method_std)
 
         if self.output_layer_init_method is None:
-            if self.use_mup:
+            if self.residual_output_scaling:
+                # The fixed residual multiplier alpha = 1/sqrt(2*num_layers) already applies the
+                # depth scaling to every sublayer output (in fwd and bwd, for all of training), so
+                # the classic 1/sqrt(2*num_layers) *init* scaling of the output projections would
+                # double-count. Use the unscaled init (which still carries any MuP width scaling
+                # via self.init_method) and let the forward multiplier provide the depth scaling.
+                self.output_layer_init_method = self.init_method
+            elif self.use_mup:
                 # MuP: depth and width scaling for output layers.
                 self.output_layer_init_method = mup_scaled_init_method_normal(
                     self.init_method_std,

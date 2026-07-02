@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import math
 import warnings
 from abc import ABC
 from dataclasses import dataclass, field
@@ -444,6 +445,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 self.post_self_attn_layernorm = IdentityOp()
                 self.post_mlp_layernorm = IdentityOp()
 
+        # Each sublayer computes x = x + alpha * f(x) with
+        # alpha = 1/sqrt(2 * num_layers) (2 sublayers per layer -> 2*num_layers residual branches).
+        # alpha is a fixed, non-learnable scalar applied (in fwd/bwd) after the optional sandwich
+        # norm; see _apply_post_norm. When KEEL is used it has its own highway scaling and never uses this path.
+        self.residual_output_scale = None
+        if self.config.residual_output_scaling and not self.keel:
+            self.residual_output_scale = 1.0 / math.sqrt(2 * self.config.num_layers)
+
         self.recompute_input_layernorm = False
         self.recompute_pre_mlp_layernorm = False
         self.recompute_mlp = False
@@ -568,24 +577,51 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         return get_transformer_layer_offset(config)
 
-    @staticmethod
-    def _apply_post_norm(output_with_bias, post_norm):
-        """Apply a sandwich-norm to a sublayer's output before the residual add.
+    def _apply_post_norm(self, output_with_bias, post_norm):
+        """Apply the optional sandwich-norm and the optional fixed residual scale to a sublayer's
+        ``(output, bias)`` before the residual add.
 
-        ``output_with_bias`` is the ``(output, bias)`` pair produced by a sublayer (attention
-        or MLP). When sandwich norm is enabled, ``post_norm`` is a real normalization module:
-        the bias (if any) is folded into the output, the result is normalized, and
-        ``(normed, None)`` is returned so the downstream bias-dropout-add simply applies dropout
-        and the residual add, yielding ``residual + dropout(Norm(output + bias))``. When sandwich
-        norm is disabled, ``post_norm`` is an ``IdentityOp`` and the pair is returned unchanged,
-        preserving the fused bias-dropout-add path exactly (no extra work, no behavior change).
+        Two independent, composable transforms live here:
+
+        * **Sandwich norm** (``post_norm`` is a real norm): the bias (if any) is folded into the
+          output and the result is normalized, so the downstream bias-dropout-add yields
+          ``residual + dropout(Norm(output + bias))``.
+        * **Residual scaling** (``self.residual_output_scale`` is not None): a fixed scalar
+          ``alpha = 1/sqrt(2*num_layers)`` implementing ``x = x + alpha * f(x)``. It is applied
+          *after* the sandwich norm (``x = x + alpha * Norm(f(x))`` when both are on).
+
+        When there is no sandwich norm, ``alpha`` is folded into *both* the output and the bias so
+        the fused bias-dropout-add path is preserved exactly: dropout is linear in its input, so
+        ``dropout(alpha*output + alpha*bias) == alpha * dropout(output + bias)``. When neither
+        transform is enabled the pair is returned unchanged (no extra work, no behavior change).
+
+        Note: when both sandwich norm and residual scaling are on, ``alpha`` is applied as a
+        pointwise multiply on the norm output. For the local (torch) norms this is fused with the
+        norm/add by the JIT; TE's norm is a fused kernel, so there ``alpha`` stays a separate
+        (cheap) elementwise op. Either way it is exact in forward and backward.
         """
-        if isinstance(post_norm, IdentityOp):
+        alpha = self.residual_output_scale
+        has_norm = not isinstance(post_norm, IdentityOp)
+
+        if not has_norm and alpha is None:
             return output_with_bias
+
         output, bias = output_with_bias
+
+        if has_norm:
+            if bias is not None:
+                output = output + bias
+            output = apply_module(post_norm)(output)
+            if alpha is not None:
+                output = alpha * output
+            return output, None
+
+        # No sandwich norm, residual scaling on: fold alpha into (output, bias) to keep the
+        # fused bias-dropout-add path (dropout(alpha*y) == alpha*dropout(y)).
+        output = alpha * output
         if bias is not None:
-            output = output + bias
-        return apply_module(post_norm)(output), None
+            bias = alpha * bias
+        return output, bias
 
     def _forward_attention(
         self,

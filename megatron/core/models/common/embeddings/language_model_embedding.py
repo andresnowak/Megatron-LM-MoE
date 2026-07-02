@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import math
 from typing import Literal, Optional
 
 import torch
@@ -130,6 +131,12 @@ class LanguageModelEmbedding(MegatronModule):
         # MuP: scale embeddings by alpha_input.
         if self.config.use_mup and self.config.mup_embedding_mult != 1.0:
             embeddings = embeddings * self.config.mup_embedding_mult
+
+        # Fixed embedding upscale by sqrt(hidden_size). With an embedding init std of
+        # 1/sqrt(hidden_size) this makes the RMS of the vectors entering the network ~1. This is a
+        # fixed (non-learnable) multiplier, applied in both forward and backward.
+        if self.config.scale_embeddings_by_sqrt_hidden:
+            embeddings = embeddings * math.sqrt(self.config.hidden_size)
 
         # If the input flag for fp32 residual connection is set, convert for float.
         if self.config.fp32_residual_connection:
