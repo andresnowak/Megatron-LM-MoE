@@ -26,7 +26,9 @@ from megatron.core.optimizer.optimizer import FP32Optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
-from megatron.core.transformer.moe.fp8_utils import make_fused_experts_sharded_factory
+from megatron.core.transformer.moe.expert_checkpoint_utils import (
+    make_fused_experts_sharded_factory,
+)
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
