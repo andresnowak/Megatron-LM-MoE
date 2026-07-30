@@ -42,6 +42,16 @@ git submodule update --remote _research
 
 The submodule pointer pinned in this repo deliberately lags what's checked out; everyone pulls `_research` directly to stay current, and the pin is bumped only occasionally. Each run logs `PRETRAIN CONFIG COMMIT: <sha>[-dirty]` — that logged SHA, not the pin, is the source of truth for which config produced a run.
 
+## Muon-MD gain logging
+
+For `--optimizer md_decoupling`, pass `--log-muon-md-gains` to write effective gain
+statistics to TensorBoard and Weights & Biases at `--tensorboard-log-interval`. Metrics use
+`muon-md/gains/<family>/<axis>/<stat>`, where the axis is `row`, `col`, or `flat`; the
+statistics are `mean`, `rms`, `min`, and `max`. Families distinguish routers, embeddings,
+outputs, attention inputs/outputs, expert inputs/outputs, dense MLP inputs/outputs, and other
+matrices. Softplus gains are transformed before logging, so the values match the multipliers
+applied to model weights.
+
 ## About
 
 This repository contains two components: **Megatron-LM** and **Megatron Core**.

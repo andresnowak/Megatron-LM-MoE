@@ -178,7 +178,10 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
-from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
+from megatron.core.optimizer.md_decoupling import (
+    collect_md_gain_stats,
+    get_megatron_mddecoupling_optimizer,
+)
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -2022,6 +2025,7 @@ def training_log(
     skipped_iter,
     grad_norm,
     params_norm,
+    md_gain_stats,
     num_zeros_in_grad,
     max_attention_logit,
     pg_collection=None,
@@ -2171,6 +2175,11 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
+        if md_gain_stats:
+            for metric_name, metric_value in md_gain_stats.items():
+                writer.add_scalar(metric_name, metric_value, iteration)
+            if wandb_writer:
+                wandb_writer.log(md_gain_stats, iteration)
         if args.perform_rl_step:
             grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
             writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
@@ -3239,9 +3248,12 @@ def train(
         else:
             loss_scale = 1.0
         params_norm = None
+        md_gain_stats = None
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
+        if args.log_muon_md_gains and iteration % args.tensorboard_log_interval == 0:
+            md_gain_stats = collect_md_gain_stats(optimizer)
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
@@ -3256,6 +3268,7 @@ def train(
             skipped_iter,
             grad_norm,
             params_norm,
+            md_gain_stats,
             num_zeros_in_grad,
             max_attention_logit,
             pg_collection=model_pg_collection,

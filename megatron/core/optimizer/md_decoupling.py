@@ -75,9 +75,49 @@ _MD_GAIN_STATE_KINDS = {
     "flat_gain_v": "flat",
 }
 
+_GAIN_AXES = ("row", "col", "flat")
+_GAIN_FAMILIES = (
+    "router",
+    "embedding",
+    "output",
+    "attention-in",
+    "attention-out",
+    "expert-in",
+    "expert-out",
+    "dense-mlp-in",
+    "dense-mlp-out",
+    "other",
+)
+
 
 def _normalize_embedding_mode(mode):
     return None if mode == "external" else mode
+
+
+def _gain_log_family(name: str, param: torch.Tensor) -> str:
+    """Assign a stable, low-cardinality logging family while the parameter name is available."""
+    if getattr(param, "is_router", False) or name.endswith("router.weight"):
+        return "router"
+    if getattr(param, "is_md_embedding_parameter", False) or name.endswith(
+        "word_embeddings.weight"
+    ):
+        return "embedding"
+    if getattr(param, "is_md_output_parameter", False) or name.endswith("output_layer.weight"):
+        return "output"
+
+    is_out = getattr(param, "is_out_proj", False)
+    if "experts" in name:
+        return "expert-out" if is_out else "expert-in"
+    if (
+        "self_attention" in name
+        or "cross_attention" in name
+        or ".attention." in name
+        or any(token in name for token in ("linear_qkv", "linear_q_", "linear_kv_"))
+    ):
+        return "attention-out" if is_out else "attention-in"
+    if ".mlp." in name or "linear_fc" in name:
+        return "dense-mlp-out" if is_out else "dense-mlp-in"
+    return "other"
 
 
 def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
@@ -428,6 +468,18 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_router = getattr(p, "is_router", False)
         is_merged_offload_expert = getattr(p, "merged_offload_expert", False)
 
+        # A hypersphere-normalized matrix is projected back onto its fixed-radius sphere at the
+        # end of this step (see the post-step normalization below), which discards any global
+        # rescaling of `p`. Weight decay on such a param does NOT decay it — it only re-weights
+        # the direction update to an effective lr/(1 - wd*lr). Skip WD for those: magnitude is
+        # carried by the gains (decayed via gains_weight_decay) and the non-normalized params are
+        # decayed by the chained Adam. `_will_normalize` mirrors the guard on the post-step
+        # normalization so the two stay in lockstep.
+        _will_normalize = (
+            (p.ndim == 2 or (p.ndim == 3 and is_merged_offload_expert))
+            and self._resolve_mode(is_embedding, is_router) is not None
+        )
+
         # Strip the radial component of grad before it feeds any momentum buffer or 2nd-moment
         # estimate (applies to both Muon and AdamW).
         if self.hypersphere_tangential_grad:
@@ -441,7 +493,8 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             assert emerging_optimizers is not None, (
                 "emerging_optimizers package required for --use-orthogonal-updates"
             )
-            self._apply_weight_decay_inplace(p, group)
+            if not _will_normalize:
+                self._apply_weight_decay_inplace(p, group)
             exp_avg.lerp_(grad, 1 - momentum_beta)
             if self.use_nesterov:
                 grad = grad.lerp(exp_avg, momentum_beta)
@@ -470,14 +523,14 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 denom = (exp_avg_sq.sqrt() / math.sqrt(bias_correction2)).add_(group["eps"])
                 update = exp_avg.div(bias_correction1) / denom
 
-            self._apply_weight_decay_inplace(p, group)
+            if not _will_normalize:
+                self._apply_weight_decay_inplace(p, group)
 
         # Apply update.
         p.add_(update, alpha=-group["lr"])
 
         # Post-step hypersphere normalization (matrix clipping).
-        is_valid_p = (p.ndim == 2 or (len(p.shape) == 3 and is_merged_offload_expert))
-        if is_valid_p and self._resolve_mode(is_embedding, is_router) is not None:
+        if _will_normalize:
             self._normalize(p, p, is_qkv=is_qkv, is_out_proj=is_out_proj,
                             is_embedding=is_embedding, is_router=is_router,
                             is_merged_offload_expert=is_merged_offload_expert)
@@ -1241,6 +1294,97 @@ class MDDecoupling(_MDDecouplingBase):
         return self.hypersphere_gains_mode
 
 
+@torch.no_grad()
+def collect_md_gain_stats(optimizer) -> Dict[str, float]:
+    """Collect global effective-gain statistics from wrapped MDDecoupling optimizers.
+
+    This diagnostic intentionally uses simple global reductions. Replicated gains can therefore
+    be counted more than once, but identical replicas do not change their bucket's min/max and
+    normally do not change its mean/RMS.
+    """
+
+    def iter_md_optimizers(wrapped):
+        if isinstance(wrapped, MDDecoupling):
+            yield wrapped
+            return
+        if hasattr(wrapped, "chained_optimizers"):
+            for child in wrapped.chained_optimizers:
+                yield from iter_md_optimizers(child)
+            return
+        inner = getattr(wrapped, "optimizer", None)
+        if inner is not None and inner is not wrapped:
+            yield from iter_md_optimizers(inner)
+
+    md_optimizers = list(iter_md_optimizers(optimizer))
+    distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+    if not md_optimizers and not distributed:
+        return {}
+
+    bucket_count = len(_GAIN_FAMILIES) * len(_GAIN_AXES)
+    device = None
+    for md_optimizer in md_optimizers:
+        for param, state in md_optimizer.state.items():
+            if any(key in state for key in ("row_gain", "col_gain", "flat_gain")):
+                device = param.device
+                break
+        if device is not None:
+            break
+    if device is None:
+        device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+
+    sums = torch.zeros(bucket_count, dtype=torch.float64, device=device)
+    sum_squares = torch.zeros_like(sums)
+    counts = torch.zeros_like(sums)
+    minima = torch.full_like(sums, float("inf"))
+    maxima = torch.full_like(sums, float("-inf"))
+
+    family_indices = {name: index for index, name in enumerate(_GAIN_FAMILIES)}
+    axis_indices = {name: index for index, name in enumerate(_GAIN_AXES)}
+    for md_optimizer in md_optimizers:
+        for param, state in md_optimizer.state.items():
+            family = getattr(param, "md_gain_log_family", "other")
+            family_index = family_indices.get(family, family_indices["other"])
+            for axis in _GAIN_AXES:
+                raw_gain = state.get(f"{axis}_gain")
+                if raw_gain is None:
+                    continue
+                effective_gain = md_optimizer._phi(raw_gain).to(dtype=torch.float64)
+                bucket = family_index * len(_GAIN_AXES) + axis_indices[axis]
+                sums[bucket].add_(effective_gain.sum())
+                sum_squares[bucket].add_(effective_gain.square().sum())
+                counts[bucket].add_(effective_gain.numel())
+                minima[bucket].copy_(torch.minimum(minima[bucket], effective_gain.min()))
+                maxima[bucket].copy_(torch.maximum(maxima[bucket], effective_gain.max()))
+
+    if distributed:
+        torch.distributed.all_reduce(sums)
+        torch.distributed.all_reduce(sum_squares)
+        torch.distributed.all_reduce(counts)
+        torch.distributed.all_reduce(minima, op=torch.distributed.ReduceOp.MIN)
+        torch.distributed.all_reduce(maxima, op=torch.distributed.ReduceOp.MAX)
+
+    sums, sum_squares, counts, minima, maxima = (
+        tensor.cpu() for tensor in (sums, sum_squares, counts, minima, maxima)
+    )
+    stats = {}
+    for family_index, family in enumerate(_GAIN_FAMILIES):
+        for axis_index, axis in enumerate(_GAIN_AXES):
+            bucket = family_index * len(_GAIN_AXES) + axis_index
+            count = counts[bucket].item()
+            if count == 0:
+                continue
+            prefix = f"muon-md/gains/{family}/{axis}"
+            stats[f"{prefix}/mean"] = sums[bucket].item() / count
+            stats[f"{prefix}/rms"] = math.sqrt(sum_squares[bucket].item() / count)
+            stats[f"{prefix}/min"] = minima[bucket].item()
+            stats[f"{prefix}/max"] = maxima[bucket].item()
+    return stats
+
+
 @torch.compile(dynamic=True)
 def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd):
     """Fused in-place Adam update for one gain tensor (compiled leaf kernel).
@@ -1564,6 +1708,7 @@ def get_megatron_mddecoupling_optimizer(
             )
             if is_out_proj:
                 param.is_out_proj = True
+            param.md_gain_log_family = _gain_log_family(name, param)
 
     # Partition params: MDDecoupling-managed ("linear") vs external chained Adam ("nonlinear").
     hypersphere_embedding_mode = _normalize_embedding_mode(config.hypersphere_embedding_mode)

@@ -208,6 +208,9 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
+    log_muon_md_gains: bool = False
+    """If set, log effective Muon-MD gain statistics by parameter family and gain axis."""
+
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""
 
