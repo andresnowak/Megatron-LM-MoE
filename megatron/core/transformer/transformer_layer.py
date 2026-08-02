@@ -1002,7 +1002,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Optional sandwich norm: normalize the MLP output before the residual add.
         # Skipped under KEEL, which instead normalizes the *summed* output after the add (below).
-        if not self.keel:
+        if not self.keel and not self.is_moe_layer:
             mlp_output_with_bias = self._apply_post_norm(
                 mlp_output_with_bias, self.post_mlp_layernorm
             )
