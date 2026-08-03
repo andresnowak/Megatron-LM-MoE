@@ -54,6 +54,7 @@ _GAIN_FAMILIES = (
     "moe-latent-out",
     "dense-mlp-in",
     "dense-mlp-out",
+    "layernorm",
     "unclassified",
 )
 
@@ -98,6 +99,11 @@ def _compiled_softplus_matrix_gain_stats(
 
 def _gain_log_family(name: str, param: torch.Tensor) -> str:
     """Assign a stable, low-cardinality logging family while the parameter name is available."""
+    if param.ndim == 1 and (
+        name.endswith("layer_norm_weight")
+        or (name.endswith(".weight") and "norm" in name.rpartition(".")[0].lower())
+    ):
+        return "layernorm"
     if getattr(param, "is_router", False):
         return "router"
     if getattr(param, "is_md_embedding_parameter", False):
@@ -574,12 +580,24 @@ def collect_md_gain_stats(
     from .md_decoupling import MDDecoupling
 
     wrapped_optimizers = getattr(optimizer, "chained_optimizers", (optimizer,))
-    md_optimizers = [
+    inner_optimizers = [
         getattr(wrapped, "optimizer", wrapped) for wrapped in wrapped_optimizers
     ]
     md_optimizers = [
-        wrapped for wrapped in md_optimizers if isinstance(wrapped, MDDecoupling)
+        wrapped for wrapped in inner_optimizers if isinstance(wrapped, MDDecoupling)
     ]
+    layernorm_params = [
+        param
+        for inner_optimizer in inner_optimizers
+        for group in inner_optimizer.param_groups
+        for param in group["params"]
+        if getattr(param, "md_gain_log_family", None) == "layernorm"
+    ]
+
+    logged_params = [
+        param for md_optimizer in md_optimizers for param in md_optimizer.state
+    ] + layernorm_params
+
     dp_state_is_sharded = isinstance(optimizer, LayerWiseDistributedOptimizer)
     distributed = (
         torch.distributed.is_available() and torch.distributed.is_initialized()
@@ -599,6 +617,8 @@ def collect_md_gain_stats(
     device = (
         gain_param.device
         if gain_param is not None
+        else layernorm_params[0].device
+        if layernorm_params
         else (
             torch.device("cuda", torch.cuda.current_device())
             if torch.cuda.is_available()
@@ -611,8 +631,7 @@ def collect_md_gain_stats(
         layer_count = max(
             (
                 getattr(param, "md_gain_log_layer", -1) + 1
-                for md_optimizer in md_optimizers
-                for param in md_optimizer.state
+                for param in logged_params
             ),
             default=0,
         )
@@ -691,6 +710,27 @@ def collect_md_gain_stats(
                         ),
                     )
                 )
+    # LayerNorm scales are direct 1D gains owned by the chained Adam optimizer. Add one for
+    # zero-centered gamma before element statistics, and average each norm vector's RMS equally.
+    if log_gains and md_optimizers:
+        layernorm_bucket = (
+            family_indices["layernorm"] * len(_GAIN_AXES) + _GAIN_AXES.index("flat")
+        )
+        for param in layernorm_params:
+            if not _include_gain_in_global_stats(
+                md_optimizers[0], param, "flat", dp_state_is_sharded
+            ):
+                continue
+            effective_gain = param.detach() + getattr(param, "md_layernorm_gain_offset", 0.0)
+            layer = getattr(param, "md_gain_log_layer", None)
+            layer_scope = layer + 1 if per_layer and layer is not None else None
+            gain_entries.append((effective_gain, layernorm_bucket, layer_scope, None))
+            rms = effective_gain.to(torch.float64).square().mean().sqrt()
+            matrix_axis_totals[0, layernorm_bucket, _MATRIX_RMS_SUM] += rms
+            matrix_axis_totals[0, layernorm_bucket, _MATRIX_COUNT] += 1
+            if layer_scope is not None:
+                matrix_axis_totals[layer_scope, layernorm_bucket, _MATRIX_RMS_SUM] += rms
+                matrix_axis_totals[layer_scope, layernorm_bucket, _MATRIX_COUNT] += 1
     if gain_entries:
         # These are element-level gain distribution metrics: mean, RMS, min, max, and softplus
         # saturation. Unlike ``effective-rms`` above, every gain element has equal weight here;

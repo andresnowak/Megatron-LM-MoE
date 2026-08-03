@@ -52,6 +52,43 @@ def test_md_gain_log_family_classifies_matrix_types():
         assert _gain_log_family(name, param) == expected
 
 
+def test_collect_md_gain_stats_logs_layernorm_effective_gains():
+    matrix = torch.nn.Parameter(torch.ones(2, 2))
+    matrix.md_gain_log_family = "attention-in"
+    md_optimizer = MDDecoupling(
+        [matrix], hypersphere_gains_mode="row", gain_parametrization="direct"
+    )
+    md_optimizer.state[matrix]["row_gain"] = torch.ones(2)
+
+    layernorm = torch.nn.Parameter(torch.tensor([0.0, 0.5]))
+    layernorm.md_gain_log_family = _gain_log_family(
+        "decoder.layers.2.input_layernorm.weight", layernorm
+    )
+    layernorm.md_layernorm_gain_offset = 1.0
+    layernorm.md_gain_log_layer = 2
+    adam = torch.optim.Adam([layernorm])
+    optimizer = SimpleNamespace(
+        chained_optimizers=(
+            SimpleNamespace(optimizer=md_optimizer),
+            SimpleNamespace(optimizer=adam),
+        )
+    )
+
+    stats = collect_md_gain_stats(
+        optimizer, per_layer=True, log_sparsity=False, log_param_rms=False
+    )
+
+    expected_rms = ((1.0**2 + 1.5**2) / 2) ** 0.5
+    for prefix in ("muon-md", "muon-md/layers/2"):
+        gain_prefix = f"{prefix}/gains/layernorm/flat"
+        assert stats[f"{gain_prefix}/mean"] == pytest.approx(1.25)
+        assert stats[f"{gain_prefix}/rms"] == pytest.approx(expected_rms)
+        assert stats[f"{gain_prefix}/effective-rms"] == pytest.approx(expected_rms)
+        assert stats[f"{gain_prefix}/min"] == pytest.approx(1.0)
+        assert stats[f"{gain_prefix}/max"] == pytest.approx(1.5)
+        assert f"{gain_prefix}/saturated-fraction" not in stats
+
+
 @pytest.mark.parametrize("gain_parametrization", ["softplus", "zero-centered-softplus"])
 def test_collect_md_gain_stats_logs_effective_gains_by_family_and_axis(
     gain_parametrization,

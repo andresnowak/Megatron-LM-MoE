@@ -1581,6 +1581,11 @@ def get_megatron_mddecoupling_optimizer(
             if is_out_proj:
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
+            if param.md_gain_log_family == "layernorm":
+                # This tagging is just to be able to log layernorm gain under md_decoupling_logging
+                param.md_layernorm_gain_offset = float(
+                    getattr(model_chunk.config, "layernorm_zero_centered_gamma", False)
+                )
             module_name = name.rpartition('.')[0]
             while module_name:
                 module = named_modules.get(module_name)
