@@ -1266,6 +1266,13 @@ def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd):
         m  = beta1*m + (1-beta1)*grad
         v  = beta2*v + (1-beta2)*grad^2
         gain -= (lr/bc1) * m / (v.sqrt()/bc2.sqrt() + eps)
+
+    Weight decay always pulls the stored raw gain toward zero. In effective-gain
+    space, direct gains approach 0, softplus gains approach
+    softplus(0) = log(2) ~= 0.693, and zero-centered-softplus gains approach 1.
+    This is a soft preference for those values, not an exact norm constraint. For
+    zero-centered-softplus, it therefore favors preserving the weight's original
+    magnitude because phi(0) = 1.
     """
     if wd != 0.0:
         gain.mul_(1.0 - lr * wd)
