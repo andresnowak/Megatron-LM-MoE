@@ -52,7 +52,10 @@ def test_md_gain_log_family_classifies_matrix_types():
         assert _gain_log_family(name, param) == expected
 
 
-def test_collect_md_gain_stats_logs_effective_gains_by_family_and_axis():
+@pytest.mark.parametrize("gain_parametrization", ["softplus", "zero-centered-softplus"])
+def test_collect_md_gain_stats_logs_effective_gains_by_family_and_axis(
+    gain_parametrization,
+):
     router = torch.nn.Parameter(torch.ones(2, 2))
     router.md_gain_log_family = "router"
     attention = torch.nn.Parameter(torch.ones(2, 2))
@@ -60,60 +63,75 @@ def test_collect_md_gain_stats_logs_effective_gains_by_family_and_axis():
     optimizer = MDDecoupling(
         [router, attention],
         hypersphere_gains_mode="rowcol",
-        gain_parametrization="softplus",
+        gain_parametrization=gain_parametrization,
     )
-    optimizer.state[router]["row_gain"] = optimizer._phi_inv(torch.tensor([1.0, 3.0]))
-    optimizer.state[router]["col_gain"] = optimizer._phi_inv(torch.tensor([2.0, 4.0]))
-    optimizer.state[attention]["flat_gain"] = optimizer._phi_inv(torch.tensor(5.0))
+    row_gain = torch.tensor([-1.0, 1.0])
+    col_gain = torch.tensor([0.0, 2.0])
+    flat_gain = torch.tensor(3.0)
+    optimizer.state[router]["row_gain"] = row_gain
+    optimizer.state[router]["col_gain"] = col_gain
+    optimizer.state[attention]["flat_gain"] = flat_gain
 
     stats = collect_md_gain_stats(SimpleNamespace(optimizer=optimizer))
+    row = optimizer._phi(row_gain)
+    col = optimizer._phi(col_gain)
+    flat = optimizer._phi(flat_gain)
 
-    assert stats["muon-md/gains/router/row/mean"] == pytest.approx(2.0)
-    assert stats["muon-md/gains/router/row/rms"] == pytest.approx(5.0**0.5)
-    assert stats["muon-md/gains/router/row/effective-rms"] == pytest.approx(5.0**0.5)
-    assert stats["muon-md/gains/router/row/min"] == pytest.approx(1.0)
-    assert stats["muon-md/gains/router/row/max"] == pytest.approx(3.0)
+    assert stats["muon-md/gains/router/row/mean"] == pytest.approx(row.mean().item())
+    assert stats["muon-md/gains/router/row/rms"] == pytest.approx(row.square().mean().sqrt().item())
+    assert stats["muon-md/gains/router/row/effective-rms"] == pytest.approx(
+        row.square().mean().sqrt().item()
+    )
+    assert stats["muon-md/gains/router/row/min"] == pytest.approx(row.min().item())
+    assert stats["muon-md/gains/router/row/max"] == pytest.approx(row.max().item())
     assert stats["muon-md/gains/router/row/saturated-fraction"] == pytest.approx(0.0)
-    assert stats["muon-md/gains/router/col/mean"] == pytest.approx(3.0)
-    assert stats["muon-md/gains/router/col/rms"] == pytest.approx(10.0**0.5)
-    assert stats["muon-md/gains/router/col/effective-rms"] == pytest.approx(10.0**0.5)
-    assert stats["muon-md/gain-field/router/rms"] == pytest.approx(50.0**0.5)
+    assert stats["muon-md/gains/router/col/mean"] == pytest.approx(col.mean().item())
+    assert stats["muon-md/gains/router/col/rms"] == pytest.approx(col.square().mean().sqrt().item())
+    assert stats["muon-md/gains/router/col/effective-rms"] == pytest.approx(
+        col.square().mean().sqrt().item()
+    )
+    assert stats["muon-md/gain-field/router/rms"] == pytest.approx(
+        (row.square().mean() * col.square().mean()).sqrt().item()
+    )
     assert stats["muon-md/gauge/router/combined-log-scale"] == pytest.approx(
-        (
-            torch.tensor([1.0, 3.0]).log().mean()
-            + torch.tensor([2.0, 4.0]).log().mean()
-        ).item()
+        (row.log().mean() + col.log().mean()).item()
     )
     assert stats["muon-md/gauge/router/row-col-imbalance"] == pytest.approx(
-        (
-            torch.tensor([1.0, 3.0]).log().mean()
-            - torch.tensor([2.0, 4.0]).log().mean()
-        ).item()
+        (row.log().mean() - col.log().mean()).item()
     )
-    assert stats["muon-md/gains/attention-in/flat/mean"] == pytest.approx(5.0)
+    assert stats["muon-md/gains/attention-in/flat/mean"] == pytest.approx(flat.item())
     assert "muon-md/gain-field/attention-in/rms" not in stats
     assert not any("muon-md/layers/" in name for name in stats)
     assert not any("/unclassified/" in name for name in stats)
 
 
-def test_collect_md_gain_stats_logs_softplus_saturation_only():
-    softplus_param = torch.nn.Parameter(torch.ones(2, 2))
-    softplus_param.md_gain_log_family = "router"
-    softplus_optimizer = MDDecoupling(
-        [softplus_param],
+@pytest.mark.parametrize(
+    "gain_parametrization,raw_gains,expected_saturated_fraction",
+    [
+        ("softplus", [-10.0, 0.0], 0.5),
+        ("zero-centered-softplus", [-5.0, 0.0], 0.0),
+    ],
+)
+def test_collect_md_gain_stats_logs_softplus_saturation_only(
+    gain_parametrization, raw_gains, expected_saturated_fraction
+):
+    param = torch.nn.Parameter(torch.ones(2, 2))
+    param.md_gain_log_family = "router"
+    optimizer = MDDecoupling(
+        [param],
         hypersphere_gains_mode="row",
-        gain_parametrization="softplus",
+        gain_parametrization=gain_parametrization,
     )
-    softplus_optimizer.state[softplus_param]["row_gain"] = torch.tensor([-10.0, 0.0])
+    optimizer.state[param]["row_gain"] = torch.tensor(raw_gains)
 
-    softplus_stats = collect_md_gain_stats(
-        SimpleNamespace(optimizer=softplus_optimizer)
-    )
+    stats = collect_md_gain_stats(SimpleNamespace(optimizer=optimizer))
 
-    assert softplus_stats[
+    assert stats[
         "muon-md/gains/router/row/saturated-fraction"
-    ] == pytest.approx(0.5)
+    ] == pytest.approx(expected_saturated_fraction)
 
+
+def test_collect_md_gain_stats_omits_softplus_metrics_for_direct_gains():
     direct_param = torch.nn.Parameter(torch.ones(2, 2))
     direct_param.md_gain_log_family = "router"
     direct_optimizer = MDDecoupling(

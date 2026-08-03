@@ -208,6 +208,41 @@ def test_md_decoupling_recipe_defaults():
     assert config.muon_router_scale_mode == "none"
 
 
+def test_md_decoupling_zero_centered_softplus_gains_initialize_at_zero():
+    param = torch.nn.Parameter(torch.ones(2, 3))
+    optimizer = MDDecoupling(
+        [param],
+        lr=0.01,
+        hypersphere_gains_mode="rowcol",
+        gain_parametrization="zero-centered-softplus",
+        pg_collection=None,
+    )
+
+    optimizer._maybe_init_gain_state(param)
+
+    state = optimizer.state[param]
+    torch.testing.assert_close(state["row_gain"], torch.zeros(2), rtol=0, atol=0)
+    torch.testing.assert_close(state["col_gain"], torch.zeros(3), rtol=0, atol=0)
+    torch.testing.assert_close(
+        optimizer._phi(state["row_gain"]), torch.ones(2), rtol=0, atol=1e-7
+    )
+    gamma = torch.tensor([-1.0, 0.0, 1.0], requires_grad=True)
+    optimizer._phi(gamma).sum().backward()
+    torch.testing.assert_close(gamma.grad, optimizer._phi_prime(gamma.detach()))
+
+
+def test_md_decoupling_zero_centered_softplus_rejects_preserve_init():
+    with pytest.raises(AssertionError, match="gamma initializes at zero"):
+        MDDecoupling(
+            [torch.nn.Parameter(torch.ones(2, 3))],
+            lr=0.01,
+            hypersphere_gains_mode="rowcol",
+            hypersphere_preserve_init=True,
+            gain_parametrization="zero-centered-softplus",
+            pg_collection=None,
+        )
+
+
 def test_md_decoupling_router_scale_mode_resolution():
     # Default: routers get "none" (constant 1.0) while matrices follow scale_mode. A router of
     # shape (num_experts, hidden) is non-square, so shape_up would give >1; "none" pins it to 1.

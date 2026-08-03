@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 
 _GAIN_AXES = ("row", "col", "flat")
+_GAIN_ENTRY_RAW, _GAIN_ENTRY_BUCKET, _GAIN_ENTRY_LAYER_SCOPE, _GAIN_ENTRY_OFFSET = range(4)  # fmt: skip
 _MATRIX_SQUARE_SUM, _MATRIX_ELEMENT_COUNT, _MATRIX_LOG_SUM, _WEIGHT_SQUARE_SUM, _WEIGHT_ELEMENT_COUNT, _MATRIX_NEAR_ZERO_START = range(6)  # fmt: skip
 
 # Columns of ``totals``: element-weighted effective-gain distribution statistics.
@@ -76,17 +77,23 @@ def _compiled_matrix_weight_stats(
     return _matrix_weight_stats(matrix_weights, thresholds)
 
 
-def _softplus_matrix_gain_stats(raw_gains: torch.Tensor) -> torch.Tensor:
+def _softplus_matrix_gain_stats(
+    raw_gains: torch.Tensor, gain_offset: float
+) -> torch.Tensor:
     """Compute the two softplus matrix reductions in one pass."""
-    effective_gains = torch.nn.functional.softplus(raw_gains.to(torch.float64))
+    effective_gains = torch.nn.functional.softplus(
+        raw_gains.to(torch.float64) + gain_offset
+    )
     return torch.stack(
         (effective_gains.square().sum(dim=1), effective_gains.log().sum(dim=1)), dim=1
     )
 
 
 @torch.compile(dynamic=True, fullgraph=True)
-def _compiled_softplus_matrix_gain_stats(raw_gains: torch.Tensor) -> torch.Tensor:
-    return _softplus_matrix_gain_stats(raw_gains)
+def _compiled_softplus_matrix_gain_stats(
+    raw_gains: torch.Tensor, gain_offset: float
+) -> torch.Tensor:
+    return _softplus_matrix_gain_stats(raw_gains, gain_offset)
 
 
 def _gain_log_family(name: str, param: torch.Tensor) -> str:
@@ -424,12 +431,12 @@ def _accumulate_md_matrix_stats(
                 # Matrix-level gain statistics are based on effective gains phi(raw_gain). Store
                 # their squared sum for effective RMS and, for softplus, their log sum for gauge
                 # metrics. TP combines these sufficient statistics before either value is formed.
-                if md_optimizer.gain_parametrization == "softplus":
+                if md_optimizer.gain_parametrization != "direct":
                     gain_stats = (
                         _compiled_softplus_matrix_gain_stats
                         if raw_gain.is_cuda
                         else _softplus_matrix_gain_stats
-                    )(raw_matrix_gains)
+                    )(raw_matrix_gains, md_optimizer._gain_offset)
                     record[:, axis_index, _MATRIX_SQUARE_SUM] = gain_stats[:, 0]
                     record[:, axis_index, _MATRIX_LOG_SUM] = gain_stats[:, 1]
                 else:
@@ -446,7 +453,7 @@ def _accumulate_md_matrix_stats(
                     family_indices.get(family, family_indices["unclassified"]),
                     getattr(param, "md_gain_log_layer", None),
                     matrix_count,
-                    md_optimizer.gain_parametrization == "softplus",
+                    md_optimizer.gain_parametrization != "direct",
                 )
             )
 
@@ -677,7 +684,11 @@ def collect_md_gain_stats(
                         raw_gain,
                         bucket,
                         layer_scope,
-                        md_optimizer.gain_parametrization == "softplus",
+                        (
+                            md_optimizer._gain_offset
+                            if md_optimizer.gain_parametrization != "direct"
+                            else None
+                        ),
                     )
                 )
     if gain_entries:
@@ -685,27 +696,41 @@ def collect_md_gain_stats(
         # saturation. Unlike ``effective-rms`` above, every gain element has equal weight here;
         # differently sized matrices therefore contribute different numbers of observations.
         entry_counts = torch.tensor(
-            [entry[0].numel() for entry in gain_entries],
+            [entry[_GAIN_ENTRY_RAW].numel() for entry in gain_entries],
             dtype=torch.long,
             device=device,
         )
         raw_values = torch.cat(
-            [entry[0].detach().flatten() for entry in gain_entries]
+            [entry[_GAIN_ENTRY_RAW].detach().flatten() for entry in gain_entries]
         ).to(torch.float64)
         entry_ids = torch.repeat_interleave(
             torch.arange(len(gain_entries), device=device), entry_counts
         )
-        softplus_values = torch.tensor(
-            [entry[3] for entry in gain_entries], dtype=torch.bool, device=device
-        )[entry_ids]
-        effective_gain = torch.where(
-            softplus_values, torch.nn.functional.softplus(raw_values), raw_values
+        softplus_entries = torch.tensor(
+            [entry[_GAIN_ENTRY_OFFSET] is not None for entry in gain_entries],
+            dtype=torch.bool,
+            device=device,
         )
-        # Saturation is evaluated on each raw softplus gain, not on the weight matrix. The raw
-        # threshold below is exactly equivalent to sigmoid(raw_gain) < 1e-2.
-        # sigmoid(raw_gain) is d softplus(raw_gain) / d raw_gain. Below 1e-2, the
-        # effective multiplier changes by less than 1% of the raw-gain update.
-        saturated = softplus_values & raw_values.lt(math.log(1e-2 / (1 - 1e-2)))
+        gain_offsets = torch.tensor(
+            [
+                0.0 if entry[_GAIN_ENTRY_OFFSET] is None else entry[_GAIN_ENTRY_OFFSET]
+                for entry in gain_entries
+            ],
+            dtype=torch.float64,
+            device=device,
+        )[entry_ids]
+        softplus_values = softplus_entries[entry_ids]
+        effective_gain = torch.where(
+            softplus_values,
+            torch.nn.functional.softplus(raw_values + gain_offsets),
+            raw_values,
+        )
+        # Saturation is evaluated on each softplus input (raw gain plus any zero-centered-softplus
+        # offset), not on the weight matrix. sigmoid(input) is the softplus derivative; below
+        # 1e-2, the effective multiplier changes by less than 1% of the stored-gain update.
+        saturated = softplus_values & (raw_values + gain_offsets).lt(
+            math.log(1e-2 / (1 - 1e-2))
+        )
         gain_values = torch.stack(
             (
                 torch.segment_reduce(effective_gain, "sum", lengths=entry_counts),
@@ -725,7 +750,9 @@ def collect_md_gain_stats(
         gain_minima = torch.segment_reduce(effective_gain, "min", lengths=entry_counts)
         gain_maxima = torch.segment_reduce(effective_gain, "max", lengths=entry_counts)
         entry_buckets = torch.tensor(
-            [entry[1] for entry in gain_entries], dtype=torch.long, device=device
+            [entry[_GAIN_ENTRY_BUCKET] for entry in gain_entries],
+            dtype=torch.long,
+            device=device,
         )
         flat_totals = totals.view(-1, _GAIN_STAT_COUNT)
         flat_minima = minima.view(-1)
@@ -735,11 +762,14 @@ def collect_md_gain_stats(
         flat_maxima.scatter_reduce_(0, entry_buckets, gain_maxima, reduce="amax")
 
         layer_entries = [
-            index for index, entry in enumerate(gain_entries) if entry[2] is not None
+            index
+            for index, entry in enumerate(gain_entries)
+            if entry[_GAIN_ENTRY_LAYER_SCOPE] is not None
         ]
         if layer_entries:
             layer_indices = [
-                gain_entries[index][2] * bucket_count + gain_entries[index][1]
+                gain_entries[index][_GAIN_ENTRY_LAYER_SCOPE] * bucket_count
+                + gain_entries[index][_GAIN_ENTRY_BUCKET]
                 for index in layer_entries
             ]
             layer_entries = torch.tensor(layer_entries, dtype=torch.long, device=device)

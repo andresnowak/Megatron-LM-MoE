@@ -402,14 +402,18 @@ class OptimizerConfig:
 
     gain_parametrization: str = 'softplus'
     """Reparametrize the stored gain g; effective multiplier is phi(g). 'direct' keeps phi(g)=g;
-    'softplus' uses phi(g)=softplus(g) (always positive). Applied uniformly to row/col/flat."""
+    'softplus' uses phi(g)=softplus(g); 'zero-centered-softplus' uses
+    phi(g)=softplus(g+softplus_inv(1)), so the zero-centered gamma initializes at g=0 and the
+    effective gain initializes at 1. Incompatible with hypersphere_preserve_init. Applied
+    uniformly to row/col/flat."""
 
     gains_no_clamp_min: bool = False
     """Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in _preprocess_gains.
     The clamp floors the divisor, which is asymmetric with _apply_gains (multiplies by the true,
     unclamped phi(g)) and — under gain_parametrization='direct' — blocks a gain from shrinking
     through 1e-8 or flipping sign. Setting this makes the recover/apply round-trip exact for any
-    nonzero gain, letting direct gains go small or negative. No-op for 'softplus' (phi(g)>0)."""
+    nonzero gain, letting direct gains go small or negative. No-op for softplus-based gains
+    (phi(g)>0)."""
 
     use_layer_wise_distributed_optimizer: bool = False
     """If true, wrap the optimizer with LayerWiseDistributedOptimizer to shard optimizer state

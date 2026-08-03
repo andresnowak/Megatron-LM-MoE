@@ -1560,10 +1560,10 @@ def validate_args(args, defaults={}):
         assert args.hypersphere_gains_mode is not None or not gains_overrides, (
             "md_decoupling gains overrides require --hypersphere-gains-mode to be used; got "
             f"{', '.join(gains_overrides)}.")
-        if args.gains_no_clamp_min and args.gain_parametrization == "softplus":
+        if args.gains_no_clamp_min and args.gain_parametrization != "direct":
             warn_rank_0(
-                "--gains-no-clamp-min has little effect with --gain-parametrization softplus; "
-                "softplus gains are positive, so the clamp only changes values below 1e-8."
+                "--gains-no-clamp-min has little effect with softplus-based gains; they are "
+                "positive, so the clamp only changes values below 1e-8."
             )
         if args.hypersphere_radius_from_init:
             assert args.hypersphere_mode == "flat", (
@@ -2934,10 +2934,12 @@ def _add_training_args(parser):
                        help='Absolute LR for the per-axis gains AdamW under md_decoupling. When '
                        'unset, falls back to --lr (and still tracks the schedule shape of --lr).')
     group.add_argument('--gain-parametrization', type=str, default='softplus',
-                       choices=['direct', 'softplus'],
+                       choices=['direct', 'softplus', 'zero-centered-softplus'],
                        help='Reparametrize the stored gain g; effective multiplier is phi(g). '
                        '"direct" keeps phi(g)=g. "softplus" (default) uses phi(g)=softplus(g) '
-                       '(always positive). Applied uniformly to row/col/flat gains.')
+                       '(always positive). "zero-centered-softplus" uses '
+                       'phi(g)=softplus(g+softplus_inv(1)), so g=0 is the identity. Applied '
+                       'uniformly to row/col/flat gains.')
     group.add_argument('--gains-no-clamp-min', action='store_true', default=False,
                        help='Drop the 1e-8 clamp_min on phi(g) when recovering the bare weight in '
                        'md_decoupling gains. Makes recover/apply exact for nonzero direct gains, '

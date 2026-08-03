@@ -9,7 +9,8 @@ Decouples a 2D weight into a *direction* (hypersphere-normalized weight) and a *
   - Direction: post-step L2-sphere projection of the weight (modes: row, col, flat, embed),
     optionally per-class for embedding/output and router weights.
   - Magnitude: optional learnable per-axis gains as a fused reparameterization
-    (p = normalized_w * phi(gains)); ``gain_parametrization`` selects phi ∈ {direct, softplus}.
+    (p = normalized_w * phi(gains)); ``gain_parametrization`` selects direct, softplus, or
+    zero-centered softplus gains.
   - Update: AdamW by default, or Muon orthogonalized updates (``use_orthogonal_updates``).
 
 1D params (biases / norms) and (optionally) embedding/output params are routed to a chained
@@ -831,11 +832,16 @@ class MDDecoupling(_MDDecouplingBase):
         gains_weight_decay: float = 0.0,
         # Reparametrize the per-axis gain: the stored state tensor is `g`, the effective
         # multiplier applied to `p` is `phi(g)`. "direct" is the identity (phi(g)=g);
-        # "softplus" uses phi(g)=softplus(g). Applied uniformly to row/col/flat.
-        gain_parametrization: Literal["direct", "softplus"] = "direct",
+        # "softplus" uses phi(g)=softplus(g); "zero-centered-softplus" shifts its stored gamma so
+        # gamma=0 maps to an effective multiplier of 1. Applied uniformly to row/col/flat.
+        gain_parametrization: Literal["direct", "softplus", "zero-centered-softplus"] = "direct",
         gains_no_clamp_min: bool = False,
         **kwargs,
     ):
+        assert not (
+            gain_parametrization == "zero-centered-softplus"
+            and kwargs.get("hypersphere_preserve_init", False)
+        ), "zero-centered-softplus requires hypersphere_preserve_init=False so gamma initializes at zero"
         self.hypersphere_gains_mode = None if hypersphere_gains_mode == "none" else hypersphere_gains_mode
         self.hypersphere_gains_mode_output = (
             None if hypersphere_gains_mode_output == "inherit" else hypersphere_gains_mode_output
@@ -853,6 +859,11 @@ class MDDecoupling(_MDDecouplingBase):
         self.gains_eps = gains_eps
         self.gains_weight_decay = gains_weight_decay
         self.gain_parametrization = gain_parametrization
+        self._gain_offset = (
+            math.log(math.expm1(1.0)) # softplus identity offset: softplus(0) = log(1+exp(0)) = log(2) ≈ 0.693, so to get softplus(g)=1 at g=0, we need to shift g by log(exp(1)-1) ≈ 0.541
+            if gain_parametrization == "zero-centered-softplus"
+            else 0.0
+        )
         super().__init__(params, **kwargs)
         # Gain state is initialized lazily at first step (see step() → _maybe_init_gain_state).
         # Eager init here would write entries into self.state keyed by the bf16 model param, but
@@ -892,8 +903,8 @@ class MDDecoupling(_MDDecouplingBase):
         mode = self.gain_parametrization
         if mode == "direct":
             return g
-        if mode == "softplus":
-            return torch.nn.functional.softplus(g)
+        if mode in ("softplus", "zero-centered-softplus"):
+            return torch.nn.functional.softplus(g + self._gain_offset)
         raise ValueError(f"Unknown gain_parametrization {mode}")
 
     def _phi_prime(self, g: torch.Tensor):
@@ -902,8 +913,8 @@ class MDDecoupling(_MDDecouplingBase):
         mode = self.gain_parametrization
         if mode == "direct":
             return 1.0
-        if mode == "softplus":
-            return torch.sigmoid(g)
+        if mode in ("softplus", "zero-centered-softplus"):
+            return torch.sigmoid(g + self._gain_offset)
         raise ValueError(f"Unknown gain_parametrization {mode}")
 
     def _phi_inv(self, x: torch.Tensor) -> torch.Tensor:
@@ -913,6 +924,8 @@ class MDDecoupling(_MDDecouplingBase):
         mode = self.gain_parametrization
         if mode == "direct":
             return x
+        if mode == "zero-centered-softplus":
+            return torch.zeros_like(x)
         if mode == "softplus":
             # Stable softplus_inv for x > 0: g = x + log1p(-exp(-x)).
             # As x → ∞, g → x. As x → 0+, g → −∞.
