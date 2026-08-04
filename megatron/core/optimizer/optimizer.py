@@ -112,6 +112,7 @@ _MAIN_PARAM_ROUTING_ATTRS = (
     'is_md_embedding_parameter',
     'is_md_output_parameter',
     'merged_offload_expert',
+    'glu_split_dim',
 )
 
 

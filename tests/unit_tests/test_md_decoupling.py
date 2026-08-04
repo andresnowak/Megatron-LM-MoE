@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
 import os
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.optimizer.md_decoupling import MDDecoupling
 from megatron.core.optimizer.md_decoupling import _get_muon_scale_factor
+from megatron.core.optimizer.md_decoupling import _glu_fc1_split_dim
 from megatron.core.optimizer.md_decoupling import _md_init_state_fn
 from megatron.core.optimizer.md_decoupling import _split_qkv
 from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
@@ -83,6 +85,17 @@ def _gqa_qkv_optimizer(param, **kwargs):
         split_qkv=True,
         is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
         qkv_split_shapes=(4, 2, 2),
+        pg_collection=_NoProcessGroups(),
+        tp_mode="duplicated",
+        **kwargs,
+    )
+
+
+def _glu_fc1_optimizer(param, **kwargs):
+    return MDDecoupling(
+        params=[param],
+        lr=0.01,
+        split_fc1=True,
         pg_collection=_NoProcessGroups(),
         tp_mode="duplicated",
         **kwargs,
@@ -206,6 +219,7 @@ def test_md_decoupling_recipe_defaults():
     assert config.use_orthogonal_updates is True
     assert config.gain_parametrization == "softplus"
     assert config.muon_router_scale_mode == "none"
+    assert config.muon_split_fc1 is True
 
 
 def test_md_decoupling_zero_centered_softplus_gains_initialize_at_zero():
@@ -1222,6 +1236,73 @@ def test_md_decoupling_gqa_split_row_normalization():
     for part in _split_qkv(param, optimizer.qkv_split_shapes):
         row_norms = torch.linalg.vector_norm(part, dim=1)
         torch.testing.assert_close(row_norms, torch.ones_like(row_norms), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("name", "shape", "gated", "expected_dim"),
+    [
+        ("decoder.mlp.linear_fc1.weight", (8, 3), True, 0),
+        ("decoder.mlp.shared_experts.linear_fc1.weight", (8, 3), True, 0),
+        ("decoder.mlp.experts.local_experts.0.linear_fc1.weight", (8, 3), True, 0),
+        ("decoder.mlp.experts.linear_fc1.weight0", (8, 3), True, 0),
+        ("decoder.mlp.experts.weight1_expert_0", (3, 8), True, 1),
+        ("decoder.mlp.experts.weight1", (2, 8, 3), True, 1),
+        ("decoder.mlp.linear_fc1.weight", (8, 3), False, None),
+        ("decoder.mlp.linear_fc2.weight", (3, 4), True, None),
+    ],
+)
+def test_md_decoupling_glu_fc1_layout_detection(name, shape, gated, expected_dim):
+    param = torch.nn.Parameter(torch.empty(shape))
+    assert _glu_fc1_split_dim(name, param, gated) == expected_dim
+
+
+@pytest.mark.parametrize(
+    ("shape", "split_dim", "expected_part_shapes"),
+    [
+        ((8, 3), 0, [(4, 3), (4, 3)]),
+        ((3, 8), 1, [(3, 4), (3, 4)]),
+        ((2, 8, 3), 1, [(4, 3), (4, 3), (4, 3), (4, 3)]),
+    ],
+)
+def test_md_decoupling_glu_fc1_orthogonalizes_each_logical_matrix(
+    shape, split_dim, expected_part_shapes
+):
+    param = torch.nn.Parameter(torch.empty(shape))
+    param.glu_split_dim = split_dim
+    grad = torch.arange(math.prod(shape), dtype=torch.float32).view(shape)
+
+    output, calls = _record_md_split_output(
+        param,
+        grad,
+    )
+
+    assert [tuple(call.shape) for call in calls] == expected_part_shapes
+    assert output.shape == grad.shape
+
+
+@pytest.mark.parametrize(("shape", "split_dim"), [((8, 3), 0), ((3, 8), 1), ((2, 8, 3), 1)])
+def test_md_decoupling_glu_fc1_flat_normalization_is_block_local(shape, split_dim):
+    param = torch.nn.Parameter(torch.arange(1, math.prod(shape) + 1, dtype=torch.float32).view(shape))
+    param.glu_split_dim = split_dim
+    optimizer = _glu_fc1_optimizer(
+        param,
+        hypersphere_mode="flat",
+        hypersphere_preserve_init=True,
+    )
+
+    with torch.no_grad():
+        optimizer._normalize(
+            param,
+            param,
+            is_merged_offload_expert=param.ndim == 3,
+        )
+
+    parts, _ = optimizer._split_param_tensor(param, param)
+    expected_norms = torch.tensor(
+        [max(part.shape) ** 0.5 for part in parts], dtype=param.dtype
+    )
+    actual_norms = torch.stack([torch.linalg.vector_norm(part) for part in parts])
+    torch.testing.assert_close(actual_norms, expected_norms, rtol=1e-5, atol=1e-5)
 
 
 @requires_cuda_and_emerging

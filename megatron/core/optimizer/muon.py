@@ -74,6 +74,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
+        split_fc1: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: tuple[int, int, int] | None = None,
         is_kv_up_proj_fn: Callable[[torch.Tensor], bool] | None = None,
@@ -124,6 +125,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.pg_collection = pg_collection
         self.mode = mode
         self.split_qkv = split_qkv
+        self.split_fc1 = split_fc1
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
         self.is_kv_up_proj_fn = is_kv_up_proj_fn
@@ -211,6 +213,17 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 for g in qkv_grads
             ]
             grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
+        elif self.split_fc1 and (glu_split_dim := getattr(p, 'glu_split_dim', None)) is not None:
+            if grad.size(glu_split_dim) % 2 != 0:
+                raise ValueError(
+                    f"Fused GLU FC1 dimension {glu_split_dim} must be even, "
+                    f"got shape {tuple(grad.shape)}"
+                )
+            fc1_grads = torch.chunk(grad, 2, dim=glu_split_dim)
+            fc1_grads = [
+                self.scaled_orthogonalize_fn(g, tp_group, partition_dim) for g in fc1_grads
+            ]
+            grad = torch.cat(fc1_grads, dim=glu_split_dim)
         elif (
             self.split_qkv
             and self.is_qkv_down_proj_fn is not None
@@ -470,6 +483,12 @@ def get_megatron_muon_optimizer(
             # add flags for grouped QKV and MLA projection parameters
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
                 param.is_qkv = True
+            if (
+                getattr(model_chunk.config, 'gated_linear_unit', False)
+                and param.ndim == 2
+                and 'linear_fc1.weight' in name
+            ):
+                param.glu_split_dim = 0
             if 'linear_kv_up_proj.weight' in name and len(param.shape) == 2:
                 param.is_kv_up_proj = True
             if 'linear_q_up_proj.weight' in name and len(param.shape) == 2:
@@ -517,6 +536,7 @@ def get_megatron_muon_optimizer(
         "num_ns_steps": config.muon_num_ns_steps,
         "scale_mode": config.muon_scale_mode,
         "split_qkv": config.muon_split_qkv,
+        "split_fc1": config.muon_split_fc1,
         "is_qkv_fn": lambda p: getattr(p, "is_qkv", False),
         "qkv_split_shapes": qkv_split_shapes,
         "is_kv_up_proj_fn": lambda p: getattr(p, "is_kv_up_proj", False),

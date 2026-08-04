@@ -81,6 +81,44 @@ def _normalize_embedding_mode(mode):
     return None if mode == "external" else mode
 
 
+def _glu_fc1_split_dim(name: str, p: torch.Tensor, gated_linear_unit: bool) -> Optional[int]:
+    """Return the fused gate/up dimension for every supported GLU FC1 implementation."""
+    if not gated_linear_unit:
+        return None
+    if p.ndim == 2 and 'linear_fc1.weight' in name:
+        # Dense/shared MLP, SequentialMLP experts, and TEGroupedMLP expert weights.
+        return 0
+    if 'experts.weight1' in name and p.ndim in (2, 3):
+        # Offloaded experts store the fused output dimension at tensor dim 1.
+        return 1
+    return None
+
+
+def _split_glu_fc1(x: torch.Tensor, split_dim: int):
+    """Split a fused GLU FC1 tensor and return its logical matrices plus a merge function."""
+    if x.size(split_dim) % 2 != 0:
+        raise ValueError(
+            f"Fused GLU FC1 dimension {split_dim} must be even, got shape {tuple(x.shape)}"
+        )
+    if x.ndim == 2:
+        return (
+            list(torch.chunk(x, 2, dim=split_dim)),
+            lambda parts: torch.cat(parts, dim=split_dim),
+        )
+    if x.ndim == 3 and split_dim == 1:
+        parts = [part for expert in x.unbind(0) for part in torch.chunk(expert, 2, dim=0)]
+        return (
+            parts,
+            lambda parts: torch.stack(
+                [torch.cat(parts[i:i + 2], dim=0) for i in range(0, len(parts), 2)],
+                dim=0,
+            ),
+        )
+    raise ValueError(
+        f"Unsupported fused GLU FC1 layout: shape {tuple(x.shape)}, split dim {split_dim}"
+    )
+
+
 def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") -> float:
     """Muon orthogonalization scale factor.
 
@@ -279,6 +317,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         momentum_beta: float = 0.95,
         use_nesterov: bool = True,
         split_qkv: bool = True,
+        split_fc1: bool = True,
         qkv_split_shapes: Optional[tuple[int, int, int]] = None,
         qkv_dim: Optional[int] = None,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
@@ -323,6 +362,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             )
 
         self.split_qkv = split_qkv
+        self.split_fc1 = split_fc1
         self.is_qkv_fn = is_qkv_fn if is_qkv_fn is not None else (lambda p: False)
         self.qkv_split_shapes = qkv_split_shapes
         self.qkv_dim = qkv_dim
@@ -489,13 +529,16 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             p.add_(p, alpha=-weight_decay * group["lr"])
 
     def _split_param_tensor(self, p, x, is_qkv: bool = False):
-        """Return split views and a merge function for grouped QKV/MLA weights."""
+        """Return logical matrix parts and a merge function for fused projection weights."""
         if self.split_qkv and is_qkv:
             assert self.qkv_split_shapes is not None
             return (
                 _split_qkv(x, self.qkv_split_shapes),
                 lambda parts: _merge_qkv(parts, x.shape, self.qkv_split_shapes),
             )
+        glu_split_dim = getattr(p, "glu_split_dim", None)
+        if self.split_fc1 and glu_split_dim is not None:
+            return _split_glu_fc1(x, glu_split_dim)
         if self.split_qkv and self.is_qkv_down_proj_fn(p):
             assert self.qkv_down_proj_split_shapes is not None
             shapes = self._local_dim0_split_shapes(
@@ -1566,6 +1609,11 @@ def get_megatron_mddecoupling_optimizer(
                 param.merged_offload_expert = True
             if len(param.shape) == 2 and 'linear_qkv.weight' in name:
                 param.is_qkv = True
+            glu_split_dim = _glu_fc1_split_dim(
+                name, param, getattr(cfg, 'gated_linear_unit', False)
+            )
+            if glu_split_dim is not None:
+                param.glu_split_dim = glu_split_dim
             if len(param.shape) == 2 and 'linear_kv_up_proj.weight' in name:
                 param.is_kv_up_proj = True
             if len(param.shape) == 2 and 'linear_q_up_proj.weight' in name:
@@ -1642,6 +1690,7 @@ def get_megatron_mddecoupling_optimizer(
         momentum_beta=config.muon_momentum,
         use_nesterov=config.muon_use_nesterov,
         split_qkv=config.muon_split_qkv,
+        split_fc1=config.muon_split_fc1,
         is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
         qkv_split_shapes=qkv_split_shapes,
         qkv_dim=model_chunks[0].config.kv_channels,

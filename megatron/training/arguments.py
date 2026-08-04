@@ -1487,6 +1487,13 @@ def validate_args(args, defaults={}):
         assert args.gradient_accumulation_fusion, "MoE expert offloading currently requires gradient accumulation fusion to be enabled."
         assert args.bf16, "MoE expert offloading currently requires using bfloat16 precision."
         assert not args.async_save, "Asynchronous checkpoint saving is not supported with MoE expert offloading for now."
+        if args.optimizer == 'muon':
+            warn_rank_0(
+                'MoE expert offloading is not currently correctly supported by the standalone '
+                'Muon optimizer: regular offloaded expert weights are orthogonalized in their '
+                'transposed fused shape without splitting gate/up, while merged FP8 expert '
+                'weights do not undergo Muon orthogonalization.'
+            )
 
         if args.overlap_grad_reduce:
             args.moe_offloading_experts_skip_post_backward_hook = True
@@ -2594,6 +2601,10 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
+    group.add_argument('--muon-no-split-fc1', action='store_false', default=True,
+                       dest='muon_split_fc1',
+                       help='Whether to split fused GLU FC1 parameters into gate/up matrices '
+                       'for Muon or MDDecoupling')
     group.add_argument('--muon-split-mla-per-head', action='store_true',
                        help='Split MLA up-projection parameters per attention head for Muon or '
                        'MDDecoupling.')

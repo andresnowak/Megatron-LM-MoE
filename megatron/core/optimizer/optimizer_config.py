@@ -268,6 +268,10 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_fc1: bool = True
+    """Whether to split fused GLU FC1 parameters into gate/up matrices for Muon and
+    MDDecoupling."""
+
     muon_split_mla_per_head: bool = False
     """Whether to split MLA up-projection parameters per attention head for Muon optimizer."""
 
