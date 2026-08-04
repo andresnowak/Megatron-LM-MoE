@@ -208,25 +208,25 @@ class LoggerConfig:
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
 
-    log_muon_md_gains: bool = False
-    """If set, log effective Muon-MD gain statistics by parameter family and gain axis."""
+    log_muon_gains: bool = False
+    """If set, log available Muon or Muon-MD gain statistics by parameter family."""
 
-    log_muon_md_sparsity: bool = False
-    """If set, log effective-weight sparsity by Muon-MD parameter family."""
+    log_muon_sparsity: bool = False
+    """If set, log weight sparsity by Muon parameter family."""
 
-    log_muon_md_param_rms: bool = False
-    """If set, log effective-weight RMS by Muon-MD parameter family."""
+    log_muon_param_rms: bool = False
+    """If set, log weight RMS by Muon parameter family."""
 
-    log_muon_md_per_layer: bool = False
-    """If set, additionally log all Muon-MD statistics by global layer."""
+    log_muon_per_layer: bool = False
+    """If set, additionally log all Muon statistics by global layer."""
 
-    muon_md_log_interval: int | None = None
-    """Muon-MD logging interval. Defaults to log_interval when unset."""
+    muon_log_interval: int | None = None
+    """Muon logging interval. Defaults to log_interval when unset."""
 
-    muon_md_sparsity_thresholds: list[float] = field(
+    muon_sparsity_thresholds: list[float] = field(
         default_factory=lambda: [1e-20, 1e-10, 1e-30]
     )
-    """Absolute effective-weight thresholds used for Muon-MD sparsity logging."""
+    """Absolute weight thresholds used for Muon sparsity logging."""
 
     log_throughput: bool = False
     """If set, calculate and log throughput per GPU."""

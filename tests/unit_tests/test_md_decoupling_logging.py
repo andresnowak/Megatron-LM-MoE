@@ -8,12 +8,12 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-import megatron.core.optimizer.md_decoupling_logging as md_logging_module
+import megatron.core.optimizer.muon_logging as md_logging_module
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.optimizer.md_decoupling import MDDecoupling
-from megatron.core.optimizer.md_decoupling_logging import _gain_log_family
-from megatron.core.optimizer.md_decoupling_logging import _include_gain_in_global_stats
-from megatron.core.optimizer.md_decoupling_logging import collect_md_gain_stats
+from megatron.core.optimizer.muon_logging import _gain_log_family
+from megatron.core.optimizer.muon_logging import _include_gain_in_global_stats
+from megatron.core.optimizer.muon_logging import collect_md_gain_stats
 from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 

@@ -15,6 +15,7 @@ from megatron.core.utils import get_pg_size, log_single_rank
 
 from . import HAVE_EMERGING_OPTIMIZERS, HAVE_EO_V02, _get_param_groups, get_megatron_optimizer
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
+from .muon_logging import _gain_log_family
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -457,6 +458,7 @@ def get_megatron_muon_optimizer(
             mla_config.kv_lora_rank + mla_config.qk_pos_emb_head_dim,
         ) if is_mla and getattr(mla_config, 'q_lora_rank', None) is not None else None
 
+        named_modules = dict(model_chunk.named_modules())
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -474,6 +476,23 @@ def get_megatron_muon_optimizer(
                 param.is_q_up_proj = True
             if 'linear_qkv_down_proj.weight' in name and len(param.shape) == 2:
                 param.is_qkv_down_proj = True
+            if len(param.shape) == 2 and name.endswith('router.weight'):
+                param.is_router = True
+            if len(param.shape) == 2 and ('linear_fc2' in name or 'linear_proj' in name):
+                param.is_out_proj = True
+            param.md_gain_log_family = _gain_log_family(name, param)
+            if param.md_gain_log_family == "layernorm":
+                param.md_layernorm_gain_offset = float(
+                    getattr(model_chunk.config, "layernorm_zero_centered_gamma", False)
+                )
+            module_name = name.rpartition('.')[0]
+            while module_name:
+                module = named_modules.get(module_name)
+                layer_number = getattr(module, 'layer_number', None)
+                if layer_number is not None:
+                    param.md_gain_log_layer = int(layer_number) - 1
+                    break
+                module_name = module_name.rpartition('.')[0]
             # TODO(deyuf): currently only allow 2D non-embedding weight to avoid breaking
             if (
                 not getattr(param, 'is_embedding_or_output_parameter', False)

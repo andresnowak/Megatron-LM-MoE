@@ -43,7 +43,7 @@ from . import (
     get_standard_config_overrides,
 )
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer
-from .md_decoupling_logging import _gain_log_family
+from .muon_logging import _gain_log_family
 from .optimizer import (
     ChainedOptimizer,
     Float16OptimizerWithFloat16Params,
@@ -1589,7 +1589,7 @@ def get_megatron_mddecoupling_optimizer(
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)
             if param.md_gain_log_family == "layernorm":
-                # This tagging is just to be able to log layernorm gain under md_decoupling_logging
+                # This tagging is just to be able to log layernorm gain under muon_logging
                 param.md_layernorm_gain_offset = float(
                     getattr(model_chunk.config, "layernorm_zero_centered_gamma", False)
                 )

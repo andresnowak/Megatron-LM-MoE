@@ -179,7 +179,10 @@ from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
-from megatron.core.optimizer.md_decoupling_logging import collect_md_gain_stats
+from megatron.core.optimizer.muon_logging import (
+    collect_md_gain_stats,
+    collect_muon_stats,
+)
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -3252,20 +3255,21 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-        if (
-            args.log_muon_md_gains
-            or args.log_muon_md_sparsity
-            or args.log_muon_md_param_rms
-        ):
-            muon_md_log_interval = args.muon_md_log_interval or args.log_interval
-            if iteration % muon_md_log_interval == 0:
-                md_gain_stats = collect_md_gain_stats(
+        if args.log_muon_gains or args.log_muon_sparsity or args.log_muon_param_rms:
+            muon_log_interval = args.muon_log_interval or args.log_interval
+            if iteration % muon_log_interval == 0:
+                collect_muon_stats = (
+                    collect_md_gain_stats
+                    if args.optimizer == "md_decoupling"
+                    else collect_muon_stats
+                )
+                md_gain_stats = collect_muon_stats(
                     optimizer,
-                    per_layer=args.log_muon_md_per_layer,
-                    sparsity_thresholds=args.muon_md_sparsity_thresholds,
-                    log_gains=args.log_muon_md_gains,
-                    log_sparsity=args.log_muon_md_sparsity,
-                    log_param_rms=args.log_muon_md_param_rms,
+                    per_layer=args.log_muon_per_layer,
+                    sparsity_thresholds=args.muon_sparsity_thresholds,
+                    log_gains=args.log_muon_gains,
+                    log_sparsity=args.log_muon_sparsity,
+                    log_param_rms=args.log_muon_param_rms,
                 )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
