@@ -13,8 +13,8 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_biased_logits,
     apply_random_logits,
     apply_router_token_dropping,
+    compute_qb_histogram,
     compute_routing_scores_for_aux_loss,
-    expert_load_violation_batchwise,
     get_tokens_per_expert_and_token_count,
     qb_dual_update,
     router_gating_linear,
@@ -26,17 +26,6 @@ from megatron.core.transformer.moe.moe_utils import (
 )
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-
-
-def _aggregate_expert_load_across_ep(
-    tokens_per_expert: torch.Tensor,
-    total_num_tokens: int,
-    ep_group: torch.distributed.ProcessGroup,
-):
-    """Aggregate expert and valid-token counts over the expert-parallel group."""
-    counts = torch.cat((tokens_per_expert, tokens_per_expert.new_tensor([total_num_tokens])))
-    torch.distributed.all_reduce(counts, group=ep_group)
-    return counts[:-1], counts[-1]
 
 
 class Router(ABC, MegatronModule):
@@ -192,6 +181,12 @@ class TopKRouter(Router):
             ),
             persistent=False,
         )
+        # Retain local counts until finalization so TP/CP communication is batched.
+        self.mbs_expert_load_samples = []
+        self.seq_expert_load_samples = []
+        # Inference samples have an independent consume/reset lifecycle.
+        self.inference_mbs_expert_load_samples = []
+        self.inference_seq_expert_load_samples = []
 
         self.enable_expert_bias = self.config.moe_router_enable_expert_bias
         if self.enable_expert_bias:
@@ -226,10 +221,10 @@ class TopKRouter(Router):
             self.global_tokens_per_expert = None
             self.ga_steps = None
 
-        # Quantile balancing uses a per-expert bias `qb_beta`; it may be combined with
-        # sequence-level aux loss through the load-balancing type list.
-        # `qb_beta_accum`/`qb_beta_count` collect the per-microbatch quantile, reduced
-        # and reset each global batch.
+        # Quantile balancing uses a per-expert threshold `qb_beta`; it may be combined with
+        # sequence-level aux loss through the load-balancing type list. The average method
+        # accumulates per-microbatch quantiles, while the histogram method accumulates local
+        # counts and recovers the pooled quantile at the global-batch boundary.
         if "quantile_balancing" in self.routing_type:
             self.register_buffer(
                 'qb_beta',
@@ -239,22 +234,40 @@ class TopKRouter(Router):
                     device=torch.cuda.current_device(),
                 ),
             )
-            self.register_buffer(
-                'qb_beta_accum',
-                torch.zeros(
-                    self.config.num_moe_experts,
-                    dtype=torch.float32,
-                    device=torch.cuda.current_device(),
-                ),
-                persistent=False,
-            )
-            self.register_buffer(
-                'qb_beta_count',
-                torch.zeros((), dtype=torch.long, device=torch.cuda.current_device()),
-                persistent=False,
-            )
+            if self.config.moe_router_quantile_balancing_method == 'histogram':
+                self.register_buffer(
+                    'qb_histogram',
+                    torch.zeros(
+                        (
+                            self.config.num_moe_experts,
+                            self.config.moe_router_quantile_balancing_num_bins,
+                        ),
+                        dtype=torch.int64,
+                        device=torch.cuda.current_device(),
+                    ),
+                    persistent=False,
+                )
+                self.qb_beta_accum = None
+                self.qb_beta_count = None
+            else:
+                self.qb_histogram = None
+                self.register_buffer(
+                    'qb_beta_accum',
+                    torch.zeros(
+                        self.config.num_moe_experts,
+                        dtype=torch.float32,
+                        device=torch.cuda.current_device(),
+                    ),
+                    persistent=False,
+                )
+                self.register_buffer(
+                    'qb_beta_count',
+                    torch.zeros((), dtype=torch.long, device=torch.cuda.current_device()),
+                    persistent=False,
+                )
         else:
             self.qb_beta = None
+            self.qb_histogram = None
             self.qb_beta_accum = None
             self.qb_beta_count = None
 
@@ -316,7 +329,14 @@ class TopKRouter(Router):
     def quantile_balancing(
         self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
     ):
-        """Apply quantile-balancing (QB) routing to the logits tensor (from https://github.com/NVIDIA/Megatron-LM/pull/5349)."""
+        """Apply average or histogram quantile-balancing routing.
+
+        The average methods gather TP/CP values and accumulate one quantile per
+        microbatch for later averaging. ``legacy_average`` uses raw logits for
+        compatibility with older QB checkpoints, while ``average`` uses bounded
+        router scores. The histogram method performs no forward-pass communication:
+        it accumulates local counts that are pooled once at the batch boundary.
+        """
         assert (
             not self.config.moe_router_fusion
         ), "Quantile balancing routing does not support moe_router_fusion."
@@ -325,8 +345,8 @@ class TopKRouter(Router):
         ), "Quantile balancing routing does not support group-limited routing."
 
         local_num_tokens = logits.shape[0]
-        # Gather logits across TP/CP only for the beta quantile update. Routing itself is
-        # per-token and can use the local logits with the previous global-batch qb_beta.
+        # The average estimators gather QB scores across TP/CP. The histogram estimator
+        # does not use this group during the forward pass.
         gather_group = self.tp_cp_group
         gather_size = gather_group.size() if gather_group is not None else 1
 
@@ -334,54 +354,92 @@ class TopKRouter(Router):
 
         with torch.no_grad():
             logits_fp32 = logits.detach().to(dtype=torch.float32)
-            indices = (logits_fp32 - self.qb_beta).topk(self.topk, dim=1).indices
+            if self.score_function == "sigmoid":
+                scores = torch.sigmoid(logits_fp32)
+            elif self.score_function == "softmax":
+                scores = torch.softmax(logits_fp32, dim=-1)
+            else:
+                raise ValueError(f"Invalid score_function: {self.score_function}")
+
+            # NOTE: Legacy average is so that previous checkpoints that used the average method can still be loaded and work correctly.
+            # This backwards compatibility should probably be removed in 1 or 2 months from this git blame
+            qb_scores = (
+                logits_fp32
+                if self.config.moe_router_quantile_balancing_method == 'legacy_average'
+                else scores
+            )
+            biased_scores = qb_scores - self.qb_beta
+            use_histogram = (
+                self.config.moe_router_quantile_balancing_method == 'histogram'
+            )
+            if should_update_beta and use_histogram:
+                topk_result = biased_scores.topk(self.topk + 1, dim=1)
+                indices = topk_result.indices[:, : self.topk]
+            else:
+                indices = biased_scores.topk(self.topk, dim=1).indices
 
             if should_update_beta:
-                beta_logits = logits_fp32
-                beta_padding_mask = padding_mask
-                if gather_size > 1:
-                    # TODO: we could cache a reusable gather buffer sized for the max token count.
-                    beta_logits = torch.empty(
-                        (local_num_tokens * gather_size, self.config.num_moe_experts),
-                        dtype=logits_fp32.dtype,
-                        device=logits_fp32.device,
-                    )
-                    logits_work = torch.distributed.all_gather_into_tensor(
-                        beta_logits,
-                        logits_fp32.contiguous(),
-                        group=gather_group,
-                        async_op=True,
-                    )
-                    mask_work = None
+                if use_histogram:
+                    valid_scores = scores
+                    valid_alpha = topk_result.values[:, -1]
                     if padding_mask is not None:
-                        local_padding_mask = padding_mask.to(dtype=torch.uint8)
-                        beta_padding_mask = torch.empty(
-                            local_num_tokens * gather_size,
-                            dtype=local_padding_mask.dtype,
-                            device=local_padding_mask.device,
+                        valid_scores = valid_scores[~padding_mask]
+                        valid_alpha = valid_alpha[~padding_mask]
+                    if valid_scores.numel() > 0:
+                        histogram = compute_qb_histogram(
+                            valid_scores,
+                            valid_alpha,
+                            self.qb_beta,
+                            self.config.moe_router_quantile_balancing_num_bins,
                         )
-                        mask_work = torch.distributed.all_gather_into_tensor(
-                            beta_padding_mask,
-                            local_padding_mask,
+                        self.qb_histogram.add_(histogram)
+                else:
+                    beta_scores = qb_scores
+                    beta_padding_mask = padding_mask
+                    if gather_size > 1:
+                        # TODO: we could cache a reusable gather buffer sized for the max token count.
+                        gathered_beta_scores = torch.empty(
+                            (local_num_tokens * gather_size, self.config.num_moe_experts),
+                            dtype=logits_fp32.dtype,
+                            device=logits_fp32.device,
+                        )
+                        scores_work = torch.distributed.all_gather_into_tensor(
+                            gathered_beta_scores,
+                            beta_scores.contiguous(),
                             group=gather_group,
                             async_op=True,
                         )
+                        mask_work = None
+                        if padding_mask is not None:
+                            local_padding_mask = padding_mask.to(dtype=torch.uint8)
+                            beta_padding_mask = torch.empty(
+                                local_num_tokens * gather_size,
+                                dtype=local_padding_mask.dtype,
+                                device=local_padding_mask.device,
+                            )
+                            mask_work = torch.distributed.all_gather_into_tensor(
+                                beta_padding_mask,
+                                local_padding_mask,
+                                group=gather_group,
+                                async_op=True,
+                            )
 
-                    logits_work.wait()
-                    if mask_work is not None:
-                        mask_work.wait()
+                        scores_work.wait()
+                        if mask_work is not None:
+                            mask_work.wait()
 
-                    if padding_mask is not None:
-                        beta_padding_mask = beta_padding_mask.bool()
+                        beta_scores = gathered_beta_scores
+                        if padding_mask is not None:
+                            beta_padding_mask = beta_padding_mask.bool()
 
-                if beta_padding_mask is not None:
-                    beta_logits = beta_logits[~beta_padding_mask]
-                if beta_logits.numel() > 0:
-                    _, beta_local = qb_dual_update(
-                        beta_logits, self.topk, self.qb_beta, update_beta=True
-                    )
-                    self.qb_beta_accum.add_(beta_local)
-                    self.qb_beta_count.add_(1)
+                    if beta_padding_mask is not None:
+                        beta_scores = beta_scores[~beta_padding_mask]
+                    if beta_scores.numel() > 0:
+                        _, beta_local = qb_dual_update(
+                            beta_scores, self.topk, self.qb_beta, update_beta=True
+                        )
+                        self.qb_beta_accum.add_(beta_local)
+                        self.qb_beta_count.add_(1)
 
         # QB only picks the experts; reuse the shared score function for the probs.
         return topk_routing_with_score_function(
@@ -806,64 +864,50 @@ class TopKRouter(Router):
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
 
-        if self.training and torch.is_grad_enabled():
+        if (
+            self.training
+            and torch.is_grad_enabled()
+            and self.config.moe_router_violation_metrics
+        ):
+            violation_metrics = self.config.moe_router_violation_metrics
+            mbs_samples = self.mbs_expert_load_samples
+            seq_samples = self.seq_expert_load_samples
+        elif (
+            not self.training
+            and not torch.is_grad_enabled()
+            and self.config.moe_router_inference_violation_metrics
+        ):
+            violation_metrics = self.config.moe_router_inference_violation_metrics
+            mbs_samples = self.inference_mbs_expert_load_samples
+            seq_samples = self.inference_seq_expert_load_samples
+        else:
+            violation_metrics = None
+
+        if violation_metrics is not None:
             with torch.no_grad():
-                num_layers = self.config.num_layers
-                if self.config.mtp_num_layers is not None:
-                    num_layers += self.config.mtp_num_layers
-
-                expert_max_violation_routing_map = routing_map
-                total_num_tokens = routing_map.shape[0]
+                expert_load_routing_map = routing_map.reshape(seq_length, bsz, -1)
                 if padding_mask is not None:
-                    expert_max_violation_routing_map = routing_map & (~padding_mask.unsqueeze(-1))
-                    total_num_tokens = (~padding_mask).sum().item()
-
-                tokens_per_expert = expert_max_violation_routing_map.sum(dim=0).float()
-                max_violation, min_violation, median_violation = expert_load_violation_batchwise(
-                    tokens_per_expert=tokens_per_expert,
-                    num_experts=self.config.num_moe_experts,
-                    total_num_tokens=total_num_tokens,
-                    topk=self.topk,
-                )
-                for name, value in (
-                    ("expert_max_violation", max_violation),
-                    ("expert_min_violation", min_violation),
-                    ("expert_median_violation", median_violation),
-                ):
-                    save_to_aux_losses_tracker(
-                        name,
-                        value,
-                        self.layer_number,
-                        num_layers,
-                        reduce_group=self.tp_cp_group,
+                    valid_tokens = ~padding_mask.reshape(seq_length, bsz)
+                    expert_load_routing_map = expert_load_routing_map & valid_tokens.unsqueeze(-1)
+                    seq_num_tokens = valid_tokens.sum(dim=0, dtype=torch.float32).unsqueeze(-1)
+                else:
+                    seq_num_tokens = torch.full(
+                        (bsz, 1),
+                        seq_length,
+                        dtype=torch.float32,
+                        device=routing_map.device,
                     )
 
-                if self.config.moe_router_ep_violation_metrics:
-                    ep_tokens_per_expert, ep_total_num_tokens = (
-                        _aggregate_expert_load_across_ep(
-                            tokens_per_expert, total_num_tokens, self.ep_group
-                        )
+                seq_tokens_per_expert = expert_load_routing_map.sum(dim=0, dtype=torch.float32)
+                if "seq" in violation_metrics:
+                    seq_samples.append(
+                        torch.cat((seq_tokens_per_expert, seq_num_tokens), dim=-1)
                     )
-                    ep_max_violation, ep_min_violation, ep_median_violation = (
-                        expert_load_violation_batchwise(
-                            tokens_per_expert=ep_tokens_per_expert,
-                            num_experts=self.config.num_moe_experts,
-                            total_num_tokens=ep_total_num_tokens,
-                            topk=self.topk,
-                        )
-                    )
-                    for name, value in (
-                        ("ep_expert_max_violation", ep_max_violation),
-                        ("ep_expert_min_violation", ep_min_violation),
-                        ("ep_expert_median_violation", ep_median_violation),
-                    ):
-                        save_to_aux_losses_tracker(
-                            name,
-                            value,
-                            self.layer_number,
-                            num_layers,
-                            reduce_group=self.tp_cp_group,
-                        )
+
+                if "mbs" in violation_metrics or "ep" in violation_metrics:
+                    mbs_tokens_per_expert = seq_tokens_per_expert.sum(dim=0)
+                    mbs_num_tokens = seq_num_tokens.sum(dim=0)
+                    mbs_samples.append(torch.cat((mbs_tokens_per_expert, mbs_num_tokens)))
 
         return probs, routing_map
 
@@ -994,10 +1038,19 @@ class InferenceTopKRouter(TopKRouter):
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         logits = self.gating(input).squeeze(1)  # [num_tokens, num_experts]
 
-        # QB selects on (logits - qb_beta); at inference qb_beta is fixed.
+        # QB uses the configured score space with a fixed inference-time qb_beta.
         precomputed_indices = None
         if self.qb_beta is not None:
-            precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
+            logits_fp32 = logits.to(dtype=torch.float32)
+            if self.config.moe_router_quantile_balancing_method == 'legacy_average':
+                qb_scores = logits_fp32
+            elif self.score_function == "sigmoid":
+                qb_scores = torch.sigmoid(logits_fp32)
+            elif self.score_function == "softmax":
+                qb_scores = torch.softmax(logits_fp32, dim=-1)
+            else:
+                raise ValueError(f"Invalid score_function: {self.score_function}")
+            precomputed_indices = (qb_scores - self.qb_beta).topk(self.topk, dim=1).indices
 
         probs, top_indices = self._compiled_topk_routing(
             logits,

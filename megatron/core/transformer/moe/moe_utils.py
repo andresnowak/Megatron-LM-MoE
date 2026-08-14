@@ -3,7 +3,7 @@
 import functools
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -22,7 +22,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import internal_api, is_te_min_version
+from megatron.core.utils import get_model_config, internal_api, is_te_min_version
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -218,6 +218,103 @@ def qb_dual_update(
     alpha = topk_result.values[:, -1:]
     beta_local = (scores - alpha).topk(col_target + 1, dim=0).values[-1].contiguous()
     return indices, beta_local
+
+
+def compute_qb_histogram(
+    scores: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    num_bins: int,
+) -> torch.Tensor:
+    """Histogram the per-token QB bias required by every expert.
+
+    Implements the histogram estimator from the Kimi K3 Technical Report:
+    https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf
+
+    ``beta`` is the threshold subtracted from ``scores`` by Megatron's QB
+    implementation, while the Kimi K3 derivation uses an additive bias. Thus
+    the required additive bias is ``r = alpha - scores`` and its bounded range
+    is ``[-beta.max() - 1, -beta.min() + 1]`` for scores in ``[0, 1]``.
+
+    Args:
+        scores: Router scores in ``[0, 1]``, shaped ``[num_tokens, num_experts]``.
+        alpha: Biased Top-(k+1) cutoff for each token, shaped ``[num_tokens]``.
+        beta: Current per-expert subtractive QB threshold, shaped ``[num_experts]``.
+        num_bins: Number of uniform histogram bins.
+
+    Returns:
+        Per-expert integer counts shaped ``[num_experts, num_bins]``.
+    """
+    assert scores.dim() == 2
+    assert alpha.dim() == 1 and alpha.shape[0] == scores.shape[0]
+    assert beta.dim() == 1 and beta.shape[0] == scores.shape[1]
+    assert num_bins > 0
+
+    num_experts = scores.shape[1]
+    # We have a guarantee that r_{i, j} = alpha_i - scores_{i, j} is in [-beta.max() - 1, -beta.min() + 1], where beta.max and beta.min are the past values of beta.
+    lower = -beta.max() - 1.0
+    upper = -beta.min() + 1.0
+    width = (upper - lower) / num_bins
+
+    # Offset each expert's bin IDs into a disjoint range so one bincount builds
+    # the complete 2D histogram without materializing an equally large tensor
+    # of integer ones for scatter_add.
+    r = alpha.unsqueeze(1) - scores
+    bin_indices = ((r - lower) / width).clamp_(
+        min=0, max=num_bins - 1
+    ) # upper bin index is part of the last bin, so clamp to num_bins - 1
+    bin_indices = bin_indices.to(torch.long)
+
+    expert_offsets = torch.arange(num_experts, device=scores.device) * num_bins
+    bin_indices.add_(expert_offsets)
+    return torch.bincount(
+        bin_indices.reshape(-1), minlength=num_experts * num_bins
+    ).reshape(num_experts, num_bins)
+
+
+def recover_qb_beta_from_histogram(
+    histogram: torch.Tensor,
+    beta: torch.Tensor,
+    topk: int,
+) -> torch.Tensor:
+    """Recover Megatron's subtractive QB threshold from pooled histogram counts.
+
+    Leading dimensions are supported so all MoE layers can be decoded together.
+    The first bin whose cumulative count reaches ``ceil(num_tokens * topk /
+    num_experts)`` is selected and the quantile is linearly interpolated inside
+    that bin. Empty histograms preserve the current beta.
+    """
+    assert histogram.dim() >= 2
+    assert beta.shape == histogram.shape[:-1]
+    assert histogram.shape[-2] > topk > 0
+
+    num_experts, num_bins = histogram.shape[-2:]
+    token_counts = histogram.sum(dim=-1)
+    target_rank = torch.div(
+        token_counts * topk + num_experts - 1, # round up to ceil(num_tokens * topk / num_experts)
+        num_experts,
+        rounding_mode='floor',
+    ) # This is the q variable in the Kimi K3 Technical Report.
+
+    cumulative = histogram.cumsum(dim=-1)
+    selected_bin = (cumulative >= target_rank.unsqueeze(-1)).to(torch.int64).argmax(dim=-1)
+    selected_count = histogram.gather(-1, selected_bin.unsqueeze(-1)).squeeze(-1)
+    cumulative_at_bin = cumulative.gather(-1, selected_bin.unsqueeze(-1)).squeeze(-1)
+    count_before = cumulative_at_bin - selected_count # This is the number of tokens that are in bins before the selected bin. seelcted_count is the number of tokens that are in the selected bin.
+    fraction = (
+        (target_rank - count_before).to(beta.dtype)
+        / selected_count.clamp_min(1).to(beta.dtype)
+    ).clamp_(0, 1)
+
+    # We have a guarantee that r_{i, j} = alpha_i - scores_{i, j} is in [-beta.max() - 1, -beta.min() + 1], where beta.max and beta.min are the past values of beta.
+    lower = -beta.max(dim=-1).values - 1.0
+    upper = -beta.min(dim=-1).values + 1.0
+    width = (upper - lower) / num_bins
+    required_additive_bias = lower.unsqueeze(-1) + (
+        selected_bin.to(beta.dtype) + fraction
+    ) * width.unsqueeze(-1)
+    estimated_beta = -required_additive_bias
+    return torch.where(token_counts > 0, estimated_beta, beta)
 
 
 def get_capacity(
@@ -988,6 +1085,164 @@ def expert_load_violation_batchwise(
     ideal_tokens_per_expert = effective_total_tokens / num_experts
     violation_ratios = (tokens_per_expert - ideal_tokens_per_expert) / ideal_tokens_per_expert
     return violation_ratios.max(), violation_ratios.min(), violation_ratios.median()
+
+
+@torch.no_grad()
+def consume_inference_router_violation_metrics(
+    model: Union[torch.nn.Module, Sequence[torch.nn.Module]],
+    pg_collection: Optional[ProcessGroupCollection] = None,
+) -> Dict[str, float]:
+    """Reduce and clear router violation samples accumulated during inference.
+
+    Every participating rank must call this function at the same synchronization point after the
+    same eager forward or collection window. Each result is the average of the corresponding
+    per-observation, per-layer expert-distribution statistic, weighted correctly for uneven
+    data-parallel batches. Calling this function is also the reset operation for the collection
+    window. Python-side collection is not compatible with CUDA graph replay.
+
+    Args:
+        model: A model or sequence of virtual-pipeline model chunks.
+        pg_collection: Optional process groups. Defaults to the global parallel state.
+
+    Returns:
+        Aggregate min, max, median, and population-standard-deviation violation metrics for each
+        collected scope. When ``moe_per_layer_logging`` is enabled, the same metrics are returned
+        with ``_layer_<zero-based global layer index>`` suffixes. Scopes and layers without
+        observations are omitted.
+    """
+    model_chunks = [model] if isinstance(model, torch.nn.Module) else list(model)
+    model_config = get_model_config(model_chunks[0])
+    per_layer_logging = model_config.moe_per_layer_logging
+    num_metric_layers = model_config.num_layers + (model_config.mtp_num_layers or 0) if per_layer_logging else 0
+
+    router_modules = []
+    sample_sizes = []
+    samples = []
+
+    for model_chunk in model_chunks:
+        for module in model_chunk.modules():
+            mbs_samples = getattr(module, 'inference_mbs_expert_load_samples', None)
+            seq_samples = getattr(module, 'inference_seq_expert_load_samples', None)
+            if not mbs_samples and not seq_samples:
+                continue
+
+            module_samples = []
+            mbs_sample_count = len(mbs_samples) if mbs_samples else 0
+            seq_sample_count = sum(sample.shape[0] for sample in seq_samples) if seq_samples else 0
+            if mbs_sample_count:
+                module_samples.append(torch.stack(mbs_samples))
+            if seq_sample_count:
+                module_samples.append(torch.cat(seq_samples))
+
+            router_modules.append(module)
+            sample_sizes.append((mbs_sample_count, seq_sample_count))
+            samples.append(
+                torch.cat(module_samples) if len(module_samples) > 1 else module_samples[0]
+            )
+
+    if samples:
+        stacked_samples = torch.cat(samples)
+        tp_cp_group = router_modules[0].tp_cp_group
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size(tp_cp_group) > 1:
+            # We pool the counts of the TP and CP group as the sequence is devided into mulitple chunks in this group. The counts are then reduced across the group to get the total counts for each expert.
+            torch.distributed.all_reduce(
+                stacked_samples, op=torch.distributed.ReduceOp.SUM, group=tp_cp_group
+            )
+        device = stacked_samples.device
+    else:
+        stacked_samples = None
+        device = next(model_chunks[0].parameters()).device
+
+    # Dimension 0 contains the aggregate followed by optional global layers. Dimension 1 is
+    # mbs/seq; dimension 2 contains max, min, median, std, and observation count.
+    accumulators = torch.zeros(
+        (1 + num_metric_layers, 2, 5), dtype=torch.float64, device=device
+    )
+
+    def accumulate(scope_index: int, module: torch.nn.Module, counts: torch.Tensor) -> None:
+        # Fully padded rows are not logical observations and must not dilute the metrics.
+        counts = counts[counts[:, -1] > 0]
+        if counts.numel() == 0:
+            return
+        tokens_per_expert = counts[:, :-1]
+        total_num_tokens = counts[:, -1:]
+        ideal_tokens_per_expert = total_num_tokens * module.topk / tokens_per_expert.shape[-1]
+        violation = (tokens_per_expert - ideal_tokens_per_expert) / ideal_tokens_per_expert
+        stats = torch.stack(
+            (
+                violation.max(dim=-1).values,
+                violation.min(dim=-1).values,
+                violation.median(dim=-1).values,
+                violation.std(dim=-1, correction=0),
+            ),
+            dim=-1,
+        )
+        stats_sum = stats.double().sum(dim=0)
+        observation_count = counts.shape[0]
+        accumulators[0, scope_index, :4] += stats_sum
+        accumulators[0, scope_index, 4] += observation_count
+
+        if per_layer_logging:
+            if module.layer_number is None:
+                raise ValueError("Router layer number is required for per-layer inference metrics")
+            layer_index = module.layer_number - 1
+            if module.is_mtp_layer:
+                layer_index += model_config.num_layers
+            if not 0 <= layer_index < num_metric_layers:
+                raise ValueError(
+                    f"Router layer index {layer_index} is outside [0, {num_metric_layers})"
+                )
+            accumulators[layer_index + 1, scope_index, :4] += stats_sum
+            accumulators[layer_index + 1, scope_index, 4] += observation_count
+
+    if stacked_samples is not None:
+        offset = 0
+        for module, (mbs_sample_count, seq_sample_count) in zip(router_modules, sample_sizes):
+            accumulate(0, module, stacked_samples[offset : offset + mbs_sample_count])
+            offset += mbs_sample_count
+            accumulate(1, module, stacked_samples[offset : offset + seq_sample_count])
+            offset += seq_sample_count
+
+    if torch.distributed.is_initialized():
+        if pg_collection is None:
+            dp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=False, partial_data_parallel=False
+            )
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+        else:
+            dp_group = pg_collection.dp
+            pp_group = pg_collection.pp
+        for group in (dp_group, pp_group):
+            if group is not None and torch.distributed.get_world_size(group) > 1:
+                torch.distributed.all_reduce(
+                    accumulators, op=torch.distributed.ReduceOp.SUM, group=group
+                )
+
+    for module in router_modules:
+        module.inference_mbs_expert_load_samples.clear()
+        module.inference_seq_expert_load_samples.clear()
+
+    metric_names = ('max', 'min', 'median', 'std')
+    metrics = {}
+
+    def export_metrics(accumulator: torch.Tensor, suffix: str = '') -> None:
+        for scope_index, scope_name in enumerate(('mbs', 'seq')):
+            observation_count = accumulator[scope_index, 4]
+            if observation_count.item() == 0:
+                continue
+            values = accumulator[scope_index, :4] / observation_count
+            metrics.update(
+                {
+                    f'moe_router_{scope_name}_{metric_name}_violation{suffix}': value.item()
+                    for metric_name, value in zip(metric_names, values)
+                }
+            )
+
+    export_metrics(accumulators[0])
+    if per_layer_logging:
+        for layer_index in range(num_metric_layers):
+            export_metrics(accumulators[layer_index + 1], suffix=f'_layer_{layer_index}')
+    return metrics
 
 
 def expert_max_violation_batchwise(

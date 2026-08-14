@@ -2229,13 +2229,18 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
-        track_names.append("expert_max_violation")
-        track_names.append("expert_min_violation")
-        track_names.append("expert_median_violation")
+        if "mbs" in args.moe_router_violation_metrics:
+            track_names.append("expert_max_violation")
+            track_names.append("expert_min_violation")
+            track_names.append("expert_median_violation")
+        if "seq" in args.moe_router_violation_metrics:
+            track_names.append("seq_expert_max_violation")
+            track_names.append("seq_expert_min_violation")
+            track_names.append("seq_expert_median_violation")
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
         track_names.append("global_expert_median_violation")
-        if args.moe_router_ep_violation_metrics:
+        if "ep" in args.moe_router_violation_metrics:
             track_names.append("ep_expert_max_violation")
             track_names.append("ep_expert_min_violation")
             track_names.append("ep_expert_median_violation")

@@ -9,6 +9,7 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import (
+    consume_inference_router_violation_metrics,
     get_updated_expert_bias,
     qb_dual_update,
     router_gating_linear,
@@ -157,6 +158,48 @@ class TestTop2Router:
             torch.testing.assert_close(scores_ref, scores_fused)
             # restore the config
             self.router.config.moe_router_fusion = False
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_inference_violation_metric_collection(self):
+        self.router = self.router.cuda()
+        self.router.eval()
+        hidden_states = torch.randn(
+            (8, 2, self.router.config.hidden_size), device='cuda', dtype=torch.bfloat16
+        )
+
+        # Disabled by default, and eval with gradients enabled must not collect samples.
+        with torch.no_grad():
+            self.router(hidden_states)
+        assert not self.router.inference_mbs_expert_load_samples
+        assert not self.router.inference_seq_expert_load_samples
+        self.router.config.moe_router_inference_violation_metrics = ['mbs', 'seq']
+        self.router(hidden_states)
+        assert not self.router.inference_mbs_expert_load_samples
+        assert not self.router.inference_seq_expert_load_samples
+
+        with torch.no_grad():
+            self.router(hidden_states)
+        assert len(self.router.inference_mbs_expert_load_samples) == 1
+        assert len(self.router.inference_seq_expert_load_samples) == 1
+        assert self.router.inference_mbs_expert_load_samples[0].shape == (5,)
+        assert self.router.inference_seq_expert_load_samples[0].shape == (2, 5)
+        assert self.router.inference_mbs_expert_load_samples[0][-1] == 16
+        torch.testing.assert_close(
+            self.router.inference_seq_expert_load_samples[0][:, -1],
+            torch.tensor([8.0, 8.0], device='cuda'),
+        )
+        assert not self.router.mbs_expert_load_samples
+        assert not self.router.seq_expert_load_samples
+
+        metrics = consume_inference_router_violation_metrics(self.router)
+        assert set(metrics) == {
+            f'moe_router_{scope}_{stat}_violation'
+            for scope in ('mbs', 'seq')
+            for stat in ('max', 'min', 'median', 'std')
+        }
+        assert not self.router.inference_mbs_expert_load_samples
+        assert not self.router.inference_seq_expert_load_samples
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

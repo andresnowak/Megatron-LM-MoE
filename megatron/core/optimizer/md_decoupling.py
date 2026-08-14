@@ -527,6 +527,13 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             p, is_qkv, is_merged_offload_expert, will_normalize
         )
 
+        # A hypersphere-normalized matrix is projected back onto its fixed-radius sphere at the
+        # end of this step (see the post-step normalization below), which discards any global
+        # rescaling of `p`. Weight decay on such a param does NOT decay it — it only re-weights
+        # the direction update to an effective lr/(1 - wd*lr). Skip WD for those: magnitude is
+        # carried by the gains (decayed via gains_weight_decay), while non-normalized parameters
+        # retain ordinary decoupled weight decay. `will_normalize` mirrors the post-step guard.
+
         # Strip the radial component of grad before it feeds any momentum buffer or 2nd-moment
         # estimate (applies to both Muon and AdamW).
         if self.hypersphere_tangential_grad:
@@ -540,7 +547,6 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             assert emerging_optimizers is not None, (
                 "emerging_optimizers package required for --use-orthogonal-updates"
             )
-            # NOTE: weight decay is not really used in MuonMD
             if not will_normalize and group["weight_decay"] != 0:
                 p.add_(p, alpha=-group["weight_decay"] * group["lr"])
 

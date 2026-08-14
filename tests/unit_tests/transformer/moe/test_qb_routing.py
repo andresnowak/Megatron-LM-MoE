@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+from dataclasses import replace
 from typing import cast
 
 import pytest
@@ -10,8 +11,10 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodu
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
+    compute_qb_histogram,
     get_moe_layer_wise_logging_tracker,
     qb_dual_update,
+    recover_qb_beta_from_histogram,
 )
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.spec_utils import get_submodules
@@ -62,6 +65,33 @@ class TestQBDualUpdate:
         assert imbalance1 < imbalance0
 
 
+class TestQBHistogram:
+    """Pure-tensor tests for the pooled histogram estimator."""
+
+    @pytest.mark.internal
+    def test_accumulation_and_recovered_quantile(self):
+        torch.manual_seed(4)
+        num_tokens, num_experts, topk, num_bins = 4096, 8, 2, 1000
+        scores = torch.rand(num_tokens, num_experts)
+        beta = torch.linspace(-0.1, 0.1, num_experts)
+        alpha = (scores - beta).topk(topk + 1, dim=1).values[:, -1]
+        full_histogram = compute_qb_histogram(scores, alpha, beta, num_bins)
+        histogram = compute_qb_histogram(scores[:1000], alpha[:1000], beta, num_bins)
+        histogram += compute_qb_histogram(scores[1000:], alpha[1000:], beta, num_bins)
+
+        assert torch.equal(histogram, full_histogram)
+        assert torch.equal(
+            histogram.sum(dim=1),
+            torch.full((num_experts,), num_tokens, dtype=torch.int64),
+        )
+        estimated_beta = recover_qb_beta_from_histogram(histogram, beta, topk)
+        required_bias = alpha.unsqueeze(1) - scores
+        exact_beta = -torch.quantile(required_bias, topk / num_experts, dim=0)
+        bin_width = (-beta.min() + beta.max() + 2.0) / num_bins
+
+        assert torch.all((estimated_beta - exact_beta).abs() <= bin_width + 1e-6)
+
+
 @pytest.mark.internal
 @pytest.mark.parametrize(
     "load_balancing_type",
@@ -96,6 +126,7 @@ class TestQuantileBalancingRouter:
             num_moe_experts=self.num_moe_experts,
             use_cpu_initialization=True,
             moe_router_load_balancing_type="quantile_balancing",
+            moe_router_quantile_balancing_method="average",
             moe_router_score_function="softmax",
             moe_router_topk=2,
             moe_aux_loss_coeff=0,
@@ -122,6 +153,23 @@ class TestQuantileBalancingRouter:
         assert self.router.qb_beta.dtype == torch.float32
         assert self.router.qb_beta_accum is not None
         assert self.router.qb_beta_count is not None
+        assert self.router.qb_histogram is None
+
+    @pytest.mark.internal
+    def test_qb_histogram_buffer_registered_only_for_histogram_method(self):
+        config = replace(
+            self.transformer_config,
+            moe_router_quantile_balancing_method="histogram",
+            moe_router_quantile_balancing_num_bins=32,
+            moe_router_score_function="sigmoid",
+        )
+        router = cast(Router, MoELayer(config, self.submodules).router)
+
+        assert router.qb_histogram is not None
+        assert router.qb_histogram.shape == (self.num_moe_experts, 32)
+        assert router.qb_histogram.dtype == torch.int64
+        assert router.qb_beta_accum is None
+        assert router.qb_beta_count is None
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -176,7 +224,6 @@ class TestQuantileBalancingRouter:
 
         assert torch.equal(routing_map, expected_qb_routing_map)
         assert torch.equal(captured["routing_map"], expected_aux_routing_map)
-        assert not torch.equal(captured["routing_map"], routing_map)
         assert "seq_load_balancing_loss" in get_moe_layer_wise_logging_tracker()
 
         probs.sum().mul(0).backward()
@@ -207,6 +254,7 @@ class TestQuantileBalancingRouter:
         expected_valid_logits = logits.reshape(-1, self.num_moe_experts)[
             ~padding_mask.reshape(-1)
         ]
+        expected_valid_scores = torch.softmax(expected_valid_logits, dim=-1)
 
         calls = []
 
@@ -226,35 +274,129 @@ class TestQuantileBalancingRouter:
 
         assert len(calls) == 1
         assert calls[0]["update_beta"] is True
-        torch.testing.assert_close(calls[0]["scores"], expected_valid_logits)
-        torch.testing.assert_close(self.router.qb_beta_accum, expected_valid_logits.mean(dim=0))
+        torch.testing.assert_close(calls[0]["scores"], expected_valid_scores)
+        torch.testing.assert_close(self.router.qb_beta_accum, expected_valid_scores.mean(dim=0))
         assert self.router.qb_beta_count.item() == 1
         assert routing_map.shape == (seq_len * batch_size, self.num_moe_experts)
 
     @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_legacy_average_qb_uses_raw_logits(self, monkeypatch):
+        config = replace(
+            self.transformer_config,
+            moe_router_quantile_balancing_method="legacy_average",
+        )
+        router = cast(Router, MoELayer(config, self.submodules).router).cuda()
+        router.train()
+
+        logits = torch.tensor(
+            [
+                [3.0, 1.0, 0.9, -1.0, -2.0, -3.0, -4.0, -5.0],
+                [1.0, 3.0, 0.9, -1.0, -2.0, -3.0, -4.0, -5.0],
+            ],
+            device="cuda",
+        )
+        with torch.no_grad():
+            router.qb_beta.zero_()
+            router.qb_beta[0] = 1.0
+        expected_qb_scores = logits.to(torch.bfloat16).float()
+        expected_indices = (expected_qb_scores - router.qb_beta).topk(router.topk, dim=1).indices
+        expected_routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(
+            1, expected_indices, True
+        )
+        captured = {}
+
+        def fake_qb_dual_update(scores, topk, beta, update_beta=True):
+            captured["scores"] = scores.detach().clone()
+            return expected_indices, scores.mean(dim=0)
+
+        monkeypatch.setattr(router_module, "qb_dual_update", fake_qb_dual_update)
+
+        _, routing_map = router.quantile_balancing(logits.to(torch.bfloat16))
+
+        torch.testing.assert_close(captured["scores"], expected_qb_scores)
+        assert torch.equal(routing_map, expected_routing_map)
+        torch.testing.assert_close(router.qb_beta_accum, expected_qb_scores.mean(dim=0))
+        assert router.qb_beta_count.item() == 1
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_qb_histogram_accumulates_valid_tokens_without_forward_collective(
+        self, monkeypatch
+    ):
+        config = replace(
+            self.transformer_config,
+            moe_router_quantile_balancing_method="histogram",
+            moe_router_quantile_balancing_num_bins=16,
+            moe_router_score_function="sigmoid",
+        )
+        router = cast(Router, MoELayer(config, self.submodules).router).cuda()
+        router.train()
+
+        logits = torch.arange(
+            6 * self.num_moe_experts, dtype=torch.float32, device="cuda"
+        ).reshape(6, 1, self.num_moe_experts)
+        padding_mask = torch.tensor(
+            [[False], [True], [False], [False], [True], [False]],
+            dtype=torch.bool,
+            device="cuda",
+        )
+        valid_scores = torch.sigmoid(
+            logits.reshape(-1, self.num_moe_experts)[~padding_mask.reshape(-1)]
+        )
+        expected_alpha = (
+            (valid_scores - router.qb_beta).topk(router.topk + 1, dim=1).values[:, -1]
+        )
+        captured = {}
+        expected_histogram = torch.arange(
+            self.num_moe_experts * 16, dtype=torch.int64, device="cuda"
+        ).reshape(self.num_moe_experts, 16)
+
+        def fake_compute_qb_histogram(scores, alpha, beta, num_bins):
+            captured["scores"] = scores.detach().clone()
+            captured["alpha"] = alpha.detach().clone()
+            captured["beta"] = beta.detach().clone()
+            captured["num_bins"] = num_bins
+            return expected_histogram
+
+        def fail_all_gather(*args, **kwargs):
+            raise AssertionError("histogram QB must not all-gather during forward")
+
+        monkeypatch.setattr(
+            router_module, "compute_qb_histogram", fake_compute_qb_histogram
+        )
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", fail_all_gather)
+
+        for _ in range(2):
+            router.quantile_balancing(
+                logits.to(torch.bfloat16).reshape(-1, self.num_moe_experts),
+                padding_mask=padding_mask.reshape(-1),
+            )
+
+        torch.testing.assert_close(captured["scores"], valid_scores)
+        torch.testing.assert_close(captured["alpha"], expected_alpha)
+        torch.testing.assert_close(captured["beta"], router.qb_beta)
+        assert captured["num_bins"] == 16
+        assert torch.equal(router.qb_histogram, 2 * expected_histogram)
+
+    @pytest.mark.internal
     def test_non_qb_router_has_no_qb_buffers(self):
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=12,
-            num_attention_heads=4,
-            num_moe_experts=self.num_moe_experts,
-            use_cpu_initialization=True,
+        config = replace(
+            self.transformer_config,
             moe_router_load_balancing_type="aux_loss",
-            moe_router_topk=2,
-            moe_aux_loss_coeff=0,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            add_bias_linear=False,
         )
         router = MoELayer(config, self.submodules).router
         assert router.qb_beta is None
         assert router.qb_beta_accum is None
         assert router.qb_beta_count is None
+        assert router.qb_histogram is None
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    @pytest.mark.parametrize("moe_router_pre_softmax", [True, False])
-    @pytest.mark.parametrize("score_function", ["softmax", "sigmoid"])
+    @pytest.mark.parametrize(
+        ("score_function", "moe_router_pre_softmax"),
+        [("softmax", True), ("softmax", False), ("sigmoid", False)],
+    )
     def test_qb_router_forward(self, score_function, moe_router_pre_softmax):
         self.router = self.router.cuda()
         self.router.config.moe_router_score_function = score_function

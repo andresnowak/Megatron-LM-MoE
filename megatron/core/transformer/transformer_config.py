@@ -68,8 +68,8 @@ class TransformerConfig(ModelParallelConfig):
 
     mtp_loss_scaling_factor: Optional[float] = 0.1
     """Weighting factor of Multi-Token Prediction (MTP) loss.
-    We compute the average of the MTP losses across all depths, 
-    and multiply it the scaling factor to obtain the overall MTP loss, 
+    We compute the average of the MTP losses across all depths,
+    and multiply it the scaling factor to obtain the overall MTP loss,
     which serves as an additional training objective.
     """
 
@@ -98,8 +98,8 @@ class TransformerConfig(ModelParallelConfig):
     - list: e.g., [['embedding', 'decoder'], ['decoder', 'decoder', 'decoder', 'loss']].
     - PipelineParallelLayerLayout: a PipelineParallelLayerLayout object.
     If given either a string or a list, it will be transferred into a PipelineParallelLayerLayout
-    in post init. Let i = a * pp_size + b, then layout[i] gives a list of the layers 
-    in the a-th vpp stage and the b-th pp stage, i.e., vpp(0)pp(0), vpp(0)pp(1), ..., 
+    in post init. Let i = a * pp_size + b, then layout[i] gives a list of the layers
+    in the a-th vpp stage and the b-th pp stage, i.e., vpp(0)pp(0), vpp(0)pp(1), ...,
     vpp(i)pp(j), vpp(i)pp(j+1), ..., vpp(-1)pp(-2), vpp(-1)pp(-1).
     In the inner lists of layers, 'embedding' or 'E' denotes the embedding layer, 'loss' or 'L'
     denotes the loss function, and 'decoder' or 't' denotes the transformer decoder layer.
@@ -140,8 +140,8 @@ class TransformerConfig(ModelParallelConfig):
     """Softmax scale for attention scaling."""
 
     softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
-    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
-       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
+    """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html.
+       Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and
        and learnable offset."""
 
     num_query_groups: Optional[int] = field(
@@ -201,7 +201,7 @@ class TransformerConfig(ModelParallelConfig):
     The stored input is casted back to the original precision before backprop compuatation."""
 
     glu_linear_offset: float = 0.0
-    """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only 
+    """Offset term in the GLU activation function: activation_func(x[0]) * (x[1] + offset). Only
     used when gated_linear_unit is True"""
 
     activation_func_clamp_value: Optional[float] = None
@@ -463,7 +463,7 @@ class TransformerConfig(ModelParallelConfig):
     # linear attention
     ####################
     linear_attention_freq: Optional[Union[int, List[int]]] = None
-    """Frequency between LA (linear attention) layers 
+    """Frequency between LA (linear attention) layers
     and SDPA (scaled dot-product attention) layers.
     Accepts either:
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
@@ -505,13 +505,13 @@ class TransformerConfig(ModelParallelConfig):
 
     embedding_init_method: Optional[Callable] = None
     """
-    Method to initialize weights of the embedding layer. If None, will be set as described 
+    Method to initialize weights of the embedding layer. If None, will be set as described
     in init_method above.
     """
 
     embedding_init_method_std: Optional[float] = None
     """
-    Standard deviation of the zero mean normal for the default initialization method for the 
+    Standard deviation of the zero mean normal for the default initialization method for the
     embedding layer. If None, will be set to init_method_std. Setting this to a value around
     1.0 may avoid loss spikes in training. Setting this to any value will also skip applying
     weight decay on embedding weights to avoid shrinkage towards zero.
@@ -757,7 +757,7 @@ class TransformerConfig(ModelParallelConfig):
     fp4: Optional[Literal['e2m1']] = field(
         default=None, metadata={"argparse_meta": {"arg_names": ["--fp4-format"]}}
     )
-    """If set, enables the use of FP4 precision through Transformer Engine. Currently only 
+    """If set, enables the use of FP4 precision through Transformer Engine. Currently only
     supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
 
     fp4_recipe: Optional[Literal['nvfp4', 'custom']] = "nvfp4"
@@ -791,12 +791,12 @@ class TransformerConfig(ModelParallelConfig):
     in the hidden_states gradient."""
 
     moe_shared_expert_gate: bool = False
-    """Enable gate for shared expert. Only effective when 
+    """Enable gate for shared expert. Only effective when
     moe-shared-expert-intermediate-size is set."""
 
     moe_shared_expert_overlap: bool = False
     """Enable overlapping between shared expert computations and dispatcher communications.
-    Without this, the shared experts execute before the router. 
+    Without this, the shared experts execute before the router.
     Only effective when moe-shared-expert-intermediate-size is set.
     """
 
@@ -895,11 +895,23 @@ class TransformerConfig(ModelParallelConfig):
     moe_router_quantile_balancing_ema: float = 0.0
     """EMA coefficient for the quantile-balancing per-expert bias (`qb_beta`), used only when
     `moe_router_load_balancing_type` is "quantile_balancing". At each global batch the bias is
-    updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The default 0.0 means
-    no memory: the bias is replaced by the latest global-batch quantile estimate each step."""
+    updated as `qb_beta = ema * qb_beta + (1 - ema) * quantile_estimate`. The default 0.0 means
+    no memory: the bias is replaced by the latest global-batch estimate each step."""
+
+    moe_router_quantile_balancing_method: Literal[
+        'average', 'legacy_average', 'histogram'
+    ] = 'histogram'
+    """Quantile estimator used by quantile balancing. "average" averages independently computed
+    microbatch/rank quantiles in sigmoid/softmax score space. "legacy_average" preserves the
+    raw-logit routing and update scale used by older average-QB checkpoints. "histogram"
+    accumulates fixed-size per-expert histograms over all microbatches and approximates the true
+    pooled global-batch quantile."""
+
+    moe_router_quantile_balancing_num_bins: int = 1000
+    """Number of uniform bins per expert used by histogram quantile balancing."""
 
     moe_router_force_load_balancing: bool = False
-    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk 
+    """[Experimental] Force load balancing with random logits for MoE router, supports naive topk
     and group-limited topk. This is an experimental feature and only for benchmark."""
 
     moe_router_force_biased: Optional[float] = None
@@ -927,7 +939,7 @@ class TransformerConfig(ModelParallelConfig):
     be quantized into FP8 for storage."""
 
     moe_use_inplace_fp8_param: bool = False
-    """Whether to use FP8 parameter for MoE layer. Specifically, MoE layer will use BF16 storage, 
+    """Whether to use FP8 parameter for MoE layer. Specifically, MoE layer will use BF16 storage,
     but the weights will be quantized into FP8 for computation. Both transposed and non-transposed
     weights will be saved."""
 
@@ -956,7 +968,7 @@ class TransformerConfig(ModelParallelConfig):
       - "moe_input": the permuted expert input (saved on all paths).
       - "moe_fc1_output": the gated first-linear output. Only takes effect on the
         non-recompute path (when moe_act recompute is on, fc1_output is dropped and recomputed
-        instead). 
+        instead).
     None or [] disables offload. Only supported with the inplace-FP8 offloading-experts path
     (moe_use_offloading_experts + moe_use_inplace_fp8_param) and incompatible with moe_layer_recompute
     (the activation is not held across the pipeline gap under full-layer recompute)."""
@@ -1001,19 +1013,31 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_flex_dispatcher_backend: Literal['deepep', 'hybridep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
+    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports
     the MNNVL case."""
 
     moe_per_layer_logging: bool = False
-    """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
+    """Enable per-layer logging for MoE auxiliary loss, z loss, and inference router violation
+    metrics."""
 
     moe_router_bias_metrics: bool = False
     """Log mean, standard deviation, minimum, and maximum values of quantile-balancing and
     aux-loss-free (DeepSeek-style) router biases."""
 
-    moe_router_ep_violation_metrics: bool = False
-    """Log per-microbatch expert-load violation metrics after aggregating token counts across
-    the expert-parallel group (an effective batch size of EP times MBS)."""
+    moe_router_violation_metrics: List[Literal['mbs', 'seq', 'ep']] = field(
+        default_factory=lambda: ['mbs']
+    )
+    """Optional expert-load violation scopes to log. Global-batch violation is always logged.
+    Defaults to "mbs", which pools each microbatch across TP/CP. "seq" measures each sequence
+    across TP/CP, and "ep" additionally pools each microbatch across EP."""
+
+    moe_router_inference_violation_metrics: List[Literal['mbs', 'seq']] = field(
+        default_factory=list
+    )
+    """Expert-load violation scopes to collect during eager inference. Disabled by default.
+    Every model-parallel rank must call ``consume_inference_router_violation_metrics`` at the same
+    synchronization point after a forward or collection window; that call also clears the samples.
+    Python-side collection is not compatible with CUDA graph replay."""
 
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
@@ -1143,7 +1167,7 @@ class TransformerConfig(ModelParallelConfig):
     batch_invariant_mode: bool = False
     """If true, uses batch-invariant kernels that provide deterministic forward execution regardless
        of batch size. This ensures bitwise identical results when the same inputs are processed
-       in different batch configurations. This will significantly affect speed of 
+       in different batch configurations. This will significantly affect speed of
        training and inference as the kernels are not full optimized.
        Defaults to False."""
 
@@ -1663,6 +1687,23 @@ class TransformerConfig(ModelParallelConfig):
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
 
+        valid_violation_metrics = {'mbs', 'seq', 'ep'}
+        invalid_violation_metrics = set(self.moe_router_violation_metrics) - valid_violation_metrics
+        if invalid_violation_metrics:
+            raise ValueError(
+                "moe_router_violation_metrics entries must be 'mbs', 'seq', or 'ep'; "
+                f"got {sorted(invalid_violation_metrics)}"
+            )
+
+        invalid_inference_violation_metrics = set(
+            self.moe_router_inference_violation_metrics
+        ) - {'mbs', 'seq'}
+        if invalid_inference_violation_metrics:
+            raise ValueError(
+                "moe_router_inference_violation_metrics entries must be 'mbs' or 'seq'; "
+                f"got {sorted(invalid_inference_violation_metrics)}"
+            )
+
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
             warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
@@ -1735,6 +1776,28 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "quantile_balancing can only be combined with seq_aux_loss"
                     )
+
+        if "quantile_balancing" in self.moe_router_load_balancing_type:
+            valid_qb_methods = {'average', 'legacy_average', 'histogram'}
+            if self.moe_router_quantile_balancing_method not in valid_qb_methods:
+                raise ValueError(
+                    "moe_router_quantile_balancing_method must be 'average', "
+                    "'legacy_average', or 'histogram'"
+                )
+            if self.moe_router_quantile_balancing_num_bins <= 0:
+                raise ValueError("moe_router_quantile_balancing_num_bins must be positive")
+            if (
+                self.num_moe_experts is not None
+                and self.moe_router_topk >= self.num_moe_experts
+            ):
+                raise ValueError(
+                    "quantile_balancing requires moe_router_topk < num_moe_experts"
+                )
+
+            if self.moe_router_enable_expert_bias:
+                raise ValueError(
+                    "quantile_balancing does not support moe_router_enable_expert_bias"
+                )
 
         if self.moe_expert_capacity_factor is not None:
             if self.moe_expert_capacity_factor < 0:
@@ -2818,7 +2881,7 @@ class MLATransformerConfig(TransformerConfig):
 
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
-       This is only for the dynamic inference backend and requires that 
+       This is only for the dynamic inference backend and requires that
        Flash MLA is installed."""
 
     mla_down_proj_fusion: bool = False
