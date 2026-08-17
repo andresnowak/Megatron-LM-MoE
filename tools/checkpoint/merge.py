@@ -94,6 +94,26 @@ def _linear_multipliers(progress, end_multiplier):
     return [1.0 - (1.0 - end_multiplier) * position for position in progress]
 
 
+def _linear_interval_mean(left, right, decay_start, decay_steps, end_multiplier):
+    """Average a per-training-step linear schedule over ``[left, right)``."""
+    count = right - left
+    pre_decay_last = min(right - 1, decay_start)
+    total = max(pre_decay_last - left + 1, 0)
+
+    linear_first = max(left, decay_start + 1)
+    linear_last = min(right - 1, decay_start + decay_steps)
+    linear_count = max(linear_last - linear_first + 1, 0)
+    if linear_count:
+        position_sum = (
+            (linear_first + linear_last) * linear_count / 2 - decay_start * linear_count
+        )
+        total += linear_count - (1.0 - end_multiplier) * position_sum / decay_steps
+
+    post_decay_count = max(right - max(left, decay_start + decay_steps + 1), 0)
+    total += post_decay_count * end_multiplier
+    return total / count
+
+
 def merge_coefficients(
     num_checkpoints,
     method="mean",
@@ -122,11 +142,11 @@ def merge_coefficients(
     if any(left >= right for left, right in zip(checkpoint_steps, checkpoint_steps[1:])):
         raise ValueError("Checkpoint steps must be strictly increasing")
 
-    selected_span = checkpoint_steps[-1] - checkpoint_steps[0]
-    target_progress = [
-        (step - checkpoint_steps[0]) / selected_span for step in checkpoint_steps[1:]
-    ]
-    desired = _linear_multipliers(target_progress, target_end_multiplier)
+    num_intervals = num_checkpoints - 1
+    desired = _linear_multipliers(
+        [interval / num_intervals for interval in range(1, num_intervals + 1)],
+        target_end_multiplier,
+    )
     if original_schedule == "stable":
         original = [1.0] * (num_checkpoints - 1)
     elif original_schedule == "linear-decay":
@@ -144,11 +164,16 @@ def merge_coefficients(
             if original_decay_start_step is None
             else original_decay_start_step
         )
-        original_progress = [
-            min(max((step - decay_start) / original_decay_steps, 0.0), 1.0)
-            for step in checkpoint_steps[1:]
+        original = [
+            _linear_interval_mean(
+                left,
+                right,
+                decay_start,
+                original_decay_steps,
+                original_end_multiplier,
+            )
+            for left, right in zip(checkpoint_steps, checkpoint_steps[1:])
         ]
-        original = _linear_multipliers(original_progress, original_end_multiplier)
         if any(multiplier == 0 for multiplier in original):
             raise ValueError("Cannot cancel an original decay whose multiplier reaches zero")
     else:

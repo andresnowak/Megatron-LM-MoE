@@ -41,8 +41,9 @@ def test_wsm_cancels_matching_original_linear_decay():
         original_schedule="linear-decay",
         original_end_multiplier=0.2,
         target_end_multiplier=0.2,
-        checkpoint_steps=[0, 25, 50, 75, 100],
-        original_decay_steps=100,
+        checkpoint_steps=[0, 1, 2, 3, 4],
+        original_decay_steps=4,
+        original_decay_start_step=-1,
     )
 
     assert coefficients == pytest.approx([0.0, 0.0, 0.0, 0.0, 1.0])
@@ -59,7 +60,9 @@ def test_original_decay_uses_training_steps_not_checkpoint_count():
         original_decay_steps=100,
     )
 
-    assert coefficients == pytest.approx([1 / 6, 5 / 24, 5 / 8])
+    assert coefficients == pytest.approx(
+        [27 / 127, 100 / 127 - 200 / 341, 200 / 341]
+    )
 
 
 def test_wsm_rejects_zero_original_multiplier():
@@ -69,8 +72,9 @@ def test_wsm_rejects_zero_original_multiplier():
             method="linear-decay",
             original_schedule="linear-decay",
             original_end_multiplier=0.0,
-            checkpoint_steps=[0, 25, 50, 75, 100],
+            checkpoint_steps=[100, 125, 150, 175, 200],
             original_decay_steps=100,
+            original_decay_start_step=0,
         )
 
 
