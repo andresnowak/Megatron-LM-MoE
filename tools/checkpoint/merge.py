@@ -143,13 +143,17 @@ def merge_coefficients(
     if any(left >= right for left, right in zip(checkpoint_steps, checkpoint_steps[1:])):
         raise ValueError("Checkpoint steps must be strictly increasing")
 
-    num_intervals = num_checkpoints - 1
+    num_intervals = num_checkpoints
     desired = _linear_multipliers(
-        [interval / num_intervals for interval in range(1, num_intervals + 1)],
+        [interval / num_intervals for interval in range(num_intervals)],
         target_end_multiplier,
     )
+    # Treat each selected checkpoint as the endpoint of a coarse update. The preceding
+    # synthetic checkpoint has zero final coefficient and does not need to be loaded.
+    synthetic_step = checkpoint_steps[0] - (checkpoint_steps[1] - checkpoint_steps[0])
+    interval_starts = [synthetic_step, *checkpoint_steps[:-1]]
     if original_schedule == "stable":
-        original = [1.0] * (num_checkpoints - 1)
+        original = [1.0] * num_intervals
     elif original_schedule == "linear-decay":
         if not steps_were_provided:
             raise ValueError("Original linear decay requires checkpoint iteration steps")
@@ -161,9 +165,7 @@ def merge_coefficients(
         if original_decay_steps <= 0:
             raise ValueError("Original decay steps must be positive")
         decay_start = (
-            checkpoint_steps[0]
-            if original_decay_start_step is None
-            else original_decay_start_step
+            synthetic_step if original_decay_start_step is None else original_decay_start_step
         )
         original = [
             _linear_interval_mean(
@@ -173,17 +175,19 @@ def merge_coefficients(
                 original_decay_steps,
                 original_end_multiplier,
             )
-            for left, right in zip(checkpoint_steps, checkpoint_steps[1:])
+            for left, right in zip(interval_starts, checkpoint_steps)
         ]
+        if original[0] == 0:
+            raise ValueError("Cannot rebase an original decay whose multiplier reaches zero")
+        original = [multiplier / original[0] for multiplier in original]
         if any(multiplier == 0 for multiplier in original):
             raise ValueError("Cannot cancel an original decay whose multiplier reaches zero")
     else:
         raise ValueError(f"Unknown original schedule: {original_schedule}")
 
     ratios = [target / source for target, source in zip(desired, original)]
-    coefficients = [1.0 - ratios[0]]
-    coefficients.extend(left - right for left, right in zip(ratios, ratios[1:]))
-    coefficients.append(ratios[-1]) # end decay lr multiplier
+    coefficients = [left - right for left, right in zip(ratios, ratios[1:])]
+    coefficients.append(ratios[-1])
     return coefficients
 
 
@@ -409,7 +413,7 @@ def main():
         "--original-decay-start-step",
         type=int,
         default=None,
-        help="Original decay start; defaults to the first selected checkpoint step.",
+        help="Original decay start; defaults to the synthetic preceding checkpoint step.",
     )
     parser.add_argument(
         "--target-end-multiplier",

@@ -31,22 +31,24 @@ def test_wsm_linear_decay_coefficients_from_stable_schedule():
         5, method="linear-decay", target_end_multiplier=0.2
     )
 
-    assert coefficients == pytest.approx([0.2] * 5)
+    assert coefficients == pytest.approx([0.16, 0.16, 0.16, 0.16, 0.36])
 
 
-def test_wsm_cancels_matching_original_linear_decay():
+def test_original_decay_is_rebased_at_synthetic_interval():
     coefficients = checkpoint_merge.merge_coefficients(
-        5,
+        3,
         method="linear-decay",
         original_schedule="linear-decay",
-        original_end_multiplier=0.2,
-        target_end_multiplier=0.2,
-        checkpoint_steps=[0, 1, 2, 3, 4],
-        original_decay_steps=4,
-        original_decay_start_step=-1,
+        original_end_multiplier=0.5,
+        target_end_multiplier=0.5,
+        checkpoint_steps=[20, 40, 60],
+        original_decay_steps=100,
+        original_decay_start_step=0,
     )
 
-    assert coefficients == pytest.approx([0.0, 0.0, 0.0, 0.0, 1.0])
+    assert coefficients == pytest.approx(
+        [47 / 682, 635 / 682 - 254 / 301, 254 / 301]
+    )
 
 
 def test_original_decay_uses_training_steps_not_checkpoint_count():
@@ -58,10 +60,11 @@ def test_original_decay_uses_training_steps_not_checkpoint_count():
         target_end_multiplier=0.5,
         checkpoint_steps=[0, 20, 40],
         original_decay_steps=100,
+        original_decay_start_step=0,
     )
 
     assert coefficients == pytest.approx(
-        [27 / 127, 100 / 127 - 200 / 341, 200 / 341]
+        [143 / 1143, 1000 / 1143 - 800 / 1023, 800 / 1023]
     )
 
 
