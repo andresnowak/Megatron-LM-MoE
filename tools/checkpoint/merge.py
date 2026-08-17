@@ -19,6 +19,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTenso
 from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
 
 
+_ALWAYS_MEAN_TENSOR_NAMES = {"expert_bias", "qb_beta"}
 _TRAINING_PREFIXES = (
     "optimizer",
     "opt_param_scheduler",
@@ -278,10 +279,15 @@ def merge_checkpoint_directories(sources, output, coefficients=None):
         loaded = _load_assigned(source, assigned_tensors)
         for key, tensor in loaded.items():
             if tensor.is_floating_point():
+                coefficient = (
+                    1.0 / len(sources)
+                    if key.rsplit(".", 1)[-1] in _ALWAYS_MEAN_TENSOR_NAMES
+                    else coefficients[source_index]
+                )
                 if source_index == 0:
-                    accumulators[key] = tensor.float().mul_(coefficients[source_index])
+                    accumulators[key] = tensor.float().mul_(coefficient)
                 else:
-                    accumulators[key].add_(tensor, alpha=coefficients[source_index])
+                    accumulators[key].add_(tensor, alpha=coefficient)
             elif source_index == 0:
                 static_tensors[key] = tensor.cpu().clone()
             elif not torch.equal(static_tensors[key], tensor.cpu()):

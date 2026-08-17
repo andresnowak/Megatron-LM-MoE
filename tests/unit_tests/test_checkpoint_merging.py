@@ -124,6 +124,12 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
         dist_checkpointing.save(
             {
                 "weight": ShardedTensor.from_rank_offsets("weight", torch.full((4,), value)),
+                "router.expert_bias": ShardedTensor.from_rank_offsets(
+                    "router.expert_bias", torch.full((4,), value)
+                ),
+                "router.qb_beta": ShardedTensor.from_rank_offsets(
+                    "router.qb_beta", torch.full((4,), value)
+                ),
                 "optimizer.state.row_gain.weight": ShardedTensor.from_rank_offsets(
                     "optimizer.state.row_gain.weight", torch.full((4,), 99.0)
                 ),
@@ -142,10 +148,15 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
         checkpoint_merge.merge_checkpoint_directories(sources, output, coefficients)
         release = output / "release"
         loaded = dist_checkpointing.load(
-            {"weight": ShardedTensor.from_rank_offsets("weight", torch.empty(4))},
+            {
+                key: ShardedTensor.from_rank_offsets(key, torch.empty(4))
+                for key in ("weight", "router.expert_bias", "router.qb_beta")
+            },
             str(release),
         )
         torch.testing.assert_close(loaded["weight"], torch.full((4,), expected))
+        torch.testing.assert_close(loaded["router.expert_bias"], torch.full((4,), 3.0))
+        torch.testing.assert_close(loaded["router.qb_beta"], torch.full((4,), 3.0))
         assert "optimizer.state.row_gain.weight" not in dist_checkpointing.load_tensors_metadata(
             str(release)
         )
