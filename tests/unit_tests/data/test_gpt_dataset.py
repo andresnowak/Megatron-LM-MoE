@@ -14,6 +14,7 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.utils import compile_helpers
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.utils import _merge_cu_seqlens_across_micro_batch
 from tests.unit_tests.test_utilities import Utils
 
 _MOCK_VOCAB_SIZE = 8192
@@ -113,5 +114,118 @@ def test_mock_gpt_dataset():
     assert not torch.any(sample['loss_mask'])
 
 
+def test_inter_document_masking():
+    if torch.distributed.is_available():
+        Utils.initialize_distributed()
+        if torch.distributed.get_rank() == 0:
+            compile_helpers()
+        torch.distributed.barrier()
+    else:
+        compile_helpers()
+
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
+
+    sequence_length = 1024
+
+    config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=sequence_length,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+        inter_document_masking=True,
+    )
+
+    datasets = BlendedMegatronDatasetBuilder(
+        MockGPTDataset, [100, 100, 100], lambda: True, config
+    ).build()
+
+    N = 20
+    for idx in range(N):
+        sample = datasets[0][idx]
+
+        assert "cu_seqlens" in sample
+        assert "max_seqlen" in sample
+        assert "attention_mask" not in sample
+
+        # Strip collation padding before validation.
+        cu_seqlens = _merge_cu_seqlens_across_micro_batch(
+            sample["cu_seqlens"].unsqueeze(0), sequence_length
+        )
+        max_seqlen = sample["max_seqlen"]
+        tokens = sample["tokens"]
+        position_ids = sample["position_ids"]
+
+        assert tokens.shape[0] == sequence_length
+        assert position_ids.shape[0] == sequence_length
+
+        assert cu_seqlens.dtype == torch.int32
+        assert cu_seqlens[0] == 0
+        assert cu_seqlens[-1] == sequence_length
+
+        # cu_seqlens must be strictly increasing.
+        diffs = cu_seqlens[1:] - cu_seqlens[:-1]
+        assert torch.all(diffs > 0), f"cu_seqlens not strictly increasing: {cu_seqlens}"
+
+        assert max_seqlen == diffs.max()
+
+        # Position IDs must reset to 0 at each document boundary.
+        for i in range(cu_seqlens.numel() - 1):
+            start = cu_seqlens[i].item()
+            end = cu_seqlens[i + 1].item()
+            expected = torch.arange(end - start, dtype=torch.long)
+            assert torch.equal(
+                position_ids[start:end], expected
+            ), f"position_ids mismatch in segment {i} [{start}:{end}]"
+
+    # Verify that None index zeros out loss_mask.
+    sample = datasets[0][None]
+    assert not torch.any(sample["loss_mask"])
+    assert "cu_seqlens" in sample
+
+    # The token stream itself must be untouched.
+    baseline_config = GPTDatasetConfig(
+        random_seed=1234,
+        sequence_length=sequence_length,
+        split="990,9,1",
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=False,
+        tokenizer=tokenizer,
+        mid_level_dataset_surplus=0.005,
+        inter_document_masking=False,
+    )
+    baseline = BlendedMegatronDatasetBuilder(
+        MockGPTDataset, [100, 100, 100], lambda: True, baseline_config
+    ).build()
+
+    for idx in range(N):
+        packed = datasets[0][idx]
+        plain = baseline[0][idx]
+        assert torch.equal(packed["tokens"], plain["tokens"])
+        assert torch.equal(packed["labels"], plain["labels"])
+        assert torch.equal(packed["loss_mask"], plain["loss_mask"])
+        assert "cu_seqlens" not in plain
+
+    # Samples with different document counts must collate into one batch.
+    from torch.utils.data._utils.collate import default_collate
+
+    batch = default_collate([datasets[0][i] for i in range(4)])
+    assert batch["cu_seqlens"].shape == (4, sequence_length + 1)
+    assert batch["max_seqlen"].shape == (4,)
+    merged = _merge_cu_seqlens_across_micro_batch(batch["cu_seqlens"], sequence_length)
+    assert merged[0].item() == 0
+    assert merged[-1].item() == 4 * sequence_length
+    assert torch.all(merged[1:] - merged[:-1] > 0)
+
+
 if __name__ == "__main__":
     test_mock_gpt_dataset()
+    test_inter_document_masking()

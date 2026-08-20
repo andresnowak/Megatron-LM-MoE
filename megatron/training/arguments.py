@@ -1043,7 +1043,7 @@ def validate_args(args, defaults={}):
     # across batches/microbatches. Due to additional communication overhead
     # during pipeline parallelism, it should not be set if sequence length
     # is constant during training.
-    args.variable_seq_lengths = False
+    # args.variable_seq_lengths = False
 
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
@@ -1115,6 +1115,25 @@ def validate_args(args, defaults={}):
         assert args.seq_length % (args.context_parallel_size * 2) == 0, \
             'seq-length should be a multiple of 2 * context-parallel-size ' \
             'if context-parallel-size > 1.'
+
+    if getattr(args, 'dataloader_inter_document_masking', False):
+        # The dataset omits attention_mask when inter-document masking is
+        # enabled; disable the flag to avoid a TP broadcast mismatch.
+        if args.create_attention_mask_in_dataloader:
+            args.create_attention_mask_in_dataloader = False
+        assert not args.sft, (
+            '--dataloader-inter-document-masking and --sft both produce cu_seqlens; '
+            'SFT packing already restricts attention to each packed sequence.'
+        )
+        assert args.context_parallel_size == 1, (
+            '--dataloader-inter-document-masking does not support context parallelism '
+            'yet: document boundaries are not guaranteed to be divisible by '
+            '2 * context-parallel-size, which the THD CP partitioning requires.'
+        )
+        assert not args.hybrid_context_parallel, (
+            '--dataloader-inter-document-masking does not support hybrid context '
+            'parallelism yet.'
+        )
 
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
@@ -3452,8 +3471,15 @@ def _add_data_args(parser):
     group.add_argument('--reset-attention-mask', action='store_true',
                        help='Reset self attention mask after '
                        'end-of-document token.')
+    group.add_argument('--variable-seq-lengths', action='store_true',
+                       help='Compute the length of the tensor you send in PP groups.'
+                       'Relevant with CP.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--dataloader-inter-document-masking', action='store_true',
+                       help='Return cu_seqlens marking document boundaries '
+                       'within each sample so that attention is restricted '
+                       'to individual documents.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')

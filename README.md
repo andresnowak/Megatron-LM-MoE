@@ -80,9 +80,9 @@ reapplies the gains, so the model parameter already contains the effective weigh
 $W_{\mathrm{eff},ij}=W_{ij}\phi(r_i)\phi(c_j)$ for row-column gains. For each logical matrix $m$,
 
 $$
-\operatorname{sparsity}_{\tau}(W_{\mathrm{eff},m})
-=\frac{\#\{(i,j): |W_{\mathrm{eff},m,ij}|<\tau\}}
-       {\#\{(i,j)\}}.
+\mathrm{sparsity}_{\tau}(W_{\mathrm{eff},m})
+=\frac{|\{(i,j): |W_{\mathrm{eff},m,ij}|\lt\tau\}|}
+       {|\{(i,j)\}|}.
 $$
 
 The family metric is the equal-weight average of these per-matrix fractions. TP shards are
@@ -94,7 +94,7 @@ Pass `--log-muon-param-rms` to report effective-parameter RMS at
 `muon-md/params/<family>/rms`. For each logical matrix $m$ this is
 
 $$
-\operatorname{RMS}(W_m)=\frac{\lVert W_m\rVert_F}{\sqrt{N_m}}
+\mathrm{RMS}(W_m)=\frac{\lVert W_m\rVert_F}{\sqrt{N_m}}
 =\sqrt{\frac{\sum_{i,j}W_{m,ij}^2}{N_m}}.
 $$
 
@@ -107,15 +107,15 @@ For a raw gain vector $g$, let $e=\phi(g)$ be its effective multiplier. The elem
 statistics are
 
 $$
-\operatorname{mean}(e)=\frac{\sum_i e_i}{N},\qquad
-\operatorname{RMS}(e)=\sqrt{\frac{\sum_i e_i^2}{N}}.
+\mathrm{mean}(e)=\frac{\sum_i e_i}{N},\qquad
+\mathrm{RMS}(e)=\sqrt{\frac{\sum_i e_i^2}{N}}.
 $$
 
 `min` and `max` are the extrema over the same effective-gain elements. For softplus gains,
 
 $$
 \text{saturated-fraction}
-=\frac{\#\{i:\operatorname{sigmoid}(g_i)<10^{-2}\}}{N}.
+=\frac{|\{i:\mathrm{sigmoid}(g_i)\lt10^{-2}\}|}{N}.
 $$
 
 For a TP-sharded gain axis, each rank first contributes $[\sum_i e_i^2,\,N]$, plus
@@ -126,7 +126,7 @@ For matrices $m=1,\ldots,M$ in a family and axis,
 
 $$
 \text{effective-rms}
-=\frac{1}{M}\sum_{m=1}^{M}\operatorname{RMS}(e_m).
+=\frac{1}{M}\sum_{m=1}^{M}\mathrm{RMS}(e_m).
 $$
 
 Muon-MD applies row and column gains by broadcasting, so each matrix entry is multiplied as
@@ -134,14 +134,14 @@ $W'_{ij}=W_{ij}r_i c_j$. The combined multiplier is therefore the outer-product 
 $rc^\top$. Its RMS factorizes exactly as
 
 $$
-\operatorname{RMS}(rc^\top)=\operatorname{RMS}(r)\operatorname{RMS}(c).
+\mathrm{RMS}(rc^\top)=\mathrm{RMS}(r)\mathrm{RMS}(c).
 $$
 
 For $M$ matched row and column gains $r_m,c_m$, the logged family value is
 
 $$
 \text{gain-field-rms}
-  =\frac{1}{M}\sum_{m=1}^{M}\operatorname{RMS}(r_m)\operatorname{RMS}(c_m).
+  =\frac{1}{M}\sum_{m=1}^{M}\mathrm{RMS}(r_m)\mathrm{RMS}(c_m).
 $$
 
 This describes only the multiplicative gain field. It is not the RMS of the resulting effective
@@ -152,10 +152,10 @@ $r$ with $a r$ and $c$ with $c/a$ leaves the gain field $rc^\top$ unchanged. The
 separate the meaningful combined scale from this otherwise invisible redistribution:
 
 - `combined-log-scale` is
-  $\operatorname{mean}(\log r)+\operatorname{mean}(\log c)$, the log of the product of the row
+  $\mathrm{mean}(\log r)+\mathrm{mean}(\log c)$, the log of the product of the row
   and column geometric means. It tracks their combined multiplicative scale.
 - `row-col-imbalance` is
-  $\operatorname{mean}(\log r)-\operatorname{mean}(\log c)$, the log ratio between those geometric
+  $\mathrm{mean}(\log r)-\mathrm{mean}(\log c)$, the log ratio between those geometric
   means. It tracks whether scale is moving from the column gains into the row gains or vice versa.
 
 For the $M_+$ matched softplus matrices, the logged family averages are
@@ -164,10 +164,10 @@ $$
 \begin{aligned}
 \text{combined-log-scale}
   &=\frac{1}{M_+}\sum_{m=1}^{M_+}
-    \left(\operatorname{mean}(\log r_m)+\operatorname{mean}(\log c_m)\right),\\
+    \left(\mathrm{mean}(\log r_m)+\mathrm{mean}(\log c_m)\right),\\
 \text{row-col-imbalance}
   &=\frac{1}{M_+}\sum_{m=1}^{M_+}
-    \left(\operatorname{mean}(\log r_m)-\operatorname{mean}(\log c_m)\right).
+    \left(\mathrm{mean}(\log r_m)-\mathrm{mean}(\log c_m)\right).
 \end{aligned}
 $$
 

@@ -719,6 +719,12 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         output = layer.mlp.postprocess(output, shared_expert_output)
 
         mlp_output_with_bias = (output, None)
+        # Keep the fine-grained MoE path equivalent to TransformerLayer._forward_post_mlp:
+        # apply the optional post norm (and residual scaling) before bias-dropout-add.
+        if not layer.keel:
+            mlp_output_with_bias = layer._apply_post_norm(
+                mlp_output_with_bias, layer.post_mlp_layernorm
+            )
         if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
             layer.mlp.cudagraph_tensor_store.clear()
         with layer.bias_dropout_add_exec_handler():

@@ -9,7 +9,13 @@ from .utils import is_hybrid_model, print_rank_0
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
 
-def compute_weight_and_optimizer_memory(args, verbose=False):
+def compute_weight_and_optimizer_memory(args, verbose=False, config=None):
+    if config is None:
+        # Standalone callers do not have an instantiated model from which to obtain the config.
+        from .arguments import core_transformer_config_from_args
+
+        config = core_transformer_config_from_args(args)
+
     # Attention projection size.
     query_projection_size = args.kv_channels * args.num_attention_heads
     query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
@@ -18,8 +24,8 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
         args.num_query_groups = args.num_attention_heads
     # MoE.
     num_experts = 1 if args.num_experts is None else args.num_experts
-    gated_linear_multiplier = 3 / 2 if args.swiglu else 1
-    
+    gated_linear_multiplier = 3 / 2 if config.gated_linear_unit else 1
+
     shared_expert_ffn_hidden_size = (
         0
         if args.moe_shared_expert_intermediate_size is None
@@ -370,13 +376,14 @@ def compute_activation_memory_without_sp(args, num_microbatches, verbose=False):
     return total_activation_memory
 
 
-def report_theoretical_memory(args, num_microbatches=None, verbose=False):
+def report_theoretical_memory(args, num_microbatches=None, verbose=False, config=None):
     if is_hybrid_model(args):
         print("Theoretical memory footprints not yet supported for hybrid Mamba-Transformer models.")
         return
 
     weight_and_optimizer_memory = (
-        compute_weight_and_optimizer_memory(args, verbose=verbose) / NUM_BYTES_IN_MEGABYTE
+        compute_weight_and_optimizer_memory(args, verbose=verbose, config=config)
+        / NUM_BYTES_IN_MEGABYTE
     )
 
     # Choose the appropriate activation memory calculation based on parallelism strategy

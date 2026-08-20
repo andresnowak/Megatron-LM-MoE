@@ -657,16 +657,22 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "qkv", "mlp", "moe",
+    "shared_experts".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
+    "qkv": recompute the QKV projection, QK layernorm and RoPE applying parts of standard
+    (non-MLA) self-attention. This is the dense-attention counterpart of "mla_up_proj";
+    it discards the query/key/value tensors handed to the attention kernel and regenerates
+    them from the attention input during the backward pass. Training-only: the checkpoint is
+    bypassed whenever an inference context is active.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
-    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
+    "moe_act", "layernorm", "mla_up_proj", and "qkv" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -1897,6 +1903,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_act",
                     "layernorm",
                     "mla_up_proj",
+                    "qkv",
                     "mlp",
                     "moe",
                     "shared_experts",
@@ -1917,6 +1924,26 @@ class TransformerConfig(ModelParallelConfig):
                     "mla_up_proj in recompute_modules is only supported with "
                     "multi_latent_attention."
                 )
+
+            if "qkv" in self.recompute_modules:
+                if self.multi_latent_attention:
+                    raise ValueError(
+                        "qkv in recompute_modules is not supported with multi_latent_attention; "
+                        "use mla_up_proj instead."
+                    )
+                if self.attention_output_gate:
+                    raise ValueError(
+                        "qkv in recompute_modules is not supported with attention_output_gate."
+                    )
+                if self.fine_grained_activation_offloading and self.offload_modules is not None:
+                    conflicts = {"qkv_linear", "core_attn"} & set(self.offload_modules)
+                    if conflicts:
+                        raise ValueError(
+                            f"qkv in recompute_modules conflicts with offload_modules "
+                            f"{sorted(conflicts)}: the qkv recompute region already discards "
+                            "those activations, so offloading them is redundant and the "
+                            "offload interface is bypassed on the recompute path."
+                        )
 
             if "core_attn" in self.recompute_modules:
                 warnings.warn(
@@ -2636,7 +2663,7 @@ class TransformerConfig(ModelParallelConfig):
                             "moe_input_jitter_eps is not supported with graphed moe recomputation."
                         )
 
-        if self.moe_token_dispatcher_type in ["allgather"]:
+        if self.moe_token_dispatcher_type in ["allgather"] and self.num_moe_experts is not None:
             if self.variable_seq_lengths is True:
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "

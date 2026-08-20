@@ -296,9 +296,58 @@ class GatedDeltaNet(MegatronModule):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
+        cu_seqlens = None
+        conv_seq_idx = None
         if packed_seq_params is not None:
-            # TODO: support packed sequence
-            raise NotImplementedError("GDN does not support packed sequence for now.")
+            assert packed_seq_params.qkv_format == 'thd', (
+                "GDN packed-sequence support expects THD-format packed_seq_params "
+                f"(got qkv_format={packed_seq_params.qkv_format!r})."
+            )
+            if self.pg_collection.cp.size() > 1:
+                # TODO: support packed sequence + CP. Needs a THD-aware CP all-to-all
+                # permutation, which this repo's CP scheme does not implement yet.
+                raise NotImplementedError(
+                    "GDN does not support packed sequence (cross-document masking) "
+                    "together with context parallelism yet."
+                )
+            if self.sp_size > 1:
+                # TODO: support packed sequence + sequence-parallelism. The TP-sharded
+                # sequence chunk each rank sees would need to carry its own slice of
+                # cu_seqlens, which nothing here computes yet.
+                raise NotImplementedError(
+                    "GDN does not support packed sequence (cross-document masking) "
+                    "together with sequence-parallelism yet."
+                )
+            if self.config.deterministic_mode:
+                raise NotImplementedError(
+                    "GDN packed sequence requires the FLA Triton kernels; "
+                    "deterministic_mode's torch_chunk_gated_delta_rule fallback does "
+                    "not support cu_seqlens."
+                )
+            if causal_conv1d_fn is None:
+                raise NotImplementedError(
+                    "GDN packed sequence requires the causal_conv1d CUDA kernel "
+                    "(its seq_idx argument is what resets the conv at document "
+                    "boundaries); the nn.Conv1d fallback cannot mask them."
+                )
+            assert batch == 1, "Packed sequence expects batch dimension to be 1"
+            assert torch.equal(packed_seq_params.cu_seqlens_q, packed_seq_params.cu_seqlens_kv), (
+                "GDN packed sequence requires cu_seqlens_q == cu_seqlens_kv."
+            )
+            cu_seqlens = packed_seq_params.cu_seqlens_q.to(torch.int64)
+            assert int(cu_seqlens[-1].item()) == seq_len, (
+                f"cu_seqlens must cover the whole packed sequence: "
+                f"cu_seqlens[-1]={int(cu_seqlens[-1].item())} != seq_len={seq_len}"
+            )
+            # causal_conv1d masks document boundaries with per-token segment
+            # ids, not with cu_seqlens.
+            _doc_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            conv_seq_idx = torch.repeat_interleave(
+                torch.arange(
+                    _doc_lengths.numel(), device=cu_seqlens.device, dtype=torch.int32
+                ),
+                _doc_lengths,
+            ).unsqueeze(0)
 
         # Input projection
         nvtx_range_push(suffix="in_proj")
@@ -325,7 +374,11 @@ class GatedDeltaNet(MegatronModule):
         alpha = alpha.reshape(batch, seq_len, -1)
 
         # Convolution on qkv
-        qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+        qkv = qkv.transpose(1, 2)  # b, s, d -> b, d, s
+        if conv_seq_idx is None:
+            # seq_idx requires channel-last input, so only materialize the
+            # transpose on the unpacked path.
+            qkv = qkv.contiguous()
         nvtx_range_push(suffix="conv1d")
         if (causal_conv1d_fn is None) or self.config.deterministic_mode:
             qkv = self.act_fn(self.conv1d(qkv)[..., :seq_len])
@@ -336,6 +389,7 @@ class GatedDeltaNet(MegatronModule):
                 weight=self.conv1d.weight.squeeze(1),  # d, 1, w -> d, w
                 bias=self.conv1d.bias,
                 activation=self.activation,
+                seq_idx=conv_seq_idx,
             )
         nvtx_range_pop(suffix="conv1d")
         # Split qkv into query, key, and value
@@ -383,6 +437,12 @@ class GatedDeltaNet(MegatronModule):
                 use_qk_l2norm_in_kernel=False,
             )
         else:
+            # cu_seqlens is only ever non-None here: the packed-sequence guard above
+            # raises NotImplementedError when deterministic_mode is set, so this
+            # branch (chunk_gated_delta_rule) is the only one that can receive it.
+            gated_delta_rule_kwargs = {}
+            if cu_seqlens is not None:
+                gated_delta_rule_kwargs["cu_seqlens"] = cu_seqlens
             core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
                 query,
                 key,
@@ -392,6 +452,7 @@ class GatedDeltaNet(MegatronModule):
                 initial_state=None,
                 output_final_state=False,
                 use_qk_l2norm_in_kernel=False,
+                **gated_delta_rule_kwargs,
             )
         nvtx_range_pop(suffix="gated_delta_rule")
 
