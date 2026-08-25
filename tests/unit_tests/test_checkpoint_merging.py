@@ -154,12 +154,17 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
         )
         sources.append(str(source))
 
-    for output_name, coefficients, expected in (
-        ("mean_merge", None, 3.0),
-        ("linear_decay_merge", [0.75, 0.25], 2.0),
+    for output_name, coefficients, expected, method in (
+        ("mean_merge", None, 3.0, "mean"),
+        ("linear_decay_merge", [0.75, 0.25], 2.0, "linear-decay"),
     ):
         output = tmp_path_dist_ckpt / output_name
-        checkpoint_merge.merge_checkpoint_directories(sources, output, coefficients)
+        checkpoint_merge.merge_checkpoint_directories(
+            sources,
+            output,
+            coefficients,
+            merge_metadata={"method": method, "checkpoint_steps": [123, 456]},
+        )
         release = output / "release"
         loaded = dist_checkpointing.load(
             {
@@ -180,4 +185,11 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
         assert common["args"].iteration == 456
         assert common["args"].consumed_train_samples == 456 * 512
         assert common["args"].consumed_valid_samples == 456 * 8
+        merge_metadata = common["checkpoint_merge_metadata"]
+        assert merge_metadata["method"] == method
+        assert merge_metadata["checkpoint_steps"] == [123, 456]
+        assert merge_metadata["source_checkpoints"] == sources
+        assert merge_metadata["coefficients"] == (
+            [0.5, 0.5] if coefficients is None else coefficients
+        )
         assert "rng_state" not in common

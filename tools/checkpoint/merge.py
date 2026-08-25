@@ -231,11 +231,12 @@ def _filtered_common_state(source):
     return common
 
 
-def merge_checkpoint_directories(sources, output, coefficients=None):
+def merge_checkpoint_directories(sources, output, coefficients=None, merge_metadata=None):
     """Combine model tensors using every distributed rank as an I/O worker."""
     sources = list(sources)
     if len(sources) < 2:
         raise ValueError("Checkpoint merging requires at least two checkpoints")
+    inferred_method = "mean" if coefficients is None else "custom"
     if coefficients is None:
         coefficients = merge_coefficients(len(sources))
     if len(coefficients) != len(sources):
@@ -312,6 +313,12 @@ def merge_checkpoint_directories(sources, output, coefficients=None):
     }
 
     state_dict = _filtered_common_state(sources[-1])
+    state_dict["checkpoint_merge_metadata"] = {
+        "method": inferred_method,
+        "source_checkpoints": sources,
+        "coefficients": list(coefficients),
+        **(copy.deepcopy(merge_metadata) if merge_metadata is not None else {}),
+    }
     for key, value in {**output_tensors, **output_objects}.items():
         if key in state_dict:
             raise KeyError(f"Sharded model key collides with common state: {key!r}")
@@ -371,14 +378,19 @@ def main():
         "--checkpoints",
         nargs="+",
         required=True,
-        help="Checkpoint roots or direct iteration/release directories.",
+        help=(
+            "Checkpoint roots or direct iteration/release directories in chronological order; "
+            "the final checkpoint supplies progress metadata."
+        ),
     )
     parser.add_argument(
         "--checkpoint-steps",
         nargs="+",
         type=int,
         default=None,
-        help="Iterations to merge. One root applies to every listed iteration.",
+        help=(
+            "Strictly increasing iterations to merge. One root applies to every listed iteration."
+        ),
     )
     parser.add_argument("--output", required=True, help="Output checkpoint root.")
     parser.add_argument(
@@ -446,7 +458,20 @@ def main():
         )
         if dist.get_rank() == 0:
             print(f"> checkpoint coefficients: {coefficients}")
-        merge_checkpoint_directories(sources, args.output, coefficients)
+        merge_checkpoint_directories(
+            sources,
+            args.output,
+            coefficients,
+            merge_metadata={
+                "method": args.merge_method,
+                "checkpoint_steps": checkpoint_steps,
+                "original_schedule": args.original_schedule,
+                "original_end_multiplier": args.original_end_multiplier,
+                "original_decay_steps": args.original_decay_steps,
+                "original_decay_start_step": args.original_decay_start_step,
+                "target_end_multiplier": args.target_end_multiplier,
+            },
+        )
     finally:
         if initialized_here and dist.is_initialized():
             dist.destroy_process_group()
