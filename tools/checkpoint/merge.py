@@ -216,17 +216,13 @@ def _load_assigned(source, templates):
 
 
 def _filtered_common_state(source):
+    """Filter out training-specific keys from the common state of a checkpoint."""
     common = copy.deepcopy(dist_checkpointing.load_common_state_dict(source))
     common = {key: value for key, value in common.items() if not _is_training_key(key)}
 
-    common["iteration"] = 0
-    common["num_floating_point_operations_so_far"] = 0
     checkpoint_args = common.get("args")
     if checkpoint_args is not None:
         for name, value in (
-            ("iteration", 0),
-            ("consumed_train_samples", 0),
-            ("consumed_valid_samples", 0),
             ("no_save_optim", True),
             ("no_save_rng", True),
             ("finetune", True),
@@ -315,7 +311,7 @@ def merge_checkpoint_directories(sources, output, coefficients=None):
         for key, metadata in assigned_objects.items()
     }
 
-    state_dict = _filtered_common_state(first_source)
+    state_dict = _filtered_common_state(sources[-1])
     for key, value in {**output_tensors, **output_objects}.items():
         if key in state_dict:
             raise KeyError(f"Sharded model key collides with common state: {key!r}")

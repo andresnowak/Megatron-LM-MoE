@@ -1,5 +1,7 @@
 # Copyright (c) 2026, EPFL / Swiss AI Initiative.
 
+from argparse import Namespace
+
 import pytest
 import torch
 
@@ -121,7 +123,10 @@ def initialized_model_parallel():
 
 def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_ckpt):
     sources = []
-    for name, value in (("merge_one", 1.0), ("merge_two", 5.0)):
+    for name, value, iteration in (
+        ("merge_one", 1.0, 123),
+        ("merge_two", 5.0, 456),
+    ):
         source = tmp_path_dist_ckpt / name
         source.mkdir()
         dist_checkpointing.save(
@@ -136,7 +141,13 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
                 "optimizer.state.row_gain.weight": ShardedTensor.from_rank_offsets(
                     "optimizer.state.row_gain.weight", torch.full((4,), 99.0)
                 ),
-                "iteration": 123,
+                "iteration": iteration,
+                "num_floating_point_operations_so_far": iteration * 100,
+                "args": Namespace(
+                    iteration=iteration,
+                    consumed_train_samples=iteration * 512,
+                    consumed_valid_samples=iteration * 8,
+                ),
                 "rng_state": "excluded",
             },
             str(source),
@@ -164,5 +175,9 @@ def test_merge_torch_dist_checkpoints(initialized_model_parallel, tmp_path_dist_
             str(release)
         )
         common = dist_checkpointing.load_common_state_dict(str(release))
-        assert common["iteration"] == 0
+        assert common["iteration"] == 456
+        assert common["num_floating_point_operations_so_far"] == 45600
+        assert common["args"].iteration == 456
+        assert common["args"].consumed_train_samples == 456 * 512
+        assert common["args"].consumed_valid_samples == 456 * 8
         assert "rng_state" not in common
