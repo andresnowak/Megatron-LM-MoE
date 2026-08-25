@@ -1578,6 +1578,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 tokens_per_request,
             )
 
+        if self.is_hybrid_model:
             # 5. Mamba state: allocate slots for dummy requests.
             self.mamba_metadata.request_to_mamba_state_idx[0:N] = (
                 self.mamba_metadata.batch_allocate_slots(N)

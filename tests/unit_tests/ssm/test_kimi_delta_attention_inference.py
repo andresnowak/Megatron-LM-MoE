@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 import megatron.core.ssm.kimi_delta_attention as kda_module
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig, KDAInferenceStateConfig
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -523,6 +524,15 @@ class TestKimiDeltaAttentionInference:
 
         context.reset()
         assert context.kda_metadata.mamba_state_free_slot_count == context.max_requests
+
+        context.cuda_graph_batch_dimensions_list = [
+            InferenceBatchDimensions(token_count=2, decode_req_count=2)
+        ]
+        context.add_dummy_requests_for_expert_parallel_step()
+        dummy_slots = context.kda_metadata.request_to_mamba_state_idx[:2]
+        assert context.mamba_metadata is None
+        assert (dummy_slots >= 0).all()
+        assert dummy_slots.unique().numel() == 2
 
     def test_dynamic_context_rejects_kda_context_parallelism(self):
         conv_shape, recurrent_shape = self.kda.kda_state_shapes_per_request()
