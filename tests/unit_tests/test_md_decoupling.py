@@ -140,6 +140,133 @@ def _record_md_split_output(param, grad, **md_kwargs):
     ), calls
 
 
+def test_md_decoupling_kda_in_proj_split_uses_local_dim0_tp_shapes():
+    local_shapes = (2, 2, 3, 3, 1, 4)
+    param = torch.nn.Parameter(torch.empty(sum(local_shapes), 5))
+    param.is_kda_in_proj = True
+    param.kda_split_shapes = tuple(2 * rows for rows in local_shapes)
+    param.partition_dim = 0
+    grad = torch.arange(param.numel(), dtype=torch.float32).view_as(param)
+
+    output, calls = _record_md_split_output(
+        param,
+        grad,
+        is_kda_in_proj_fn=lambda p: getattr(p, "is_kda_in_proj", False),
+    )
+
+    assert [call.shape for call in calls] == [
+        torch.Size([rows, param.size(1)]) for rows in local_shapes
+    ]
+    expected = torch.cat(
+        [
+            torch.full((rows, param.size(1)), i, dtype=output.dtype)
+            for i, rows in enumerate(local_shapes, 1)
+        ]
+    )
+    assert torch.equal(output, expected)
+
+
+def test_md_decoupling_builder_routes_kda_decay_parameters_to_adam(monkeypatch):
+    class _FakeModelChunk:
+        def __init__(self):
+            self.config = SimpleNamespace(
+                num_attention_heads=2,
+                num_query_groups=1,
+                kv_channels=4,
+                multi_latent_attention=False,
+                num_layers=1,
+                hidden_size=4,
+            )
+            self.in_proj = torch.nn.Parameter(torch.ones(8, 4))
+            self.A_log = torch.nn.Parameter(torch.ones(2))
+            self.dt_bias = torch.nn.Parameter(torch.ones(8))
+            self.A_log.is_kda_decay_parameter = True
+            self.dt_bias.is_kda_decay_parameter = True
+
+        def named_parameters(self):
+            return iter(
+                [
+                    ("decoder.layers.0.self_attention.in_proj.weight", self.in_proj),
+                    ("decoder.layers.0.self_attention.A_log", self.A_log),
+                    ("decoder.layers.0.self_attention.dt_bias", self.dt_bias),
+                ]
+            )
+
+    model = _FakeModelChunk()
+    captured = {}
+
+    def fake_get_param_groups(model_chunks, config, config_overrides):
+        del config, config_overrides
+        params = [
+            p
+            for model_chunk in model_chunks
+            for _, p in model_chunk.named_parameters()
+            if p.requires_grad
+        ]
+        return [{"params": params, "is_expert_parallel": False}]
+
+    def fake_md_decoupling(params, **kwargs):
+        del kwargs
+        captured["md"] = [p for group in params for p in group["params"]]
+        return SimpleNamespace(param_groups=params, state={})
+
+    def fake_get_megatron_optimizer(config, model_chunks, **kwargs):
+        del kwargs
+        captured["scalar_optimizer"] = config.optimizer
+        captured["adam"] = [
+            p
+            for model_chunk in model_chunks
+            for _, p in model_chunk.named_parameters()
+            if p.requires_grad
+        ]
+        return SimpleNamespace(chained_optimizers=[])
+
+    monkeypatch.setattr(md_module, "_get_param_groups", fake_get_param_groups)
+    monkeypatch.setattr(md_module, "MDDecoupling", fake_md_decoupling)
+    monkeypatch.setattr(md_module, "FP32Optimizer", lambda optimizer, *args: optimizer)
+    monkeypatch.setattr(md_module, "get_megatron_optimizer", fake_get_megatron_optimizer)
+    monkeypatch.setattr(
+        md_module,
+        "ChainedOptimizer",
+        lambda optimizers: SimpleNamespace(chained_optimizers=optimizers),
+    )
+
+    config = OptimizerConfig(
+        optimizer="md_decoupling",
+        lr=0.01,
+        min_lr=0.0,
+        use_orthogonal_updates=False,
+    )
+    config.hypersphere_mode = None
+    config.hypersphere_embedding_mode = None
+    config.hypersphere_router_mode = None
+    config.hypersphere_gains_mode = None
+    config.use_distributed_optimizer = False
+    config.fp16 = False
+    config.bf16 = False
+    overrides = md_module._mddecoupling_config_overrides(config, {})
+    matrix_key = next(
+        key
+        for key in overrides
+        if getattr(key.predicate, "name", None) == "md_non_embedding_or_output_matrix"
+    )
+    assert matrix_key.predicate(model.in_proj)
+    assert not matrix_key.predicate(model.A_log)
+    assert not matrix_key.predicate(model.dt_bias)
+    md_module.get_megatron_mddecoupling_optimizer(
+        config,
+        [model],
+        config_overrides={},
+        pg_collection=_NoProcessGroups(),
+    )
+
+    assert len(captured["md"]) == 1 and captured["md"][0] is model.in_proj
+    assert len(captured["adam"]) == 2
+    assert captured["scalar_optimizer"] == "adam"
+    assert captured["adam"][0] is model.A_log
+    assert captured["adam"][1] is model.dt_bias
+
+
 @requires_cuda_and_emerging
 @pytest.mark.parametrize(
     ("preserve_init", "expected_weight_norm"),
@@ -2494,6 +2621,8 @@ def test_md_decoupling_mla_param_tags_copy_to_main_param():
     param.is_kv_up_proj = True
     param.is_q_up_proj = True
     param.is_qkv_down_proj = True
+    param.is_kda_in_proj = True
+    param.kda_split_shapes = (1, 1, 1, 1, 1, 1)
     main_param = torch.empty_like(param)
 
     tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
@@ -2501,6 +2630,8 @@ def test_md_decoupling_mla_param_tags_copy_to_main_param():
     assert main_param.is_kv_up_proj
     assert main_param.is_q_up_proj
     assert main_param.is_qkv_down_proj
+    assert main_param.is_kda_in_proj
+    assert main_param.kda_split_shapes == (1, 1, 1, 1, 1, 1)
 
 @pytest.mark.parametrize(
     ("split_mla_per_head", "expected_q_up_proj_head_dim"),

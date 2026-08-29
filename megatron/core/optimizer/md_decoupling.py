@@ -345,6 +345,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         qkv_split_shapes: Optional[Sequence[int]] = None,
         qkv_dim: Optional[int] = None,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
+        is_kda_in_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         is_kv_up_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         kv_up_proj_split_shapes: Optional[tuple[int, int]] = None,
         is_qkv_down_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
@@ -395,6 +396,9 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         self.is_qkv_fn = is_qkv_fn if is_qkv_fn is not None else (lambda p: False)
         self.qkv_split_shapes = qkv_split_shapes
         self.qkv_dim = qkv_dim
+        self.is_kda_in_proj_fn = (
+            is_kda_in_proj_fn if is_kda_in_proj_fn is not None else (lambda p: False)
+        )
         self.is_kv_up_proj_fn = (
             is_kv_up_proj_fn if is_kv_up_proj_fn is not None else (lambda p: False)
         )
@@ -732,6 +736,19 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                 _split_qkv(x, self.qkv_split_shapes),
                 lambda parts: _merge_qkv(parts, x.shape, self.qkv_split_shapes),
             )
+        if self.split_qkv and self.is_kda_in_proj_fn(p):
+            shapes = getattr(p, "kda_split_shapes", None)
+            if shapes is None:
+                raise ValueError("KDA in_proj is missing kda_split_shapes metadata")
+            shapes = self._local_dim0_split_shapes(p, x, shapes, allow_groups=False)
+            if sum(shapes) != x.size(0):
+                raise ValueError(
+                    f"KDA split shapes {shapes} do not match tensor shape {x.shape}"
+                )
+            return (
+                list(torch.split(x, shapes, dim=0)),
+                lambda parts: torch.cat(parts, dim=0),
+            )
         glu_split_dim = getattr(p, "glu_split_dim", None)
         if self.split_fc1 and glu_split_dim is not None:
             return _split_glu_fc1(x, glu_split_dim), None
@@ -787,12 +804,12 @@ class _MDDecouplingBase(torch.optim.Optimizer):
             tp_size = total // dim0
         if tp_size <= 1:
             raise ValueError(
-                f"Cannot infer local split shapes for dim0-sharded MLA parameter with "
+                f"Cannot infer local split shapes for dim0-sharded projection parameter with "
                 f"tensor dim0 {dim0} and global split shapes {shapes}"
             )
         if any(shape % tp_size != 0 for shape in shapes):
             raise ValueError(
-                f"Cannot split dim0-sharded MLA parameter with global split shapes {shapes} "
+                f"Cannot split dim0-sharded projection parameter with global split shapes {shapes} "
                 f"over TP size {tp_size}"
             )
 
@@ -1874,6 +1891,7 @@ def _mddecoupling_config_overrides(
         name="md_non_embedding_or_output_matrix",
         fn=lambda p: (not getattr(p, "is_embedding_or_output_parameter", False)
                       and (len(p.shape) == 2 or getattr(p, "merged_offload_expert", False))
+                      and not getattr(p, "is_kda_decay_parameter", False)
                       and not (router_has_own_lr and getattr(p, "is_router", False))),
     )
     overrides[ParamKey(predicate=non_emb_2d)] = {
@@ -2047,7 +2065,7 @@ def get_megatron_mddecoupling_optimizer(
                 elif not getattr(param, "is_md_embedding_parameter", False):
                     param.is_md_output_parameter = True
             is_out_proj = (
-                ((len(param.shape) == 2) and ('linear_fc2' in name or 'linear_proj' in name))
+                ((len(param.shape) == 2) and ('linear_fc2' in name or 'linear_proj' in name or name.endswith('out_proj.weight') ))
                 or (is_merged_offload_expert and 'experts.weight2' in name)
             )
             if is_out_proj:
@@ -2078,7 +2096,11 @@ def get_megatron_mddecoupling_optimizer(
                 continue
             is_emb = getattr(param, 'is_embedding_or_output_parameter', False)
             is_merged_offload_expert = getattr(param, 'merged_offload_expert', False)
-            if len(param.shape) == 2 and (not is_emb or emb_in_md):
+            if (
+                len(param.shape) == 2
+                and (not is_emb or emb_in_md)
+                and not getattr(param, 'is_kda_decay_parameter', False)
+            ):
                 linear_params.append(param)
             elif len(param.shape) == 3 and is_merged_offload_expert:
                 # In OffloadingExpert with FP8, the expert weight is 3D (num_local_experts, out, in).
@@ -2112,6 +2134,7 @@ def get_megatron_mddecoupling_optimizer(
         is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
         qkv_split_shapes=qkv_split_shapes,
         qkv_dim=model_chunks[0].config.kv_channels,
+        is_kda_in_proj_fn=lambda p: getattr(p, "is_kda_in_proj", False),
         is_kv_up_proj_fn=lambda p: getattr(p, "is_kv_up_proj", False),
         kv_up_proj_split_shapes=kv_up_proj_split_shapes,
         is_qkv_down_proj_fn=lambda p: getattr(p, "is_qkv_down_proj", False),

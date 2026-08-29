@@ -22,7 +22,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_model_config, internal_api, is_te_min_version
+from megatron.core.utils import get_model_config, internal_api, is_te_min_version, get_attr_wrapped_model
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -37,6 +37,11 @@ if HAVE_TE:
         fused_unpermute,
         te_general_gemm,
     )
+
+    # NOTE (fuguan): with TE >= 2.12.0, fused_permute_and_pad_with_probs
+    # introduces extra synchronization operations that is slow.
+    # as a temporary workaround, disable fused_permute_and_pad_with_probs for now.
+    fused_permute_and_pad_with_probs = None
 else:
     (
         fused_compute_score_for_moe_aux_loss,
@@ -267,9 +272,17 @@ def compute_qb_histogram(
 
     expert_offsets = torch.arange(num_experts, device=scores.device) * num_bins
     bin_indices.add_(expert_offsets)
-    return torch.bincount(
-        bin_indices.reshape(-1), minlength=num_experts * num_bins
-    ).reshape(num_experts, num_bins)
+    # torch.bincount does not support CUDA-graph capturable because it
+    # internally has d2h sync.
+    # revert to scatter_add_. A fixed-size buffer has a static output shape, and a
+    # stride-0 expanded ones source avoids the bin_indices-sized values tensor.
+    flat_indices = bin_indices.reshape(-1)
+    ones = torch.ones(1, dtype=flat_indices.dtype, device=flat_indices.device)
+    return (
+        torch.zeros(num_experts * num_bins, dtype=torch.long, device=flat_indices.device)
+        .scatter_add_(0, flat_indices, ones.expand_as(flat_indices))
+        .reshape(num_experts, num_bins)
+    )
 
 
 def recover_qb_beta_from_histogram(
@@ -1510,6 +1523,18 @@ def get_moe_layer_wise_logging_tracker() -> dict:
     global _MOE_LAYER_WISE_LOGGING_TRACKER
     return _MOE_LAYER_WISE_LOGGING_TRACKER
 
+def save_router_state(model):
+    return [
+        (m, m.get_router_rerun_state())
+        for chunk in model
+        for m in get_attr_wrapped_model(chunk, 'modules')()
+        if hasattr(m, 'get_router_rerun_state')
+    ]
+
+def restore_router_state(state):
+    for module, saved in state:
+        if hasattr(module, 'set_router_rerun_state'):
+            module.set_router_rerun_state(saved)
 
 @internal_api
 class RandomSTE(torch.autograd.Function):

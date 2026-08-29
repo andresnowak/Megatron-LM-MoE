@@ -437,8 +437,10 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # attention variant
     ####################
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
-    """Type of attention variant to use. Currently support gated_delta_net and dsa."""
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'kda']] = None
+    """Type of attention variant to use. Supports gated_delta_net (Yang et al. 2025),
+    dsa (DeepSeek sparse attention), delta_net (Schlag et al. 2021 with chunkwise FLA op),
+    and kda (Kimi Delta Attention, MoonshotAI 2025)."""
 
     ####################
     # DSA
@@ -483,6 +485,113 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
+
+    linear_attention_allow_neg_eigval: bool = False
+    """If True, parameterize the delta-rule write strength as `beta = 2 * sigmoid(...)` so
+    `(I - beta k k^T)` admits eigenvalues in (-1, 1), unlocking state tracking
+    (Grazzi et al. 2025; OLMo Hybrid). Applies to gated_delta_net and kda variants."""
+
+    linear_attention_use_decay: bool = True
+    """If True (default), the delta-rule layer computes a per-head scalar decay g (gated_delta_net).
+    If False, decay is disabled (g forced to zero so exp(g)=1) for vanilla DeltaNet (Schlag et al.
+    2021). The corresponding alpha/dt_bias/A_log slots in the in-projection are still produced
+    but ignored to keep the projection layout uniform across variants."""
+
+    linear_attention_qk_norm: Literal['l2norm', 'rmsnorm'] = 'l2norm'
+    """Normalization applied to Q, K after the SiLU/conv1d in the delta-rule layer. 'l2norm' is the
+    FLA default for GDN/DeltaNet. 'rmsnorm' applies a learnable per-channel RMSNorm (used for
+    the Schlag-style DeltaNet variant in this repo)."""
+
+    linear_attention_v_norm: Literal['none', 'l2norm'] = 'none'
+    """If 'l2norm', also project V to unit norm along the last dim before passing to the FLA
+    chunkwise op. Default 'none' (V is the raw SiLU/conv1d output, unbounded). Bounding ||v||
+    bounds the per-token write magnitude beta v k^T."""
+
+    linear_attention_carried_state_max_frob: float = 0.0
+    """Hard cap on ||S||_F of the carried state buffer (linear_attention_carry_state). If the
+    new last-recurrent-state has Frobenius norm above this value, scale it down before storing
+    in the buffer for the next forward. Zero (default) disables the cap. Applied per-rank,
+    per-batch-element on the buffer only; intra-forward state is not capped."""
+
+    linear_attention_n_householder: int = 1
+    """Number of Householder-style updates per token (DeltaProduct). 1 (default) recovers
+    standard DeltaNet/GDN. n>1 routes the FLA op to chunk_gated_delta_product, which chains
+    n rank-1 reflections per token. Each token must produce n sets of (q, k, v, beta, alpha);
+    in_proj output dim grows by ~n* for those slots while the output gate stays per-token.
+    Recurrence and projection compute scale ~n*."""
+
+    linear_attention_n_erase: int = 0
+    """Number of pure-erase Householders per token (subset of n_householder). The last
+    n_erase positions of each token's n_householder updates have v forced to zero, so they
+    contribute only the (I - beta k k^T) erasure factor to the chained transform — no v k^T
+    addition. Useful for explicitly removing past info along key directions without writing
+    new info. n_householder must be > n_erase. The erase positions still consume v projection
+    slots in in_proj (those values are wasted)."""
+
+    linear_attention_use_output_gate: bool = True
+    """If True (default), apply a sigmoid output gate after the output RMSNorm (FLA convention,
+    matches GDN). Set False for a true Schlag-2021 vanilla DeltaNet without output gating."""
+
+    linear_attention_qk_norm_init_scale: float = 1.0
+    """Multiplier applied to the QK-RMSNorm weight init for the Schlag DeltaNet variant. The
+    base init is 1/sqrt(head_dim) (unit-norm output); values < 1 produce sub-unit-norm Q,K which
+    leaves a stability margin for delta-rule eigenvalues, useful for the neg-eigval variant."""
+
+    linear_attention_beta_scale: float = 1.0
+    """Post-sigmoid multiplier on the delta-rule write strength beta. With allow_neg_eigval the
+    base beta is 2*sigmoid(...); a scale of 0.95 caps beta at 1.9. Without allow_neg_eigval the
+    base is sigmoid(...); a scale of 0.9 caps beta at 0.9."""
+
+    linear_attention_beta_bias_init: float = 0.0
+    """Additive bias on the beta projection logit (pre-sigmoid). A negative value (e.g. -2) makes
+    beta start near 0.12 instead of 0.5, slowing initial writes so the recurrent state forms
+    before strong updates land. Adds a small per-head learnable parameter."""
+
+    linear_attention_learnable_initial_state: bool = False
+    """If True, learn a per-head initial state S0 of shape [num_v_heads_local_tp, key_head_dim,
+    value_head_dim] and pass it as `initial_state` to the FLA chunkwise op. Useful for cold-start:
+    the first few tokens of each sequence read from a learned baseline rather than zero."""
+
+    linear_attention_output_gate_form: Literal['per_channel', 'scalar'] = 'per_channel'
+    """Form of the output gate when use_output_gate=True. 'per_channel' (default, GDN/FLA
+    behavior) applies SiLU(z) per value-channel; gate has shape [b, s, h, d_v]. 'scalar' mean-
+    pools the gate projection over d_v to a single scalar per head per token, then broadcasts
+    SiLU(scalar) over the output channels. The scalar form provides a softer, single-knob
+    gate that commutes with the linear read (per-head) and uses fewer effective dofs."""
+
+    linear_attention_full_rank_output_gate: bool = False
+    """If True, the KDA output gate is a full-rank projection (hidden -> v_dim) fused into in_proj
+    and sharded on value heads, instead of the reference low-rank bottleneck (hidden ->
+    value_head_dim -> v_dim). The decay gate keeps its low-rank bottleneck. This is the Kimi-K3
+    output-gate change: reported at ~parity in quality, and it removes the TP/CP all-gather that the
+    low-rank output-gate bottleneck otherwise requires (only the decay bottleneck still needs it).
+    Changes the in_proj layout, so checkpoints are not interchangeable with the low-rank variant.
+    Only affects Kimi Delta Attention (KDA)."""
+
+    linear_attention_safe_output_gate: bool = False
+    """If True, use the Kimi-K3 / FlashKDA 'safe' bounded reparameterization of the log-decay
+    (forget) gate: g = g_min * sigmoid(exp(A_log) * (z + dt_bias)) in (g_min, 0), instead of the
+    default g = -exp(A_log) * softplus(z + dt_bias) in (-inf, 0). This is NOT a clamp of the
+    softplus form -- it is a different, smooth activation (dt_bias is added first, then scaled by
+    exp(A_log) inside the sigmoid). g_min = linear_attention_safe_output_gate_lower_bound (default
+    -5). Bounding g below keeps exp(cumsum(g)) representable in bf16, so FlashKDA's non-rescaling
+    inference kernel is usable; a model must be TRAINED with this on for the bound to hold at
+    inference. Applies to both GDN and KDA. For KDA it is computed natively by FLA (chunk_kda
+    safe_gate/lower_bound, or fused_kda_gate lower_bound) with no loss of fusion; older FLA builds
+    fall back to a torch implementation of the same formula. Matches fla.ops.kda
+    naive_kda_lowerbound_gate."""
+
+    linear_attention_safe_output_gate_lower_bound: float = -5.0
+    """g_min for linear_attention_safe_output_gate: the (negative) scale multiplying sigmoid, which
+    lower-bounds the log-decay g (so per-step retention alpha = exp(g) > exp(g_min)). -5 matches
+    Kimi-K3 / FlashKDA (retention floor exp(-5) ~= 6.7e-3), chosen so the cumulative chunk decay
+    stays representable in bf16 without rescaling."""
+
+    linear_attention_carry_state: bool = False
+    """If True, carry the recurrent state across forward passes. Each forward pulls the
+    previous step's last_recurrent_state (detached, mean-reduced over batch, broadcast back
+    over the new batch) as initial_state, then writes the new last state into a non-persistent
+    buffer. Per-rank carry (no DP all-reduce). Mutually exclusive with linear_attention_learnable_initial_state."""
 
     ####################
     # initialization
@@ -664,11 +773,14 @@ class TransformerConfig(ModelParallelConfig):
     "moe_act": recompute the MoE MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
     "mla_up_proj": recompute the MLA up projection and RoPE applying parts.
-    "qkv": recompute the QKV projection, QK layernorm and RoPE applying parts of standard
-    (non-MLA) self-attention. This is the dense-attention counterpart of "mla_up_proj";
-    it discards the query/key/value tensors handed to the attention kernel and regenerates
-    them from the attention input during the backward pass. Training-only: the checkpoint is
-    bypassed whenever an inference context is active.
+    "qkv": recompute the producer of the tensors handed to the attention kernel. For standard
+    (non-MLA) self-attention that is the QKV projection, QK layernorm and RoPE applying parts,
+    the dense-attention counterpart of "mla_up_proj"; it discards the query/key/value tensors
+    and regenerates them from the attention input during the backward pass. Training-only: the
+    checkpoint is bypassed whenever an inference context is active. For
+    experimental_attention_variant="kda" it is instead the linear-attention input projection,
+    i.e. everything from in_proj through the q/k/v/gate/beta/alpha handed to the chunkwise
+    kernel.
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
@@ -956,6 +1068,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_use_offloading_experts: bool = False
     """Whether to use offloading experts for MoE."""
 
+    moe_offloading_mode: Literal['fine-grained', 'coarse-grained'] = "fine-grained"
+    """Expert-weight reload granularity; coarse mode overlaps whole-weight H2D with MoE
+    communication."""
+
     moe_offloading_num_chunks: int = 8
     """Number of chunks to split the expert weights into for offloading. """
 
@@ -978,6 +1094,14 @@ class TransformerConfig(ModelParallelConfig):
     None or [] disables offload. Only supported with the inplace-FP8 offloading-experts path
     (moe_use_offloading_experts + moe_use_inplace_fp8_param) and incompatible with moe_layer_recompute
     (the activation is not held across the pipeline gap under full-layer recompute)."""
+
+    moe_offload_main_grad: bool = False
+    """Whether to keep the routed experts' fp32 main grads in pinned host memory instead of on the
+    device, staging them back onto the GPU only for the duration of the wgrad GEMMs that accumulate
+    into them (the H2D overlaps the combine-backward phase, the D2H follows the wgrad). Trades
+    2x main-grad bytes of PCIe traffic per layer per microbatch for the whole main-grad buffer of
+    device memory. Only supported with the inplace-FP8 offloading-experts path
+    (moe_use_offloading_experts + moe_use_inplace_fp8_param)."""
 
     moe_offloading_experts_skip_post_backward_hook: bool = False
     """Whether the offloading experts MLP should skip the post backward hook."""
@@ -1395,7 +1519,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
-        if self.experimental_attention_variant == "gated_delta_net":
+        if self.experimental_attention_variant in ("gated_delta_net", "kda"):
             assert (
                 self.linear_attention_freq is not None
             ), f"linear_attention_freq must be set for linear gated_delta_net."
@@ -1429,10 +1553,23 @@ class TransformerConfig(ModelParallelConfig):
                 self.linear_num_value_heads % self.tensor_model_parallel_size == 0
             ), "linear_num_value_heads must be a multiple of tensor_model_parallel_size."
 
-            # Do not support yet, but coming soon.
-            assert self.context_parallel_size == 1, (
-                f"Gated delta net does not support context parallel for now,"
-                f" but got {self.context_parallel_size=}."
+            # Check context parallelism compatibility. GDN/KDA's CP all-to-all
+            # (megatron/core/ssm/gated_delta_net.py) shards Q/K/V/gate/beta/alpha
+            # along the head dimension across CP ranks, so the per-TP-rank head
+            # counts must themselves divide evenly across CP ranks.
+            assert (
+                self.linear_num_key_heads // self.tensor_model_parallel_size
+            ) % self.context_parallel_size == 0, (
+                "linear_num_key_heads // tensor_model_parallel_size "
+                f"({self.linear_num_key_heads // self.tensor_model_parallel_size}) must be a "
+                f"multiple of context_parallel_size ({self.context_parallel_size})."
+            )
+            assert (
+                self.linear_num_value_heads // self.tensor_model_parallel_size
+            ) % self.context_parallel_size == 0, (
+                "linear_num_value_heads // tensor_model_parallel_size "
+                f"({self.linear_num_value_heads // self.tensor_model_parallel_size}) must be a "
+                f"multiple of context_parallel_size ({self.context_parallel_size})."
             )
 
         if self.fp8:
@@ -1902,6 +2039,12 @@ class TransformerConfig(ModelParallelConfig):
                     "core_attn",
                     "moe_act",
                     "layernorm",
+                    # Linear-attention (KDA/GDN) core: conv1d -> chunk kernel ->
+                    # gated norm. The FLA chunk kernels hold q/k/v, the fp32
+                    # decay and beta for their own backward, so this region is
+                    # the only place those can be freed. See
+                    # KimiDeltaAttention._kda_core.
+                    "linear_attn",
                     "mla_up_proj",
                     "qkv",
                     "mlp",
@@ -1930,10 +2073,6 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "qkv in recompute_modules is not supported with multi_latent_attention; "
                         "use mla_up_proj instead."
-                    )
-                if self.attention_output_gate:
-                    raise ValueError(
-                        "qkv in recompute_modules is not supported with attention_output_gate."
                     )
                 if self.fine_grained_activation_offloading and self.offload_modules is not None:
                     conflicts = {"qkv_linear", "core_attn"} & set(self.offload_modules)
@@ -2005,7 +2144,23 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"moe_offload_activations={self.moe_offload_activations!r}: "
                     f"'{MOE_OFFLOAD_FC1_OUTPUT}' requires '{MOE_OFFLOAD_INPUT}' -- the fc1 reload "
-                    "rides the same ActivationOffloadHandle / MoEActReloadTrigger as fp8_x."
+                    "rides the same MoEOffloadHandle / MoEReloadTrigger as fp8_x."
+                )
+
+        if self.moe_offloading_mode not in ("fine-grained", "coarse-grained"):
+            raise ValueError(
+                "moe_offloading_mode must be either 'fine-grained' or 'coarse-grained', "
+                f"got {self.moe_offloading_mode!r}."
+            )
+        if self.moe_use_offloading_experts and self.moe_offloading_mode == "coarse-grained":
+            if not self.moe_use_inplace_fp8_param:
+                raise ValueError(
+                    "coarse-grained expert weight offload requires moe_use_inplace_fp8_param."
+                )
+            if self.moe_offloading_experts_debug_mode:
+                raise ValueError(
+                    "coarse-grained expert weight offload is incompatible with "
+                    "moe_offloading_experts_debug_mode, which keeps weights GPU-resident."
                 )
 
         if self.moe_layer_recompute:

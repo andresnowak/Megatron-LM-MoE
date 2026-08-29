@@ -77,6 +77,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         split_fc1: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
         qkv_split_shapes: Sequence[int] | None = None,
+        is_kda_in_proj_fn: Callable[[torch.Tensor], bool] | None = None,
         is_kv_up_proj_fn: Callable[[torch.Tensor], bool] | None = None,
         kv_up_proj_split_shapes: tuple[int, int] | None = None,
         is_qkv_down_proj_fn: Callable[[torch.Tensor], bool] | None = None,
@@ -128,6 +129,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.split_fc1 = split_fc1
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
+        self.is_kda_in_proj_fn = is_kda_in_proj_fn
         self.is_kv_up_proj_fn = is_kv_up_proj_fn
         self.kv_up_proj_split_shapes = kv_up_proj_split_shapes
         self.is_qkv_down_proj_fn = is_qkv_down_proj_fn
@@ -224,6 +226,26 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 self.scaled_orthogonalize_fn(g, tp_group, partition_dim) for g in fc1_grads
             ]
             grad = torch.cat(fc1_grads, dim=glu_split_dim)
+        elif (
+            self.split_qkv
+            and self.is_kda_in_proj_fn is not None
+            and self.is_kda_in_proj_fn(p)
+        ):
+            split_shapes = getattr(p, "kda_split_shapes", None)
+            if split_shapes is None:
+                raise ValueError("KDA in_proj is missing kda_split_shapes metadata")
+            split_shapes = self._local_dim0_split_shapes(
+                p, grad, split_shapes, allow_groups=False
+            )
+            if sum(split_shapes) != grad.size(0):
+                raise ValueError(
+                    f"KDA split shapes {split_shapes} do not match gradient shape {grad.shape}"
+                )
+            kda_grads = torch.split(grad, split_shapes, dim=0)
+            kda_grads = [
+                self.scaled_orthogonalize_fn(g, tp_group, partition_dim) for g in kda_grads
+            ]
+            grad = torch.cat(kda_grads, dim=0)
         elif (
             self.split_qkv
             and self.is_qkv_down_proj_fn is not None
@@ -342,12 +364,12 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             tp_size = total // dim0
         if tp_size <= 1:
             raise ValueError(
-                f"Cannot infer local split shapes for dim0-sharded MLA parameter with "
+                f"Cannot infer local split shapes for dim0-sharded projection parameter with "
                 f"tensor dim0 {dim0} and global split shapes {shapes}"
             )
         if any(shape % tp_size != 0 for shape in shapes):
             raise ValueError(
-                f"Cannot split dim0-sharded MLA parameter with global split shapes {shapes} "
+                f"Cannot split dim0-sharded projection parameter with global split shapes {shapes} "
                 f"over TP size {tp_size}"
             )
 
@@ -520,6 +542,7 @@ def get_megatron_muon_optimizer(
             if (
                 not getattr(param, 'is_embedding_or_output_parameter', False)
                 and len(param.shape) == 2
+                and not getattr(param, 'is_kda_decay_parameter', False)
             ):
                 linear_params.append(param)
             else:
@@ -543,6 +566,7 @@ def get_megatron_muon_optimizer(
         "split_fc1": config.muon_split_fc1,
         "is_qkv_fn": lambda p: getattr(p, "is_qkv", False),
         "qkv_split_shapes": qkv_split_shapes,
+        "is_kda_in_proj_fn": lambda p: getattr(p, "is_kda_in_proj", False),
         "is_kv_up_proj_fn": lambda p: getattr(p, "is_kv_up_proj", False),
         "kv_up_proj_split_shapes": kv_up_proj_split_shapes,
         "is_qkv_down_proj_fn": lambda p: getattr(p, "is_qkv_down_proj", False),
