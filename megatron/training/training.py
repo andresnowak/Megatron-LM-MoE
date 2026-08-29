@@ -45,6 +45,7 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional, Dict
+from functools import partial
 
 import torch.distributed
 
@@ -186,6 +187,7 @@ from megatron.core.optimizer.muon_logging import (
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
+    compare_grad_norms,
     RerunDataIterator,
     RerunMode,
 )
@@ -197,7 +199,12 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.transformer.moe.moe_utils import (
+    track_moe_metrics, 
+    clear_aux_losses_tracker,
+    save_router_state,
+    restore_router_state,
+)
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
     OffloadingFP8Config,
@@ -243,6 +250,7 @@ from .utils import (
     print_rank_0,
     print_rank_last,
     report_memory,
+    report_host_memory,
     unwrap_model,
     update_use_dist_ckpt,
     to_empty_if_meta_device,
@@ -1095,7 +1103,22 @@ def pretrain(
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
+    report_host_memory('after model+optimizer built')
     config = get_model_config(model[0])
+
+    # register state save/restore functions in rerun state machine
+    rerun_state_machine = get_rerun_state_machine()
+    rerun_state_machine.register_state_save_restore_funcs(
+        "router",
+        partial(save_router_state, model=model),
+        restore_router_state,
+    )
+    # upon state restore, clear moe metrics to avoid double counting
+    rerun_state_machine.register_state_save_restore_funcs(
+        "moe_metrics",
+        lambda: None,
+        lambda state: clear_aux_losses_tracker(),
+    )
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -1847,7 +1870,6 @@ def setup_model_and_optimizer(
 
     return model, optimizer, opt_param_scheduler
 
-
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
     num_microbatches = get_num_microbatches()
@@ -1887,6 +1909,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_dgrads_interval == 0)
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
+    grad_norm = None
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -1963,6 +1986,27 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for model_chunk in model:
             model_chunk.force_all_reduce = False
 
+        if args.optimizer == 'md_decoupling' and args.check_grad_norm:
+            from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+            from functools import partial
+            if isinstance(optimizer, LayerWiseDistributedOptimizer):
+                found_inf_flag, grad_norm = optimizer.prepare_grad_norm()
+                rerun_state_machine.validate_result(
+                    result=(found_inf_flag, grad_norm),
+                    rejection_func=partial(
+                        rerun_state_machine.is_spiky_grad_norm,
+                        context="grad_norm",
+                        num_samples=20,
+                        reload=args.load is not None and args.iteration > 0,
+                        threshold=args.check_grad_norm_threshold,
+                    ),
+                    message="Spiky grad_norm",
+                    comparison_func=compare_grad_norms,
+                    tolerance=0.0,
+                    fatal=False,
+                )
+        # end of rerun_state_machine region
+
     # Checkpoint main_grads.
     if save_wgrads_in_this_iteration:
         # Collect state_dict of wgrads (each param's .main_grad field).
@@ -1994,7 +2038,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -2182,6 +2229,19 @@ def training_log(
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
                 wandb_writer.log({'skipped-train-samples': args.skipped_train_samples}, iteration)
+        rerun_state_machine = get_rerun_state_machine()
+        writer.add_scalar('rerun-count', rerun_state_machine.rerun_count, iteration)
+        writer.add_scalar(
+            'rerun-count-this-iteration', rerun_state_machine.rerun_count_this_iteration, iteration
+        )
+        if wandb_writer:
+            wandb_writer.log(
+                {
+                    'rerun-count': rerun_state_machine.rerun_count,
+                    'rerun-count-this-iteration': rerun_state_machine.rerun_count_this_iteration,
+                },
+                iteration,
+            )
         writer.add_scalar('batch-size', batch_size, iteration)
         writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
         if wandb_writer:
@@ -2463,6 +2523,7 @@ def training_log(
         if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
             not reported_memory_in_this_iteration:
             report_memory(f'(after {iteration} iterations)')
+            report_host_memory(f'iteration {iteration}')
         # Write timers to wandb, don't reset the counts.
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
@@ -2960,6 +3021,7 @@ def train(
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
+    report_host_memory('before first training step')
     report_memory_flag = True
     pre_hook_enabled = False
     should_exit = False
@@ -3076,11 +3138,19 @@ def train(
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
+        # The graph's static input surface must match the token layout the pipeline
+        # actually runs with. Under THD packing (`--dataloader-inter-document-masking`
+        # or `--sft`) a microbatch is laid out as (mbs * seq, 1) rather than (seq, mbs);
+        # train_step already collapses the shape for the pipeline buffers via
+        # _pipeline_shape_args, and the capture must size its static hidden_states the
+        # same way, or the first replayed iteration fails inside TE's
+        # Graphed.forward static_input_surface.copy_() with a dim-0 size mismatch.
+        cuda_graph_seq_length, cuda_graph_micro_batch_size = _pipeline_shape_args(args)
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            seq_length=cuda_graph_seq_length,
+            micro_batch_size=cuda_graph_micro_batch_size,
             optimizers=[optimizer],
         )
 
@@ -3300,6 +3370,9 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
+        args.skipped_train_samples += (
+            iteration_sequences * get_rerun_state_machine().discarded_batches
+        )
         num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch

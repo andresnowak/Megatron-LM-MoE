@@ -20,7 +20,7 @@ machinery, so a single class covers both the gains and no-gains cases.
 
 import logging
 import math
-from typing import Any, Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
 import torch
 
@@ -343,7 +343,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         use_nesterov: bool = True,
         split_qkv: bool = True,
         split_fc1: bool = True,
-        qkv_split_shapes: Optional[tuple[int, int, int]] = None,
+        qkv_split_shapes: Optional[Sequence[int]] = None,
         qkv_dim: Optional[int] = None,
         is_qkv_fn: Optional[Callable[[torch.Tensor], bool]] = None,
         is_kda_in_proj_fn: Optional[Callable[[torch.Tensor], bool]] = None,
@@ -1614,8 +1614,12 @@ def _fused_gain_adam(gain, m, v, grad, lr, bc1, bc2, beta1, beta2, eps, wd):
     gain.sub_((lr / bc1) * (m / denom))
 
 
-def _split_qkv(x, shapes: tuple[int, int, int]) -> list[torch.Tensor]:
-    """Split grouped attention (Q, K, V / GQA) along the head-group dim."""
+def _split_qkv(x, shapes: Sequence[int]) -> list[torch.Tensor]:
+    """Split grouped attention along the head-group dim.
+
+    ``shapes`` is the per-query-group block layout: (Q, K, V) normally, or
+    (Q, Gate, K, V) when --attention-output-gate fuses a gate block into
+    linear_qkv. The split is layout-agnostic in the number of blocks."""
     shape = x.shape
     num_query_groups = shape[0] // sum(shapes)
     qkv = torch.split(
@@ -1626,7 +1630,7 @@ def _split_qkv(x, shapes: tuple[int, int, int]) -> list[torch.Tensor]:
     return [g.reshape(-1, shape[-1]) for g in qkv]
 
 
-def _merge_qkv(qkv, xshape: tuple[int, int], shapes: tuple[int, int, int]) -> torch.Tensor:
+def _merge_qkv(qkv, xshape: tuple[int, int], shapes: Sequence[int]) -> torch.Tensor:
     num_query_groups = xshape[0] // sum(shapes)
     qkv = [g.view(num_query_groups, -1, xshape[-1]) for g in qkv]
     return torch.cat(qkv, dim=1).view(xshape)
@@ -1856,11 +1860,18 @@ def get_megatron_mddecoupling_optimizer(
         num_attention_heads = cfg.num_attention_heads
         num_query_groups = cfg.num_query_groups
         kv_channels = cfg.kv_channels
-        qkv_split_shapes = [
-            num_attention_heads // num_query_groups * kv_channels,
-            kv_channels,
-            kv_channels,
-        ]
+        q_group_dim = num_attention_heads // num_query_groups * kv_channels
+        if getattr(cfg, 'attention_output_gate', False):
+            # With --attention-output-gate the fused linear_qkv.weight carries an
+            # extra Q-sized gate block per query group, so its output layout is
+            # [Q, Gate, K, V] (see GQA get_query_key_value_tensors, where the gate
+            # slice matches the query slice). The optimizer must split on the same
+            # 4 blocks, otherwise _split_qkv's view/reshape mismatches the tensor.
+            # (attention_output_gate is mutually exclusive with MLA, so this only
+            # applies to the standard GQA qkv path.)
+            qkv_split_shapes = [q_group_dim, q_group_dim, kv_channels, kv_channels]
+        else:
+            qkv_split_shapes = [q_group_dim, kv_channels, kv_channels]
         is_mla = getattr(cfg, 'multi_latent_attention', False)
         if is_mla:
             # MLA views KV as [num_heads, qk_head_dim + v_head_dim], so these

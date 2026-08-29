@@ -22,6 +22,7 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
@@ -344,6 +345,20 @@ class GatedDeltaNet(MegatronModule):
                 "linear_attention_carry_state and linear_attention_learnable_initial_state "
                 "are mutually exclusive."
             )
+            # The rerun engine replays an iteration in place after rewinding the data
+            # iterator, but it only restores the RNG state plus whatever is registered
+            # through register_state_save_restore_funcs(). _carried_state is advanced
+            # under no_grad on every microbatch and is not registered, so the replay
+            # would resume from an already-advanced state and never reproduce the
+            # initial run -- reported as a spurious "possible transient error".
+            assert get_rerun_state_machine().get_mode() == RerunMode.DISABLED, (
+                "linear_attention_carry_state is incompatible with the rerun engine "
+                f"(--rerun-mode {get_rerun_state_machine().get_mode().value}): the carried "
+                "recurrent state is mutated by every forward and is not restored by "
+                "RerunStateMachine._restore_state(), so a replayed iteration starts from "
+                "the wrong state. Pass --rerun-mode disabled, or drop "
+                "--linear-attention-carry-state."
+            )
             self._carry_enabled = True
             self._carried_state = None  # lazy-init in forward
         else:
@@ -396,12 +411,18 @@ class GatedDeltaNet(MegatronModule):
                     device=torch.cuda.current_device(),
                 )
                 # A_log
-                A = torch.empty(
-                    self.num_v_heads_local_tp,
-                    dtype=self.config.params_dtype,
-                    device=torch.cuda.current_device(),
-                ).uniform_(*self.A_init_range)
-                self.A_log.data.copy_(torch.log(A))
+                if self.config.linear_attention_safe_output_gate:
+                    # Safe (lower-bound) gate: A_log init to 0 (exp(A_log)=1), matching
+                    # the Kimi-Linear reference. The uniform(A_init_range) init is for the
+                    # softplus decay and mis-scales the sigmoid argument.
+                    self.A_log.data.zero_()
+                else:
+                    A = torch.empty(
+                        self.num_v_heads_local_tp,
+                        dtype=self.config.params_dtype,
+                        device=torch.cuda.current_device(),
+                    ).uniform_(*self.A_init_range)
+                    self.A_log.data.copy_(torch.log(A))
 
     def _resolve_packed_cu_seqlens(
         self,
@@ -861,7 +882,17 @@ class GatedDeltaNet(MegatronModule):
         Optional ablations (linear_attention_beta_bias_init, _beta_scale) apply a
         learnable additive bias on the beta logit and a post-sigmoid scale.
         """
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # fp32
+        if self.config.linear_attention_safe_output_gate:
+            # Kimi-K3 / FlashKDA 'safe' decay: a bounded reparameterization of the
+            # log-decay, g = g_min * sigmoid(exp(A_log) * (z + dt_bias)), so g stays in
+            # (g_min, 0) and exp(cumsum(g)) stays representable in bf16 without the
+            # inference-kernel rescaling trick. This REPLACES the softplus form (it is
+            # not a clamp of it): dt_bias is added first, then scaled by exp(A_log)
+            # inside the sigmoid (cf. fla.ops.kda naive_kda_lowerbound_gate).
+            lb = self.config.linear_attention_safe_output_gate_lower_bound
+            g = lb * torch.sigmoid(A_log_local_cp.exp() * (alpha.float() + dt_bias_local_cp))
+        else:
+            g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # fp32
         if not self.config.linear_attention_use_decay:
             g = g * 0.0
         if self.beta_bias is not None:

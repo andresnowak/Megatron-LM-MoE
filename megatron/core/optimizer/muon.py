@@ -3,7 +3,7 @@
 """Megatron muon optimizer wrapper to handle tensor-parallel."""
 
 import logging
-from typing import Any, Callable, Dict, List, Literal, Optional, get_args
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -76,7 +76,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         split_qkv: bool = False,
         split_fc1: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
-        qkv_split_shapes: tuple[int, int, int] | None = None,
+        qkv_split_shapes: Sequence[int] | None = None,
         is_kda_in_proj_fn: Callable[[torch.Tensor], bool] | None = None,
         is_kv_up_proj_fn: Callable[[torch.Tensor], bool] | None = None,
         kv_up_proj_split_shapes: tuple[int, int] | None = None,
@@ -468,11 +468,15 @@ def get_megatron_muon_optimizer(
         num_attention_heads = model_chunk.config.num_attention_heads
         num_query_groups = model_chunk.config.num_query_groups
         kv_channels = model_chunk.config.kv_channels
-        qkv_split_shapes = [
-            num_attention_heads // num_query_groups * kv_channels,
-            kv_channels,
-            kv_channels,
-        ]
+        q_group_dim = num_attention_heads // num_query_groups * kv_channels
+        if getattr(model_chunk.config, 'attention_output_gate', False):
+            # --attention-output-gate fuses a Q-sized gate block into linear_qkv,
+            # making the per-group layout [Q, Gate, K, V] (see GQA
+            # get_query_key_value_tensors). Split on all 4 blocks or the reshape
+            # in the qkv-split path mismatches. (Mutually exclusive with MLA.)
+            qkv_split_shapes = [q_group_dim, q_group_dim, kv_channels, kv_channels]
+        else:
+            qkv_split_shapes = [q_group_dim, kv_channels, kv_channels]
         mla_config = model_chunk.config
         is_mla = getattr(mla_config, 'multi_latent_attention', False)
         if is_mla:

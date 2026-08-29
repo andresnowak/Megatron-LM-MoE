@@ -559,6 +559,34 @@ class TransformerConfig(ModelParallelConfig):
     SiLU(scalar) over the output channels. The scalar form provides a softer, single-knob
     gate that commutes with the linear read (per-head) and uses fewer effective dofs."""
 
+    linear_attention_full_rank_output_gate: bool = False
+    """If True, the KDA output gate is a full-rank projection (hidden -> v_dim) fused into in_proj
+    and sharded on value heads, instead of the reference low-rank bottleneck (hidden ->
+    value_head_dim -> v_dim). The decay gate keeps its low-rank bottleneck. This is the Kimi-K3
+    output-gate change: reported at ~parity in quality, and it removes the TP/CP all-gather that the
+    low-rank output-gate bottleneck otherwise requires (only the decay bottleneck still needs it).
+    Changes the in_proj layout, so checkpoints are not interchangeable with the low-rank variant.
+    Only affects Kimi Delta Attention (KDA)."""
+
+    linear_attention_safe_output_gate: bool = False
+    """If True, use the Kimi-K3 / FlashKDA 'safe' bounded reparameterization of the log-decay
+    (forget) gate: g = g_min * sigmoid(exp(A_log) * (z + dt_bias)) in (g_min, 0), instead of the
+    default g = -exp(A_log) * softplus(z + dt_bias) in (-inf, 0). This is NOT a clamp of the
+    softplus form -- it is a different, smooth activation (dt_bias is added first, then scaled by
+    exp(A_log) inside the sigmoid). g_min = linear_attention_safe_output_gate_lower_bound (default
+    -5). Bounding g below keeps exp(cumsum(g)) representable in bf16, so FlashKDA's non-rescaling
+    inference kernel is usable; a model must be TRAINED with this on for the bound to hold at
+    inference. Applies to both GDN and KDA. For KDA it is computed natively by FLA (chunk_kda
+    safe_gate/lower_bound, or fused_kda_gate lower_bound) with no loss of fusion; older FLA builds
+    fall back to a torch implementation of the same formula. Matches fla.ops.kda
+    naive_kda_lowerbound_gate."""
+
+    linear_attention_safe_output_gate_lower_bound: float = -5.0
+    """g_min for linear_attention_safe_output_gate: the (negative) scale multiplying sigmoid, which
+    lower-bounds the log-decay g (so per-step retention alpha = exp(g) > exp(g_min)). -5 matches
+    Kimi-K3 / FlashKDA (retention floor exp(-5) ~= 6.7e-3), chosen so the cumulative chunk decay
+    stays representable in bf16 without rescaling."""
+
     linear_attention_carry_state: bool = False
     """If True, carry the recurrent state across forward passes. Each forward pulls the
     previous step's last_recurrent_state (detached, mean-reduced over batch, broadcast back
@@ -1040,6 +1068,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_use_offloading_experts: bool = False
     """Whether to use offloading experts for MoE."""
 
+    moe_offloading_mode: Literal['fine-grained', 'coarse-grained'] = "fine-grained"
+    """Expert-weight reload granularity; coarse mode overlaps whole-weight H2D with MoE
+    communication."""
+
     moe_offloading_num_chunks: int = 8
     """Number of chunks to split the expert weights into for offloading. """
 
@@ -1062,6 +1094,14 @@ class TransformerConfig(ModelParallelConfig):
     None or [] disables offload. Only supported with the inplace-FP8 offloading-experts path
     (moe_use_offloading_experts + moe_use_inplace_fp8_param) and incompatible with moe_layer_recompute
     (the activation is not held across the pipeline gap under full-layer recompute)."""
+
+    moe_offload_main_grad: bool = False
+    """Whether to keep the routed experts' fp32 main grads in pinned host memory instead of on the
+    device, staging them back onto the GPU only for the duration of the wgrad GEMMs that accumulate
+    into them (the H2D overlaps the combine-backward phase, the D2H follows the wgrad). Trades
+    2x main-grad bytes of PCIe traffic per layer per microbatch for the whole main-grad buffer of
+    device memory. Only supported with the inplace-FP8 offloading-experts path
+    (moe_use_offloading_experts + moe_use_inplace_fp8_param)."""
 
     moe_offloading_experts_skip_post_backward_hook: bool = False
     """Whether the offloading experts MLP should skip the post backward hook."""
@@ -2034,10 +2074,6 @@ class TransformerConfig(ModelParallelConfig):
                         "qkv in recompute_modules is not supported with multi_latent_attention; "
                         "use mla_up_proj instead."
                     )
-                if self.attention_output_gate:
-                    raise ValueError(
-                        "qkv in recompute_modules is not supported with attention_output_gate."
-                    )
                 if self.fine_grained_activation_offloading and self.offload_modules is not None:
                     conflicts = {"qkv_linear", "core_attn"} & set(self.offload_modules)
                     if conflicts:
@@ -2108,7 +2144,23 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"moe_offload_activations={self.moe_offload_activations!r}: "
                     f"'{MOE_OFFLOAD_FC1_OUTPUT}' requires '{MOE_OFFLOAD_INPUT}' -- the fc1 reload "
-                    "rides the same ActivationOffloadHandle / MoEActReloadTrigger as fp8_x."
+                    "rides the same MoEOffloadHandle / MoEReloadTrigger as fp8_x."
+                )
+
+        if self.moe_offloading_mode not in ("fine-grained", "coarse-grained"):
+            raise ValueError(
+                "moe_offloading_mode must be either 'fine-grained' or 'coarse-grained', "
+                f"got {self.moe_offloading_mode!r}."
+            )
+        if self.moe_use_offloading_experts and self.moe_offloading_mode == "coarse-grained":
+            if not self.moe_use_inplace_fp8_param:
+                raise ValueError(
+                    "coarse-grained expert weight offload requires moe_use_inplace_fp8_param."
+                )
+            if self.moe_offloading_experts_debug_mode:
+                raise ValueError(
+                    "coarse-grained expert weight offload is incompatible with "
+                    "moe_offloading_experts_debug_mode, which keeps weights GPU-resident."
                 )
 
         if self.moe_layer_recompute:
