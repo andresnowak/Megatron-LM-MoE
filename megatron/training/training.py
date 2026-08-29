@@ -2173,6 +2173,13 @@ def training_log(
                 'consumed-tokens': args.consumed_train_samples * args.seq_length ,
                 },
                 iteration)
+            # Training progress as a percentage of the total run (current step / total steps).
+            # args.train_iters is the total step count (set by update_train_iters from
+            # train_samples // global_batch_size for sample-based runs).
+            if args.train_iters:
+                wandb_writer.log(
+                    {'training-progress-pct': iteration / args.train_iters * 100},
+                    iteration)
         if learning_rate is not None:
             writer.add_scalar('learning-rate', learning_rate, iteration)
             writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
