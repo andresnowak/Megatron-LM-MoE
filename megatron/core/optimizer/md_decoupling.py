@@ -1931,9 +1931,13 @@ def get_megatron_mddecoupling_optimizer(
                 elif not getattr(param, "is_md_embedding_parameter", False):
                     param.is_md_output_parameter = True
             is_out_proj = (
-                ((len(param.shape) == 2) and ('linear_fc2' in name or 'linear_proj' in name or name.endswith('out_proj.weight') ))
-                or (is_merged_offload_expert and 'experts.weight2' in name)
-            )
+                len(param.shape) == 2
+                and (
+                    'linear_fc2' in name
+                    or 'linear_proj' in name
+                    or name.endswith('.out_proj.weight')
+                )
+            ) or (is_merged_offload_expert and 'experts.weight2' in name)
             if is_out_proj:
                 param.is_out_proj = True
             param.md_gain_log_family = _gain_log_family(name, param)

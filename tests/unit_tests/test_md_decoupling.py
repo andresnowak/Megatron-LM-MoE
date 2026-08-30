@@ -499,6 +499,9 @@ class _TinyMDDecouplingModel(torch.nn.Module):
         self.router = torch.nn.Linear(8, 4, bias=False, device=device)
         self.attn = torch.nn.Module()
         self.attn.linear_qkv = torch.nn.Linear(8, 24, bias=False, device=device)
+        self.attn.out_proj = torch.nn.Linear(8, 8, bias=False, device=device)
+        self.attn.decay_out_proj = torch.nn.Linear(8, 8, bias=False, device=device)
+        self.attn.gate_out_proj = torch.nn.Linear(8, 8, bias=False, device=device)
         self.mlp = torch.nn.Module()
         self.mlp.linear_fc2 = torch.nn.Linear(8, 8, bias=False, device=device)
         self.norm = torch.nn.LayerNorm(8, device=device)
@@ -696,6 +699,9 @@ def test_md_decoupling_builder_tags_embedding_output_and_shared_output():
         assert not hasattr(untied_model.output_layer.weight, "is_md_embedding_parameter")
         assert untied_model.router.weight.is_router is True
         assert untied_model.attn.linear_qkv.weight.is_qkv is True
+        assert untied_model.attn.out_proj.weight.is_out_proj is True
+        assert not hasattr(untied_model.attn.decay_out_proj.weight, "is_out_proj")
+        assert not hasattr(untied_model.attn.gate_out_proj.weight, "is_out_proj")
         assert untied_model.mlp.linear_fc2.weight.is_out_proj is True
         assert (
             md_optimizer._resolve_gains_mode(untied_model.embedding.word_embeddings.weight)
