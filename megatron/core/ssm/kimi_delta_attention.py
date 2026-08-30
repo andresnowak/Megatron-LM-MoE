@@ -24,6 +24,8 @@ import inspect
 import logging
 import math
 import os
+import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Optional, Tuple, Union
@@ -359,6 +361,13 @@ class KimiDeltaAttention(GatedDeltaNet):
             + output_gate_in_proj_dim
             + self.num_value_heads
         )
+        if self.config.fp8:
+            # KDA's fused input projection includes per-head beta terms, so its output
+            # width is not guaranteed to satisfy the alignment required by FP8 GEMMs (so for now, we disable FP8).
+            warnings.warn(
+                "KDA does not currently support FP8; running the KDA layer without FP8.",
+                stacklevel=2,
+            )
 
         # Rebuild in_proj with the new output dim. Uses the same submodule spec
         # as GDN; the parent's instance is replaced.
@@ -899,6 +908,34 @@ class KimiDeltaAttention(GatedDeltaNet):
         return query, key, value, gate, beta, alpha
 
     def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        inference_context=None,
+        packed_seq_params=None,
+        sequence_len_offset=None,
+        *,
+        inference_params=None,
+        **kwargs,
+    ):
+        """Run KDA without FP8, even when FP8 is enabled for the model."""
+        quantization_context = nullcontext()
+        if self.config.fp8:
+            from transformer_engine.pytorch import fp8_autocast
+
+            quantization_context = fp8_autocast(enabled=False)
+        with quantization_context:
+            return self._forward_impl(
+                hidden_states,
+                attention_mask,
+                inference_context,
+                packed_seq_params,
+                sequence_len_offset,
+                inference_params=inference_params,
+                **kwargs,
+            )
+
+    def _forward_impl(
         self,
         hidden_states: Tensor,
         attention_mask: Tensor,
