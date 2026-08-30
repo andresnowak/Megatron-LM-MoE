@@ -17,6 +17,7 @@ from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from .utils import GlobalMemoryBuffer, is_torch_min_version
 
 logger = logging.getLogger(__name__)
+_PROCESS_GROUP_TRACE_INDEX = 0
 
 try:
     import einops
@@ -238,7 +239,24 @@ def create_group(
             # So need to unset timeout here if caller doesn't set value. Otherwise there is
             # type error.
             kwargs.pop("timeout")
+    trace_process_groups = os.environ.get("MEGATRON_TRACE_PROCESS_GROUPS") == "1"
+    if trace_process_groups:
+        global _PROCESS_GROUP_TRACE_INDEX
+        trace_index = _PROCESS_GROUP_TRACE_INDEX
+        _PROCESS_GROUP_TRACE_INDEX += 1
+        trace_rank = torch.distributed.get_rank()
+        print(
+            f"[process-group-trace] rank={trace_rank} index={trace_index} phase=PRE "
+            f"backend={backend} desc={group_desc} ranks={ranks}",
+            flush=True,
+        )
     group = torch.distributed.new_group(**kwargs)
+    if trace_process_groups:
+        print(
+            f"[process-group-trace] rank={trace_rank} index={trace_index} phase=POST "
+            f"backend={backend} desc={group_desc} ranks={ranks}",
+            flush=True,
+        )
     global _global_process_group_list
     if _global_process_group_list is None:
         # None stands for the default process group
