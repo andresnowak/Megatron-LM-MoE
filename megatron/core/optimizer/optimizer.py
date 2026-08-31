@@ -871,6 +871,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
         if is_loading:
             self.init_state_fn(self.optimizer, self.config)
+            if hasattr(self.optimizer, "init_sharded_state"):
+                self.optimizer.init_sharded_state(metadata or {})
 
         state_dict = self.state_dict()
 
@@ -1104,6 +1106,8 @@ class FP32Optimizer(MegatronOptimizer):
     ):
         if is_loading:
             self.init_state_fn(self.optimizer, self.config)
+            if hasattr(self.optimizer, "init_sharded_state"):
+                self.optimizer.init_sharded_state(metadata or {})
 
         state_dict = self.state_dict()
         id_to_sharded_param_map = get_param_id_to_sharded_param_map(
