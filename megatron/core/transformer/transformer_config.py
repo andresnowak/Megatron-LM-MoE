@@ -1522,7 +1522,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.experimental_attention_variant in ("gated_delta_net", "kda"):
             assert (
                 self.linear_attention_freq is not None
-            ), f"linear_attention_freq must be set for linear gated_delta_net."
+            ), "linear_attention_freq must be set for linear attention variants."
 
             if self.experimental_attention_variant == "kda":
                 assert self.linear_attention_beta_bias_init == 0.0, (

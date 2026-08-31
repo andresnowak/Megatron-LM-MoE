@@ -128,6 +128,8 @@ class TestKimiDeltaAttentionReferenceParameterization:
         assert kda.dt_bias.shape == (kda.num_value_heads * kda.key_head_dim,)
         assert kda.A_log.dtype == torch.float32
         assert kda.dt_bias.dtype == torch.float32
+        assert kda.A_log.is_kda_decay_parameter
+        assert kda.dt_bias.is_kda_decay_parameter
         dt = F.softplus(kda.dt_bias)
         assert torch.all(dt >= 0.001)
         assert torch.all(dt <= 0.1)
