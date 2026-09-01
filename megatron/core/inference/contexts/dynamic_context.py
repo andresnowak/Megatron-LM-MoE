@@ -135,9 +135,16 @@ class MaxSequenceLengthOverflowError(ContextOverflowError):
 
 
 class BlockOverflowError(ContextOverflowError):
-    """Adding request would overflow available memory blocks."""
+    """Adding request would overflow currently available memory blocks."""
 
     pass
+
+
+class RequestCapacityOverflowError(ContextOverflowError):
+    """Request can never fit in the active inference buffer."""
+
+    def __init__(self, request_id, message: Optional[str] = None):
+        super().__init__(request_id, message=message, is_transient=False)
 
 
 class ActiveRequestCountOverflowError(ContextOverflowError):
