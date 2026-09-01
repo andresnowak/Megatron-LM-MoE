@@ -45,6 +45,7 @@ import sys
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Optional, Dict
+from functools import partial
 
 import torch.distributed
 
@@ -178,13 +179,15 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
-from megatron.core.optimizer.md_decoupling import (
+from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_optimizer
+from megatron.core.optimizer.muon_logging import (
     collect_md_gain_stats,
-    get_megatron_mddecoupling_optimizer,
+    collect_muon_stats,
 )
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
+    compare_grad_norms,
     RerunDataIterator,
     RerunMode,
 )
@@ -196,7 +199,12 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
+from megatron.core.transformer.moe.moe_utils import (
+    track_moe_metrics, 
+    clear_aux_losses_tracker,
+    save_router_state,
+    restore_router_state,
+)
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
     OffloadingFP8Config,
@@ -242,6 +250,7 @@ from .utils import (
     print_rank_0,
     print_rank_last,
     report_memory,
+    report_host_memory,
     unwrap_model,
     update_use_dist_ckpt,
     to_empty_if_meta_device,
@@ -554,18 +563,17 @@ def num_floating_point_operations(args, batch_size):
             )
 
         if is_linear_attention_variant(args.experimental_attention_variant):
-            # Calculate number of dense and MoE Transformer MLPs.
             if isinstance(args.linear_attention_freq, int):
                 linear_attention_pattern = [
                     # [1,1,...,1,0,1,1,...,1,0,...]
                     0 if ((i + 1) % args.linear_attention_freq == 0)
-                    else 1 for i in range(num_layers)
+                    else 1 for i in range(args.num_layers)
                 ]
             elif isinstance(args.linear_attention_freq, list):
                 linear_attention_pattern = args.linear_attention_freq
-                assert len(linear_attention_pattern) == num_layers, (
+                assert len(linear_attention_pattern) == args.num_layers, (
                     f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
-                    f"expected {num_layers}, "
+                    f"expected {args.num_layers}, "
                     f"current linear attention pattern: {args.linear_attention_freq}"
                 )
             elif args.linear_attention_freq is None:
@@ -580,7 +588,10 @@ def num_floating_point_operations(args, batch_size):
                     f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
                     f" {args.linear_attention_freq}"
                 )
-            num_linear_attention_layers = sum(linear_attention_pattern)
+            # MTP layers reuse the last decoder layer's attention spec.
+            num_linear_attention_layers = (
+                sum(linear_attention_pattern) + linear_attention_pattern[-1] * mtp_num_layers
+            )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
             if args.experimental_attention_variant == "gated_delta_net":
@@ -608,6 +619,43 @@ def num_floating_point_operations(args, batch_size):
                         ## out proj
                         + args.hidden_size
                         * v_dim
+                    )
+                )
+            elif args.experimental_attention_variant == "kda":
+                qk_head_dim = args.linear_key_head_dim
+                v_head_dim = args.linear_value_head_dim
+                num_qk_heads = args.linear_num_key_heads
+                num_v_heads = args.linear_num_value_heads
+                qk_dim = qk_head_dim * num_qk_heads
+                v_dim = v_head_dim * num_v_heads
+                alpha_dim = qk_head_dim * num_v_heads
+                low_rank_dim = v_head_dim
+                full_rank_output_gate = args.linear_attention_full_rank_output_gate
+                output_gate_in_proj_dim = v_dim if full_rank_output_gate else low_rank_dim
+                in_proj_dim = (
+                    2 * qk_dim
+                    + v_dim
+                    + low_rank_dim
+                    + output_gate_in_proj_dim
+                    + num_v_heads
+                )
+                linear_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        # Fused Q/K/V, decay bottleneck, output gate, and beta projection.
+                        args.hidden_size * in_proj_dim
+                        # Low-rank decay projection.
+                        + low_rank_dim * alpha_dim
+                        # The low-rank output gate has a second projection if it uses low rank,
+                        # the full-rank gate is already included directly in in_proj.
+                        + (0 if full_rank_output_gate else low_rank_dim * v_dim)
+                        # Depthwise Q/K/V convolution.
+                        + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                        # KDA recurrent state has shape [d_k, d_v] per value head.
+                        + 4 * num_v_heads * qk_head_dim * v_head_dim
+                        # Output projection.
+                        + args.hidden_size * v_dim
                     )
                 )
             else:
@@ -1065,7 +1113,22 @@ def pretrain(
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
+    report_host_memory('after model+optimizer built')
     config = get_model_config(model[0])
+
+    # register state save/restore functions in rerun state machine
+    rerun_state_machine = get_rerun_state_machine()
+    rerun_state_machine.register_state_save_restore_funcs(
+        "router",
+        partial(save_router_state, model=model),
+        restore_router_state,
+    )
+    # upon state restore, clear moe metrics to avoid double counting
+    rerun_state_machine.register_state_save_restore_funcs(
+        "moe_metrics",
+        lambda: None,
+        lambda state: clear_aux_losses_tracker(),
+    )
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -1817,7 +1880,6 @@ def setup_model_and_optimizer(
 
     return model, optimizer, opt_param_scheduler
 
-
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
     num_microbatches = get_num_microbatches()
@@ -1827,6 +1889,24 @@ def dummy_train_step(data_iterator):
             # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
             batch = get_batch_on_this_tp_rank(data_iterator)
             batch = get_batch_on_this_cp_rank(batch)
+
+
+def _pipeline_shape_args(args):
+    """
+    Return the (seq_length, micro_batch_size) used to size pipeline P2P buffers.
+
+    When using THD packing (`dataloader_inter_document_masking` or `sft`) with
+    `micro_batch_size > 1`, the packed token stream is laid out as
+    `(mbs * seq, 1)` rather than `(seq, mbs)`. Report the collapsed shape
+    so the pipeline send/recv buffers match the actual tensor layout.
+    """
+    is_packed = (
+        getattr(args, 'dataloader_inter_document_masking', False)
+        or getattr(args, 'sft', False)
+    )
+    if is_packed and args.micro_batch_size > 1:
+        return args.seq_length * args.micro_batch_size, 1
+    return args.seq_length, args.micro_batch_size
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
@@ -1839,6 +1919,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_dgrads_interval == 0)
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
+    grad_norm = None
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         # Set grad to zero.
         for model_chunk in model:
@@ -1894,13 +1975,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Forward pass.
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            seq_length=pp_seq_length,
+            micro_batch_size=pp_micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
             adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -1913,6 +1995,27 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Reset force_all_reduce field.
         for model_chunk in model:
             model_chunk.force_all_reduce = False
+
+        if args.optimizer == 'md_decoupling' and args.check_grad_norm:
+            from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+            from functools import partial
+            if isinstance(optimizer, LayerWiseDistributedOptimizer):
+                found_inf_flag, grad_norm = optimizer.prepare_grad_norm()
+                rerun_state_machine.validate_result(
+                    result=(found_inf_flag, grad_norm),
+                    rejection_func=partial(
+                        rerun_state_machine.is_spiky_grad_norm,
+                        context="grad_norm",
+                        num_samples=20,
+                        reload=args.load is not None and args.iteration > 0,
+                        threshold=args.check_grad_norm_threshold,
+                    ),
+                    message="Spiky grad_norm",
+                    comparison_func=compare_grad_norms,
+                    tolerance=0.0,
+                    fatal=False,
+                )
+        # end of rerun_state_machine region
 
     # Checkpoint main_grads.
     if save_wgrads_in_this_iteration:
@@ -1945,7 +2048,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
+    else:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -2030,6 +2136,7 @@ def training_log(
     max_attention_logit,
     pg_collection=None,
     is_first_iteration=False,
+    config=None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2132,6 +2239,19 @@ def training_log(
             writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
             if wandb_writer:
                 wandb_writer.log({'skipped-train-samples': args.skipped_train_samples}, iteration)
+        rerun_state_machine = get_rerun_state_machine()
+        writer.add_scalar('rerun-count', rerun_state_machine.rerun_count, iteration)
+        writer.add_scalar(
+            'rerun-count-this-iteration', rerun_state_machine.rerun_count_this_iteration, iteration
+        )
+        if wandb_writer:
+            wandb_writer.log(
+                {
+                    'rerun-count': rerun_state_machine.rerun_count,
+                    'rerun-count-this-iteration': rerun_state_machine.rerun_count_this_iteration,
+                },
+                iteration,
+            )
         writer.add_scalar('batch-size', batch_size, iteration)
         writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
         if wandb_writer:
@@ -2175,11 +2295,6 @@ def training_log(
             writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if md_gain_stats:
-            for metric_name, metric_value in md_gain_stats.items():
-                writer.add_scalar(metric_name, metric_value, iteration)
-            if wandb_writer:
-                wandb_writer.log(md_gain_stats, iteration)
         if args.perform_rl_step:
             grpo_collection_iteration = iteration // (args.grpo_iterations * ( ( args.grpo_samples_per_iteration )// args.global_batch_size ))
             writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
@@ -2202,6 +2317,13 @@ def training_log(
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
 
+    if md_gain_stats:
+        if writer:
+            for metric_name, metric_value in md_gain_stats.items():
+                writer.add_scalar(metric_name, metric_value, iteration)
+        if wandb_writer:
+            wandb_writer.log(md_gain_stats, iteration)
+
     # Log MoE metrics.
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
@@ -2214,13 +2336,18 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
-        track_names.append("expert_max_violation")
-        track_names.append("expert_min_violation")
-        track_names.append("expert_median_violation")
+        if "mbs" in args.moe_router_violation_metrics:
+            track_names.append("expert_max_violation")
+            track_names.append("expert_min_violation")
+            track_names.append("expert_median_violation")
+        if "seq" in args.moe_router_violation_metrics:
+            track_names.append("seq_expert_max_violation")
+            track_names.append("seq_expert_min_violation")
+            track_names.append("seq_expert_median_violation")
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
         track_names.append("global_expert_median_violation")
-        if args.moe_router_ep_violation_metrics:
+        if "ep" in args.moe_router_violation_metrics:
             track_names.append("ep_expert_max_violation")
             track_names.append("ep_expert_min_violation")
             track_names.append("ep_expert_median_violation")
@@ -2391,7 +2518,12 @@ def training_log(
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
-                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
+                report_theoretical_memory(
+                    args,
+                    num_microbatches=num_microbatches,
+                    verbose=True,
+                    config=config,
+                )
             report_memory(f'(after {iteration} iterations)')
             reported_memory_in_this_iteration = True
             loaded_iteration = max(get_loaded_iteration() or 0, 0)
@@ -2401,6 +2533,7 @@ def training_log(
         if args.log_memory_interval is not None and iteration % args.log_memory_interval == 0 and \
             not reported_memory_in_this_iteration:
             report_memory(f'(after {iteration} iterations)')
+            report_host_memory(f'iteration {iteration}')
         # Write timers to wandb, don't reset the counts.
         if args.log_timers_to_tensorboard:
             timers.write(timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False)
@@ -2898,6 +3031,7 @@ def train(
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
+    report_host_memory('before first training step')
     report_memory_flag = True
     pre_hook_enabled = False
     should_exit = False
@@ -3014,11 +3148,19 @@ def train(
 
     # Initialize CUDA Graphs helper.
     if args.cuda_graph_impl == "transformer_engine":
+        # The graph's static input surface must match the token layout the pipeline
+        # actually runs with. Under THD packing (`--dataloader-inter-document-masking`
+        # or `--sft`) a microbatch is laid out as (mbs * seq, 1) rather than (seq, mbs);
+        # train_step already collapses the shape for the pipeline buffers via
+        # _pipeline_shape_args, and the capture must size its static hidden_states the
+        # same way, or the first replayed iteration fails inside TE's
+        # Graphed.forward static_input_surface.copy_() with a dim-0 size mismatch.
+        cuda_graph_seq_length, cuda_graph_micro_batch_size = _pipeline_shape_args(args)
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            seq_length=cuda_graph_seq_length,
+            micro_batch_size=cuda_graph_micro_batch_size,
             optimizers=[optimizer],
         )
 
@@ -3238,6 +3380,9 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
+        args.skipped_train_samples += (
+            iteration_sequences * get_rerun_state_machine().discarded_batches
+        )
         num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
@@ -3252,8 +3397,22 @@ def train(
 
         if args.log_params_norm:
             params_norm = calc_params_l2_norm(model)
-        if args.log_muon_md_gains and iteration % args.tensorboard_log_interval == 0:
-            md_gain_stats = collect_md_gain_stats(optimizer)
+        if args.log_muon_gains or args.log_muon_sparsity or args.log_muon_param_rms:
+            muon_log_interval = args.muon_log_interval or args.log_interval
+            if iteration % muon_log_interval == 0:
+                stats_collector = (
+                    collect_md_gain_stats
+                    if args.optimizer == "md_decoupling"
+                    else collect_muon_stats
+                )
+                md_gain_stats = stats_collector(
+                    optimizer,
+                    per_layer=args.log_muon_per_layer,
+                    sparsity_thresholds=args.muon_sparsity_thresholds,
+                    log_gains=args.log_muon_gains,
+                    log_sparsity=args.log_muon_sparsity,
+                    log_param_rms=args.log_muon_param_rms,
+                )
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
@@ -3273,6 +3432,7 @@ def train(
             max_attention_logit,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
+            config=config,
         )
         is_first_iteration = False
 
@@ -3421,6 +3581,8 @@ def evaluate(
 
     timers('evaluate', log_level=0).start(barrier=True)
 
+    pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
+
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         from megatron.legacy.model.vision.knn_monitor import compute_feature_bank
 
@@ -3475,8 +3637,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                seq_length=pp_seq_length,
+                micro_batch_size=pp_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -3547,8 +3709,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=get_num_microbatches(),
-                seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                seq_length=pp_seq_length,
+                micro_batch_size=pp_micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,
