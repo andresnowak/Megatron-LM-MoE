@@ -2,13 +2,15 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
+
+WandbModule = Any
 
 
 @dataclass
@@ -360,6 +362,12 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
+    sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
+    """Which sampling kernels to use during inference."""
+
+    logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
+    """Whether returned log-probs are modified by the sampling parameters or not."""
+
     request_metadata_types: Optional[List[Tuple[str, torch.dtype, bool]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple
@@ -378,3 +386,25 @@ class InferenceConfig:
                 f"prefix_caching_routing_alpha must be in [0, 1], "
                 f"got {self.prefix_caching_routing_alpha}"
             )
+
+        if self.logprobs_mode not in ("raw_logprobs", "processed_logprobs"):
+            raise ValueError(
+                f"Unsupported logprobs_mode {self.logprobs_mode!r}. "
+                "Supported modes: raw_logprobs, processed_logprobs."
+            )
+
+        # The speculative log-probs path does not yet apply processed-logprobs.
+        if self.logprobs_mode == "processed_logprobs" and self.num_speculative_tokens > 0:
+            raise ValueError(
+                "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
+                "(num_speculative_tokens > 0)."
+            )
+
+        if self.sampling_backend == 'flashinfer':
+            try:
+                import flashinfer  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    "sampling_backend='flashinfer' requires the flashinfer package; "
+                    "install it or set sampling_backend='torch'."
+                ) from e

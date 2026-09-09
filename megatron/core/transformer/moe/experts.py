@@ -52,6 +52,10 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
 )
+from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
+    NVLSAllGatherVDispatcher,
+)
 from megatron.core.transformer.moe.experts_util import (
     grouped_swiglu_mlp_torch_ref,
     ExpertsWgradScheduler,
@@ -820,6 +824,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
+        self._nvls_dispatcher = getattr(config, "inference_moe_token_dispatcher_type", "nccl") == "nvls"
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -961,6 +966,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._flashinfer_activation_type,
             ep_size=self.ep_group.size(),
             ep_rank=self.ep_group.rank(),
+            output=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )[0]
         return output, None
 
@@ -977,10 +983,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             activation_type=self._mcore_activation_type,
             num_local_experts=self.num_local_experts,
             local_expert_start=local_expert_start,
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
             routing_map=routing_map,
-            tokens_per_expert=tokens_per_expert,
-            skip_permute=skip_permute,
             disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
+            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )
         return output, None
 

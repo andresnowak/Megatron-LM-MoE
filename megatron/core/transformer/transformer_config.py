@@ -1150,6 +1150,9 @@ class TransformerConfig(ModelParallelConfig):
     """The type of token dispatcher to use. The default is 'allgather'.
     Options are 'allgather','alltoall' and 'flex'."""
 
+    inference_moe_token_dispatcher_type: Literal["nccl", "nvls"] = "nccl"
+    """Inference dispatcher backend for expert-parallel MoE execution."""
+
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 

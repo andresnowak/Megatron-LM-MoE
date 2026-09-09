@@ -61,7 +61,9 @@ from megatron.core.utils import (
     get_pg_size,
     get_pg_src_rank,
     internal_api,
+    round_up_to_nearest_multiple,
     trace_async_exceptions,
+    unwrap_model,
 )
 
 from .async_zmq_communicator import AsyncZMQCommunicator
@@ -213,11 +215,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if self.num_speculative_tokens > 0:
             assert (
-                self.num_speculative_tokens <= self.controller.num_mtp_heads
+                model_config.mtp_use_repeated_layer
+                or self.num_speculative_tokens <= self.controller.num_mtp_heads
             ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
-            assert (
-                not self.materialize_only_last_token_logits
-            ), "materialize_only_last_token_logits must be False when num_speculative_tokens > 0"
 
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
@@ -361,6 +361,22 @@ class DynamicInferenceEngine(AbstractEngine):
             unwrapped_model = controller.inference_wrapped_model.model
             set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
+        # Capture MTP graphs alongside decoder graphs for each distinct request count.
+        mtp_model = unwrap_model(controller.inference_wrapped_model.model)
+        mtp_warmup_enabled = (
+            controller.num_mtp_heads > 0
+            and (controller.num_speculative_tokens or 0) > 0
+            and hasattr(mtp_model, "mtp")
+        )
+        if mtp_warmup_enabled:
+            tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
+            sp_enabled = model_config.sequence_parallel and tp_size > 1
+            mtp_pass_depth = not mtp_model.mtp.mtp_use_repeated_layer
+            mtp_warmup_depths = (
+                range(controller._num_mtp_depths) if mtp_pass_depth else [None]
+            )
+            mtp_seen_batch_sizes = set()
+
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
@@ -384,13 +400,46 @@ class DynamicInferenceEngine(AbstractEngine):
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
             # Forward pass -> logits.
-            controller._dynamic_step_forward_logits(input_ids, position_ids)
+            logits = controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+            # Warm FlashInfer sampling graphs after the model graph. Torch sampling
+            # remains eager and does not require a separate capture.
+            if controller._sampling_backend == "flashinfer":
+                if controller.num_speculative_tokens > 0:
+                    controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
+                else:
+                    controller._dynamic_step_sample_logits()
+
+            if mtp_warmup_enabled:
+                n = cuda_graph_batch_dimension.req_count
+                if sp_enabled:
+                    n = round_up_to_nearest_multiple(n, tp_size)
+                if n > 0 and n not in mtp_seen_batch_sizes:
+                    mtp_seen_batch_sizes.add(n)
+                    device = torch.cuda.current_device()
+                    batch_dim = n // tp_size if sp_enabled else n
+                    for depth in mtp_warmup_depths:
+                        mtp_model.compute_mtp_single_step(
+                            hidden_states=torch.zeros(
+                                (batch_dim, 1, model_config.hidden_size),
+                                device=device,
+                                dtype=model_config.params_dtype,
+                            ),
+                            next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                            position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                            depth=depth,
+                            cache_key=("mtp", n, depth),
+                        )
 
             context.reset()
 
         # Disable inference dispatcher after graph capture
         if is_inference_optimized_ep:
             unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
+
+        if mtp_warmup_enabled and mtp_seen_batch_sizes:
+            controller.has_mtp_cuda_graphs = True
+            logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
         time_end = time.time()
@@ -1116,6 +1165,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
+            num_length_trim = 0
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
@@ -1124,10 +1174,12 @@ class DynamicInferenceEngine(AbstractEngine):
                     len(request.generated_tokens) + len(tokens)
                     >= request.sampling_params.num_tokens_to_generate
                 ):
-                    tokens = tokens[
-                        : request.sampling_params.num_tokens_to_generate
+                    remaining_tokens = (
+                        request.sampling_params.num_tokens_to_generate
                         - len(request.generated_tokens)
-                    ]
+                    )
+                    num_length_trim = len(tokens) - remaining_tokens
+                    tokens = tokens[:remaining_tokens]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1180,8 +1232,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 # Track acceptance statistics for logging.
                 if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
-                    actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
-                    actual_accepted = max(0, len(accepted_tokens) - num_stop_word_trim)
+                    num_output_trim = num_length_trim + num_stop_word_trim
+                    actual_proposed = max(0, self.num_speculative_tokens - num_output_trim)
+                    actual_accepted = max(0, len(accepted_tokens) - num_output_trim)
 
                     self._spec_tokens_proposed += actual_proposed
                     self._spec_tokens_accepted += actual_accepted
@@ -1209,13 +1262,23 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Additionally, chunked prefill request do not finish.
                 active_request_ids.append(request_id)
 
-            # When a stop word was found mid-speculative-batch, trim log probs
-            # and top_n_logprobs to match the truncated generated_tokens.
-            if num_stop_word_trim > 0:
+            # A request whose stop word was detected on the previous step only
+            # participates in this step so bookkeeping can remove it. Discard
+            # outputs from that final forward because no corresponding tokens
+            # were appended above.
+            if request_id in self.stop_word_being_finished_ids:
+                request_log_probs = None
+                if top_n_logprobs is not None:
+                    top_n_logprobs.pop(req_idx, None)
+
+            # Trim per-token outputs to match tokens removed at the requested
+            # generation length or at a stop word inside a speculative batch.
+            num_output_trim = num_length_trim + num_stop_word_trim
+            if num_output_trim > 0:
                 if request_log_probs is not None:
-                    request_log_probs = request_log_probs[:-num_stop_word_trim]
+                    request_log_probs = request_log_probs[:-num_output_trim]
                 if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_output_trim]
 
             # Process log_probs if available (unified for both regular and chunked prefill)
             if request_log_probs is not None:

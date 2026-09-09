@@ -222,6 +222,7 @@ class GPTModel(LanguageModule):
                 vp_stage=vp_stage,
                 pg_collection=self.pg_collection,
             )
+            self._setup_mtp_cuda_graphs()
 
         # Output
         if self.post_process:
@@ -713,6 +714,8 @@ class GPTModel(LanguageModule):
         position_ids: Tensor,
         depth: int,
         runtime_gather_output: bool = True,
+        eager: bool = False,
+        cache_key=None,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 

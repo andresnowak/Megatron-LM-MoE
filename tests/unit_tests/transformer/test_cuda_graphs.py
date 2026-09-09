@@ -1359,6 +1359,107 @@ class TestPartialCudaGraph:
         Utils.destroy_model_parallel()
 
 
+class _InlineCaptureModule(MegatronModule):
+    """Minimal module for testing a method-wrapping CUDA graph manager."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.linear = torch.nn.Linear(config.hidden_size, config.hidden_size)
+
+    def my_op(self, x):
+        return self.linear(x)
+
+
+class TestInlineCaptureManager:
+    """Cover inline capture, eager bypass, and custom cache keys."""
+
+    @staticmethod
+    def _make_config():
+        return TransformerConfig(
+            num_layers=1,
+            hidden_size=32,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            inference_rng_tracker=True,
+        )
+
+    def setup_method(self):
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(
+            seed=123,
+            inference_rng_tracker=True,
+            use_cudagraphable_rng=False,
+            force_reset_rng=True,
+        )
+
+    def teardown_method(self):
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        _CudagraphGlobalRecord.cudagraph_inference_record = []
+        CudaGraphManager.global_mempool = None
+        Utils.destroy_model_parallel()
+
+    @torch.inference_mode()
+    def test_inline_capture_matches_eager(self):
+        config = self._make_config()
+        module = _InlineCaptureModule(config).cuda().eval()
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        eager_out = module.my_op(x).clone()
+        manager = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            need_backward=False,
+        )
+
+        graph_out_1 = module.my_op(x)
+        graph_out_2 = module.my_op(x)
+        assert torch.equal(eager_out, graph_out_1)
+        assert torch.equal(eager_out, graph_out_2)
+        assert len(manager.cudagraph_runners) == 1
+        assert manager.cudagraph_runners[0].fwd_graph_recorded
+
+    @torch.inference_mode()
+    def test_eager_bypass(self):
+        config = self._make_config()
+        module = _InlineCaptureModule(config).cuda().eval()
+        manager = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            need_backward=False,
+        )
+
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        module.my_op(x, eager=True)
+        module.my_op(x, eager=True)
+        assert not manager.cudagraph_runners
+
+    @torch.inference_mode()
+    def test_cache_key_routing(self):
+        config = self._make_config()
+        module = _InlineCaptureModule(config).cuda().eval()
+        manager = CudaGraphManager(
+            config,
+            base_module=module,
+            function_name="my_op",
+            inline_capture=True,
+            need_backward=False,
+        )
+
+        x = torch.randn(4, config.hidden_size, device="cuda")
+        module.my_op(x, cache_key="key_a")
+        module.my_op(x, cache_key="key_b")
+        assert len(manager.cudagraph_runners) == 2
+        assert manager.custom_cudagraphs_lookup_table["key_a"] is not manager.custom_cudagraphs_lookup_table["key_b"]
+
+        module.my_op(x, cache_key="key_a")
+        assert len(manager.cudagraph_runners) == 2
+
+
 if __name__ == "__main__":
 
     test = TestParallelTransformerBlockCudagraphs()

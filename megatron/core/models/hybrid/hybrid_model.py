@@ -254,6 +254,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
             )
+            self._setup_mtp_cuda_graphs()
 
         # Output
         if post_process or self.mtp_process:
@@ -518,6 +519,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         position_ids: Tensor,
         depth: int,
         runtime_gather_output: bool = True,
+        eager: bool = False,
+        cache_key=None,
     ) -> tuple:
         """Compute a single MTP depth for speculative decoding.
 

@@ -1031,6 +1031,16 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
+        try:
+            import flashinfer  # noqa: F401
+        except ImportError as e:
+            raise ImportError(
+                "--inference-dynamic-batching-sampling-backend=flashinfer requires "
+                "the flashinfer package; install it or pass "
+                "--inference-dynamic-batching-sampling-backend=torch."
+            ) from e
+
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -2302,6 +2312,17 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
+    group.add_argument('--inference-dynamic-batching-sampling-backend',
+                       type=str, default='torch',
+                       choices=['torch', 'flashinfer'],
+                       help='Which sampling kernels to use during inference. '
+                            'Selecting "flashinfer" requires the flashinfer package.')
+    group.add_argument('--inference-dynamic-batching-logprobs-mode',
+                       type=str, default='raw_logprobs',
+                       choices=['raw_logprobs', 'processed_logprobs'],
+                       help='How returned inference log-probs are computed engine-wide. '
+                            '"raw_logprobs" (default) uses the unmodified model logits; '
+                            '"processed_logprobs" uses temperature and filters by top-k/top-p.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')

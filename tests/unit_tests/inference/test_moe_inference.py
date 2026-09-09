@@ -215,19 +215,22 @@ class TestInferenceCUDAGraphTokenDispatcher:
         SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
-    def _make_dispatcher(self, **config_overrides):
+    def _make_dispatcher(self, backend="nccl", **config_overrides):
         from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
         from megatron.core.transformer.moe.token_dispatcher_inference import (
-            InferenceCUDAGraphTokenDispatcher,
+            NCCLAllGatherDispatcher,
+            NVLSAllGatherVDispatcher,
         )
 
+        config_overrides.setdefault("inference_moe_token_dispatcher_type", backend)
         config_overrides.setdefault("expert_model_parallel_size", Utils.world_size)
         config = _make_base_config(**config_overrides)
         num_local_experts = config.num_moe_experts // Utils.world_size
         ep_rank = torch.distributed.get_rank() if Utils.world_size > 1 else 0
         local_expert_indices = [ep_rank * num_local_experts + i for i in range(num_local_experts)]
 
-        return InferenceCUDAGraphTokenDispatcher(
+        dispatcher_cls = NVLSAllGatherVDispatcher if backend == "nvls" else NCCLAllGatherDispatcher
+        return dispatcher_cls(
             num_local_experts=num_local_experts,
             local_expert_indices=local_expert_indices,
             config=config,
@@ -256,6 +259,7 @@ class TestInferenceCUDAGraphTokenDispatcher:
         assert buf is not None
         assert SymmetricMemoryManager.is_initialized("ep")
 
+    @pytest.mark.parametrize("backend", ["nccl", "nvls"])
     @pytest.mark.parametrize("seed", [42, 123, 7])
     @pytest.mark.parametrize(
         "num_local_tokens",
@@ -313,7 +317,7 @@ class TestInferenceCUDAGraphTokenDispatcher:
             512,
         ],
     )
-    def test_cuda_graph_dispatch_combine(self, num_local_tokens, seed):
+    def test_cuda_graph_dispatch_combine(self, num_local_tokens, seed, backend):
         """Dispatch+combine can be captured in a CUDA graph and replayed.
         Creates global buffers, shards per rank, and verifies:
         - NVLS AllGather output matches the full globalwol buffer
@@ -324,7 +328,11 @@ class TestInferenceCUDAGraphTokenDispatcher:
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
 
-        dispatcher = self._make_dispatcher()
+        dispatcher = self._make_dispatcher(backend=backend)
+        if backend == "nvls":
+            assert dispatcher.__class__.__name__ == "NVLSAllGatherVDispatcher"
+        else:
+            assert dispatcher.__class__.__name__ == "NCCLAllGatherDispatcher"
         ep_size = dispatcher.ep_size
         hidden_size = NANOV3_BASE["hidden_size"]
         topk = NANOV3_BASE["moe_router_topk"]
@@ -361,8 +369,8 @@ class TestInferenceCUDAGraphTokenDispatcher:
             with torch.cuda.stream(s):
                 for _ in range(3):
                     dispatcher.routing_map = static_routing_map
-                    d_hidden, _, d_probs = dispatcher.token_dispatch(
-                        static_hidden, None, static_probs
+                    d_hidden, d_probs = dispatcher.token_dispatch(
+                        static_hidden, static_probs
                     )
                     d_hidden = d_hidden.clone()
                     d_probs = d_probs.clone()
@@ -374,7 +382,7 @@ class TestInferenceCUDAGraphTokenDispatcher:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             dispatcher.routing_map = static_routing_map
-            d_hidden, _, d_probs = dispatcher.token_dispatch(static_hidden, None, static_probs)
+            d_hidden, d_probs = dispatcher.token_dispatch(static_hidden, static_probs)
             graph_hidden = d_hidden.clone()
             graph_probs = d_probs.clone()
             graph_routing_map = dispatcher.routing_map.clone()
