@@ -353,6 +353,14 @@ class TransformerConfig(ModelParallelConfig):
     while leaving the residual stream itself untouched, which bounds activation growth in deep
     networks. Applies to the self-attention and MLP sublayers."""
 
+    sandwich_norm_layer_types: Optional[
+        List[Literal["standard_attention", "linear_attention"]]
+    ] = None
+    """Attention layer types to which sandwich norm is applied. ``None`` applies sandwich norm to
+    all layers, preserving the default behavior. An explicit list restricts it to standard-attention
+    or linear-attention layers; selecting a layer applies both its post-attention and post-MLP norms.
+    This setting has no effect when ``sandwich_norm`` is False."""
+
     post_attn_norm_zero_init: bool = False
     """If True (requires `sandwich_norm`), zero-initialize the gain of the post-attention sandwich
     norm (`post_self_attn_layernorm`) so the attention sublayer contributes nothing to the residual
@@ -1453,6 +1461,17 @@ class TransformerConfig(ModelParallelConfig):
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+        if self.sandwich_norm_layer_types is not None:
+            invalid_layer_types = set(self.sandwich_norm_layer_types) - {
+                "standard_attention",
+                "linear_attention",
+            }
+            if invalid_layer_types:
+                raise ValueError(
+                    "sandwich_norm_layer_types contains invalid values: "
+                    f"{sorted(invalid_layer_types)}"
+                )
 
         if self.sandwich_norm and self.inference_fuse_tp_communication:
             raise ValueError(

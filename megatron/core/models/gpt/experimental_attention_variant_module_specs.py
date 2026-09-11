@@ -229,23 +229,30 @@ def get_transformer_block_with_experimental_attention_variant_spec(
 
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
-    # Optional sandwich norm: normalize each sublayer's output before the residual add
-    # (x = x + Norm(Sublayer(Norm(x)))). Applied uniformly to every layer in the hybrid
-    # block -- both the experimental-attention (e.g. KDA/GDN) sublayers and the interleaved
-    # standard-attention sublayers -- matching the standard gpt_layer_specs path. When
-    # sandwich_norm is off, these slots stay IdentityOp (the TransformerLayerSubmodules
-    # default) and the post-norm code paths in TransformerLayer are inert.
-    post_layer_norm = (
-        backend.layer_norm(rms_norm=rms_norm, for_qk=False)
-        if config.sandwich_norm
-        else IdentityOp
-    )
     layer_specs = []
     for layer_number in range(config.num_layers):
+        is_experimental_attention_layer = experimental_attention_pattern[layer_number] == 1
         attention = (
             experimental_attention_spec
-            if experimental_attention_pattern[layer_number] == 1
+            if is_experimental_attention_layer
             else standard_attention_spec
+        )
+        sandwich_norm_layer_type = (
+            "linear_attention"
+            if is_experimental_attention_layer
+            and is_linear_attention_variant(config.experimental_attention_variant)
+            else "standard_attention"
+        )
+        use_sandwich_norm = config.sandwich_norm and (
+            config.sandwich_norm_layer_types is None
+            or sandwich_norm_layer_type in config.sandwich_norm_layer_types
+        )
+        # Sandwich norm is selected for the whole TransformerLayer: both its attention output
+        # and its paired dense-MLP/MoE output receive a post norm.
+        post_layer_norm = (
+            backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+            if use_sandwich_norm
+            else IdentityOp
         )
         mlp = moe_layer_spec if moe_layer_pattern[layer_number] == 1 else dense_mlp_layer_spec
         input_layernorm = (

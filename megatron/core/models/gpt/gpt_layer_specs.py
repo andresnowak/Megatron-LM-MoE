@@ -608,6 +608,10 @@ def get_gpt_decoder_layer_specs(
     pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
+    standard_attention_sandwich_norm = config.sandwich_norm and (
+        config.sandwich_norm_layer_types is None
+        or "standard_attention" in config.sandwich_norm_layer_types
+    )
     if use_transformer_engine:
         layer_norm_impl = TENorm
         dense_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -621,7 +625,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
-            sandwich_norm=config.sandwich_norm,
+            sandwich_norm=standard_attention_sandwich_norm,
             keel=config.keel,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
@@ -636,7 +640,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
-            sandwich_norm=config.sandwich_norm,
+            sandwich_norm=standard_attention_sandwich_norm,
             keel=config.keel,
         )
     elif config.transformer_impl == "inference_optimized":
@@ -645,7 +649,7 @@ def get_gpt_decoder_layer_specs(
             qk_layernorm=config.qk_layernorm,
             multi_latent_attention=config.multi_latent_attention,
             qk_l2_norm=qk_l2_norm,
-            sandwich_norm=config.sandwich_norm,
+            sandwich_norm=standard_attention_sandwich_norm,
         )
         moe_layer_spec = get_gpt_layer_with_inference_spec(
             qk_layernorm=config.qk_layernorm,
@@ -654,7 +658,7 @@ def get_gpt_decoder_layer_specs(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
             moe_use_legacy_grouped_gemm=config.moe_use_legacy_grouped_gemm,
-            sandwich_norm=config.sandwich_norm,
+            sandwich_norm=standard_attention_sandwich_norm,
         )
     else:
         layer_norm_impl = LNImpl
@@ -668,7 +672,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
-            sandwich_norm=config.sandwich_norm,
+            sandwich_norm=standard_attention_sandwich_norm,
             keel=config.keel,
         )
         moe_layer_spec = get_gpt_layer_local_spec(
@@ -682,7 +686,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
-            sandwich_norm=config.sandwich_norm,
+            sandwich_norm=standard_attention_sandwich_norm,
             keel=config.keel,
         )
 
