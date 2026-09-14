@@ -1847,6 +1847,18 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+
+        # Release the checkpoint LOAD strategy retained in checkpointing_context.
+        # With --ckpt-fully-parallel-load it is a FullyParallelLoadStrategyWrapper that
+        # holds the broadcast-exchange state; left in place it stays resident into the
+        # first SAVE (checkpointing.py reuses checkpointing_context['load_strategy']) and
+        # the save OOMs on top of it. gc.collect() returns that memory to the caching
+        # allocator WITHOUT unmapping, so it is reused safely under expandable_segments --
+        # unlike torch.cuda.empty_cache(), which unmaps segments NCCL has registered for
+        # pipeline-parallel P2P and triggers illegal memory accesses.
+        if checkpointing_context is not None:
+            checkpointing_context.pop("load_strategy", None)
+        gc.collect()
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
@@ -2358,17 +2370,25 @@ def training_log(
             track_names.append("expert_max_violation")
             track_names.append("expert_min_violation")
             track_names.append("expert_median_violation")
+            track_names.append("expert_std_violation")
+            track_names.append("expert_entropy")
         if "seq" in args.moe_router_violation_metrics:
             track_names.append("seq_expert_max_violation")
             track_names.append("seq_expert_min_violation")
             track_names.append("seq_expert_median_violation")
+            track_names.append("seq_expert_std_violation")
+            track_names.append("seq_expert_entropy")
         track_names.append("global_expert_max_violation")
         track_names.append("global_expert_min_violation")
         track_names.append("global_expert_median_violation")
+        track_names.append("global_expert_std_violation")
+        track_names.append("global_expert_entropy")
         if "ep" in args.moe_router_violation_metrics:
             track_names.append("ep_expert_max_violation")
             track_names.append("ep_expert_min_violation")
             track_names.append("ep_expert_median_violation")
+            track_names.append("ep_expert_std_violation")
+            track_names.append("ep_expert_entropy")
         if args.moe_router_bias_metrics:
             uses_quantile_balancing = "quantile_balancing" in args.moe_router_load_balancing_type
             if args.moe_router_enable_expert_bias and not uses_quantile_balancing:
@@ -2658,11 +2678,18 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     # Free overlap param-gather buffers and release cached GPU memory so
     # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers.
-    for model_chunk in model:
-        if hasattr(model_chunk, 'free_overlap_buffers'):
-            model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
+    # D2H tensor transfers. GUARDED on async_save: torch.cuda.empty_cache()
+    # unmaps CUDA segments NCCL has registered for pipeline-parallel P2P
+    # (fragile under expandable_segments), so with PP>1 the next P2P after the
+    # save touches an unmapped address -> CUDA illegal memory access (the run
+    # dies right after checkpointing; a fresh resume re-registers and continues).
+    # It only buys headroom for the async-save worker PROCESS, so for synchronous
+    # saves it is pure downside -- skip the whole block.
+    if args.async_save:
+        for model_chunk in model:
+            if hasattr(model_chunk, 'free_overlap_buffers'):
+                model_chunk.free_overlap_buffers()
+        torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
