@@ -12,6 +12,10 @@ _STARTUP_TIMESTAMPS = {
     'pretrain_entry': None, # Set at top of pretrain()
 }
 
+# Accumulated throughput
+_ACC_ELAPSED_TIME = 0.0
+_ACC_TOKENS = 0.0
+
 
 def set_startup_timestamps(program_start=None, main_entry=None):
     """Set startup timestamps from the entry script.
@@ -2047,6 +2051,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
+    # some all reduce can be safely skipped because they are always True
+    skip_reduce_check = args.skip_reduce_check and \
+        (args.optimizer == 'md_decoupling' and isinstance(optimizer, LayerWiseDistributedOptimizer))
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
@@ -2063,10 +2071,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful)
+    if not skip_reduce_check:
+        update_successful = logical_and_across_model_parallel_group(update_successful)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+    if not skip_reduce_check:
+        grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
     if args.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
 
@@ -2220,7 +2230,8 @@ def training_log(
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
-    learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
+    if not args.skip_reduce_check:
+        learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
@@ -2230,6 +2241,13 @@ def training_log(
                 'consumed-tokens': args.consumed_train_samples * args.seq_length ,
                 },
                 iteration)
+            # Training progress as a percentage of the total run (current step / total steps).
+            # args.train_iters is the total step count (set by update_train_iters from
+            # train_samples // global_batch_size for sample-based runs).
+            if args.train_iters:
+                wandb_writer.log(
+                    {'training-progress-pct': iteration / args.train_iters * 100},
+                    iteration)
         if learning_rate is not None:
             writer.add_scalar('learning-rate', learning_rate, iteration)
             writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
@@ -2428,6 +2446,15 @@ def training_log(
         tokens_per_iteration = args.global_batch_size * args.seq_length
         tokens_per_sec = tokens_per_iteration / elapsed_time_per_iteration
         tokens_per_sec_per_gpu = tokens_per_sec / args.world_size
+        global _ACC_ELAPSED_TIME
+        global _ACC_TOKENS
+        if should_reset:
+            _ACC_ELAPSED_TIME += elapsed_time
+            _ACC_TOKENS += tokens_per_iteration * total_iterations
+        if _ACC_ELAPSED_TIME > 0:
+            avg_tokens_per_sec_per_gpu = _ACC_TOKENS / _ACC_ELAPSED_TIME / args.world_size
+        else:
+            avg_tokens_per_sec_per_gpu = tokens_per_sec_per_gpu
         iterations_remaining = max(args.train_iters - iteration, 0)
         eta_seconds = iterations_remaining * elapsed_time_per_iteration
         eta = str(timedelta(seconds=int(eta_seconds)))
@@ -2461,6 +2488,7 @@ def training_log(
         log_string += f' eta: {eta} |'
         if args.log_throughput:
             log_string += f' tokens per sec per GPU: {tokens_per_sec_per_gpu:.2f} |'
+            log_string += f' avg tokens per sec per GPU: {avg_tokens_per_sec_per_gpu:.2f} |'
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             log_string += f' MFU: {mfu:.2f}% |'
             if args.log_timers_to_tensorboard:
@@ -2471,7 +2499,8 @@ def training_log(
                     wandb_writer.log({'throughput': throughput}, iteration)
                     wandb_writer.log({
                         'iteration-time': elapsed_time_per_iteration,
-                        'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu
+                        'tokens-per-sec-per-GPU': tokens_per_sec_per_gpu,
+                        'avg-tokens-per-sec-per-GPU': avg_tokens_per_sec_per_gpu
                     }, iteration)
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
@@ -2499,6 +2528,7 @@ def training_log(
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
+            grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             log_string += f' grad norm: {grad_norm:.3f} |'
         if num_zeros_in_grad is not None:
             log_string += f' num zeros: {num_zeros_in_grad} |'

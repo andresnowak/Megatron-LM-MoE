@@ -589,6 +589,12 @@ class KimiDeltaAttention(GatedDeltaNet):
             self.config.recompute_granularity == 'selective'
             and "qkv" in self.config.recompute_modules
         )
+
+        self.recompute_qkv_fine = (
+            self.config.recompute_granularity == 'selective'
+            and self.config.recompute_modules is not None
+            and "qkv_fine" in self.config.recompute_modules
+        )
         self.qkv_checkpoint = None
 
 
@@ -811,6 +817,34 @@ class KimiDeltaAttention(GatedDeltaNet):
         projected, _ = self.in_proj(hidden_states)
         nvtx_range_pop(suffix="in_proj")
 
+        # `qkv_fine`: checkpoint past in_proj
+        if self.recompute_qkv_fine and self.training and torch.is_grad_enabled():
+            self.qkv_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                fp8=self.config.fp8 or self.config.fp4
+            )
+            return self.qkv_checkpoint.checkpoint(
+                partial(
+                    self._post_proj_to_attn_inputs,
+                    batch=batch,
+                    seq_len=seq_len,
+                    packed_seq_params=packed_seq_params,
+                    cu_seqlens=cu_seqlens,
+                ),
+                projected,
+            )
+        return self._post_proj_to_attn_inputs(
+            projected, batch, seq_len, packed_seq_params, cu_seqlens
+        )
+
+    def _post_proj_to_attn_inputs(
+        self,
+        projected: torch.Tensor,
+        batch: int,
+        seq_len: int,
+        packed_seq_params=None,
+        cu_seqlens=None,
+    ):
+        """In_proj output -> chunk_kda inputs; the region `qkv_fine` recomputes."""
         qkv_channels_split_sections = [
             self.qk_dim_local_tp,
             self.qk_dim_local_tp,
@@ -890,11 +924,14 @@ class KimiDeltaAttention(GatedDeltaNet):
         else:
             assert self.activation in ["silu", "swish"]
             qkv, backend = conv1d_input_for_backend(qkv, self._conv1d_backend)
+            conv_kwargs = {}
+            if cu_seqlens is not None and backend == "cuda":
+                conv_kwargs["seq_idx"] = self._seq_idx_for_cu_seqlens(cu_seqlens)
             qkv, _ = causal_conv1d(
                 x=qkv, weight=conv1d_weight.squeeze(1), bias=conv1d_bias,
                 activation=self.activation, initial_state=None,
                 output_final_state=False, backend=backend,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=cu_seqlens, **conv_kwargs,
             )
         nvtx_range_pop(suffix="conv1d")
 
