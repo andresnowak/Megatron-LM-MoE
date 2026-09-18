@@ -765,6 +765,9 @@ class TestPaddingMaskAuxLoss:
             expert_model_parallel_size=ep_size,
             context_parallel_size=cp_size,
             sequence_parallel=sequence_parallel and tp_size > 1,
+            # See MoEModelTestContainer: expert-load observability defaults to ["mbs"] and
+            # sizes its buffers from get_num_microbatches(), which unit tests never init.
+            moe_router_violation_metrics=[],
         )
 
     def new_router(self, **kwargs):
