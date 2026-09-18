@@ -265,6 +265,9 @@ class TestRouterAuxLoss:
             bf16=True,
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
+            # See MoEModelTestContainer: expert-load observability defaults to ["mbs"] and
+            # sizes its buffers from get_num_microbatches(), which unit tests never init.
+            moe_router_violation_metrics=[],
         )
 
     def new_router(self, **kwargs):
