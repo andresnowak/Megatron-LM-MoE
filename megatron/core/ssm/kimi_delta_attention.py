@@ -239,9 +239,12 @@ def _warn_kda_legacy_gate_bias_once() -> None:
     global _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED
     if _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED:
         return
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        if torch.distributed.get_rank() != 0:
-            return
+    if (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_rank() != 0
+    ):
+        return
     logger.warning(
         "Enabling legacy KDA gate bias for checkpoint compatibility. "
         "Use only for checkpoints trained with the old hardcoded gate bias."

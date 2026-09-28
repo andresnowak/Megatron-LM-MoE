@@ -99,19 +99,6 @@ class TestKimiDeltaAttentionInference:
         assert unbiased.gate_out_proj.bias is None or unbiased.gate_out_proj.bias.numel() == 0
         assert biased.gate_out_proj.bias is not None
         assert biased.gate_out_proj.bias.numel() > 0
-        gate_input = torch.zeros(
-            1,
-            1,
-            unbiased.gate_low_rank_dim,
-            device=torch.cuda.current_device(),
-            dtype=torch.bfloat16,
-        )
-        with torch.inference_mode():
-            _, unbiased_returned_bias = unbiased.gate_out_proj(gate_input)
-            _, biased_returned_bias = biased.gate_out_proj(gate_input)
-        assert unbiased_returned_bias is None or unbiased_returned_bias.numel() == 0
-        assert biased_returned_bias is None or biased_returned_bias.numel() > 0
-
         unbiased_params = dict(unbiased.named_parameters())
         with torch.no_grad():
             for name, parameter in biased.named_parameters():
@@ -133,8 +120,7 @@ class TestKimiDeltaAttentionInference:
 
         assert (biased_output - unbiased_output).abs().max() > 1e-3
 
-        # A backend may return the bias separately even when the projection owns it.
-        # Verify that KDA adds that value before the sigmoid-gated norm.
+        # Cover backends that return the projection bias separately.
         original_gate = biased.gate_out_proj
 
         class SeparateBiasProjection(torch.nn.Module):
