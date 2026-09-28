@@ -231,6 +231,22 @@ def _fused_kda_gate_supports_lower_bound() -> bool:
 _KDA_FUSED_GATE_SUPPORTS_LOWER_BOUND = _fused_kda_gate_supports_lower_bound()
 
 logger = logging.getLogger(__name__)
+_KDA_LEGACY_GATE_BIAS_WARNING_EMITTED = False
+
+
+def _warn_kda_legacy_gate_bias_once() -> None:
+    """Warn once on rank zero when enabling the legacy gate-bias compatibility path."""
+    global _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED
+    if _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED:
+        return
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+    logger.warning(
+        "Enabling legacy KDA gate bias for checkpoint compatibility. "
+        "Use only for checkpoints trained with the old hardcoded gate bias."
+    )
+    _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED = True
 
 
 @dataclass
@@ -317,6 +333,8 @@ class KimiDeltaAttention(GatedDeltaNet):
             raise ValueError(
                 "Kimi Delta Attention requires linear_attention_use_output_gate=True."
             )
+        if config.kda_legacy_gate_out_proj_bias:
+            _warn_kda_legacy_gate_bias_once()
 
         # pp_layer_offset/cp_comm_type are unused (see GatedDeltaNet.__init__ docstring);
         # accepted only so TransformerLayer's generic self_attention construction can pass them.
@@ -444,7 +462,7 @@ class KimiDeltaAttention(GatedDeltaNet):
                 config=second_stage_config,
                 init_method=self.config.init_method,
                 gather_output=False,
-                bias=bias,
+                bias=self.config.kda_legacy_gate_out_proj_bias,
                 skip_bias_add=False,
                 is_expert=False,
                 tp_comm_buffer_name="kda_gate_out",
@@ -804,7 +822,9 @@ class KimiDeltaAttention(GatedDeltaNet):
                 )
         alpha, _ = self.decay_out_proj(decay_low_rank)
         if not self._full_rank_output_gate:
-            gate, _ = self.gate_out_proj(gate_low_rank)
+            gate, gate_bias = self.gate_out_proj(gate_low_rank)
+            if gate_bias is not None and gate_bias.numel() > 0:
+                gate = gate + gate_bias
         return qkv, gate, beta, alpha
 
     def _prepare_g_and_beta(self, alpha, beta, A_log, dt_bias, gate_in_kernel=None):

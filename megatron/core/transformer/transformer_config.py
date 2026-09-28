@@ -568,6 +568,14 @@ class TransformerConfig(ModelParallelConfig):
     Changes the in_proj layout, so checkpoints are not interchangeable with the low-rank variant.
     Only affects Kimi Delta Attention (KDA)."""
 
+    kda_legacy_gate_out_proj_bias: bool = False
+    """Add a bias only to KDA's low-rank output-gate projection.
+
+    This is a checkpoint-compatibility option for legacy KDA models whose gate_out_proj
+    was biased even when add_bias_linear was disabled. It does not add bias to any other
+    linear layer and defaults to the current bias-free behavior.
+    """
+
     linear_attention_safe_output_gate: bool = False
     """If True, use the Kimi-K3 / FlashKDA 'safe' bounded reparameterization of the log-decay
     (forget) gate: g = g_min * sigmoid(exp(A_log) * (z + dt_bias)) in (g_min, 0), instead of the
