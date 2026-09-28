@@ -254,7 +254,7 @@ def make_fused_offloading_experts_canonical_factory(
 def make_legacy_offloading_load_factory(
     canonical_sharded_tensor: ShardedTensor, linear_name: str, gated: bool = False
 ):
-    """Request an old [in, out] offloading tensor for a canonical [out, in] parameter."""
+    """Request an old [in, out] weight through CPU staging for a canonical parameter."""
     legacy_weight_name = {'linear_fc1': 'weight1', 'linear_fc2': 'weight2'}[linear_name]
     canonical_suffix = f'{linear_name}.weight'
 
@@ -287,6 +287,7 @@ def make_legacy_offloading_load_factory(
                         replace(
                             canonical_sharded_tensor,
                             data=part,
+                            dtype=part.dtype,
                             local_shape=tuple(part.shape),
                             global_offset=tuple(global_offset),
                             axis_fragmentations=tuple(axis_fragmentations),
@@ -296,7 +297,7 @@ def make_legacy_offloading_load_factory(
 
         legacy_parts = []
         for part, part_shard in canonical_parts:
-            data = part.transpose(-2, -1).contiguous()
+            data = part.to(device='cpu').transpose(-2, -1).contiguous()
             global_shape = list(part_shard.global_shape)
             global_offset = list(part_shard.global_offset)
             axis_fragmentations = list(part_shard.axis_fragmentations)
@@ -323,9 +324,7 @@ def make_legacy_offloading_load_factory(
 
     @torch.no_grad()
     def merge_fn(loaded_shards):
-        canonical_parts = [
-            shard.transpose(-2, -1).contiguous() for shard in loaded_shards
-        ]
+        canonical_parts = [shard.transpose(-2, -1) for shard in loaded_shards]
         return torch.cat(canonical_parts, dim=-2) if gated else canonical_parts[0]
 
     return ShardedTensorFactory(
