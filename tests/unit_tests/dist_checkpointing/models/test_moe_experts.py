@@ -160,7 +160,9 @@ class TestExpertLayerReconfiguration:
             destination.load_state_dict(loaded, strict=False)
 
             roundtrip_dir = ckpt_dir / 'roundtrip'
-            roundtrip_dir.mkdir()
+            if Utils.rank == 0:
+                roundtrip_dir.mkdir()
+            torch.distributed.barrier()
             save(destination.sharded_state_dict(metadata=metadata), roundtrip_dir)
             actual = load_plain_tensors(roundtrip_dir)
             diffs = diff(expected, actual)

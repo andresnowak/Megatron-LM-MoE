@@ -141,12 +141,12 @@ class TestLegacyOffloadingCPUStaging:
                 "layers.0.mlp.experts.linear_fc1.weight",
                 target,
                 (0, 0, 1),
-                replica_id=(0, 0, 0),
+                replica_id=Utils.rank,
                 prepend_axis_num=1,
             )
         else:
             canonical = ShardedTensor.from_rank_offsets(
-                "layers.0.mlp.experts.0.linear_fc1.weight", target, replica_id=(0, 0, 0)
+                "layers.0.mlp.experts.0.linear_fc1.weight", target, replica_id=Utils.rank
             )
         return make_legacy_offloading_load_factory(canonical, "linear_fc1", gated=gated)
 
@@ -170,7 +170,9 @@ class TestLegacyOffloadingCPUStaging:
         checkpoint_dir = tmp_path_dist_ckpt / (
             f"legacy-prepend{prepend_axis_num}-gated{int(gated)}"
         )
-        checkpoint_dir.mkdir()
+        if Utils.rank == 0:
+            checkpoint_dir.mkdir()
+        torch.distributed.barrier()
         save({"value": source_shards}, checkpoint_dir, async_sharded_save=False)
 
         loaded = load({"value": factory}, checkpoint_dir)["value"]
