@@ -934,7 +934,7 @@ def test_md_projected_row_gain_reshards(tmp_path_dist_ckpt):
                 'linear.weight',
                 param,
                 (0, rank, fragments),
-                replica_id=(0, 0, 0),
+                replica_id=(0, 0, Utils.rank),
             )
             optimizer = MDDecoupling(
                 params=[param],
