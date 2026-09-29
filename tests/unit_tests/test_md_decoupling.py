@@ -1682,6 +1682,75 @@ class TestMDDecouplingMultiRankTP:
                 row_squared, torch.ones_like(row_squared), rtol=1e-5, atol=1e-5
             )
 
+    @requires_cuda_and_emerging
+    @pytest.mark.parametrize("in_features, out_features", [(64, 32), (32, 64)])
+    def test_md_decoupling_duplicated_te_linear_is_not_tp_sharded(
+        self, monkeypatch, in_features, out_features
+    ):
+        """A duplicated TELinear (e.g. the MoE latent projections) holds the full matrix on every
+        TP rank, so its Muon update must be the unsharded one on each rank."""
+        from megatron.core.extensions.transformer_engine import TELinear
+        from megatron.core.transformer import TransformerConfig
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            tensor_model_parallel_size=pg_collection.tp.size(),
+            sequence_parallel=pg_collection.tp.size() > 1,
+            params_dtype=torch.float32,
+        )
+        weight = TELinear(
+            in_features,
+            out_features,
+            parallel_mode="duplicated",
+            config=config,
+            init_method=torch.nn.init.normal_,
+            bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            is_expert=False,
+        ).weight
+        assert weight.tensor_model_parallel is False
+        assert weight.shape == (out_features, in_features)
+
+        optimizer = MDDecoupling(
+            params=[weight],
+            lr=0.01,
+            weight_decay=0.0,
+            use_orthogonal_updates=True,
+            momentum_beta=0.0,
+            use_nesterov=False,
+            hypersphere_mode="row",
+            hypersphere_radius_mode="fan_in",
+            scale_mode="shape_up",
+            pg_collection=pg_collection,
+            tp_mode="duplicated",
+        )
+        # Skip the post-step projection so the applied update is the parameter delta.
+        monkeypatch.setattr(optimizer, "_normalize", lambda *args, **kwargs: None)
+        torch.manual_seed(0)
+        weight.grad = torch.randn_like(weight)
+        torch.distributed.broadcast(
+            weight.grad,
+            src=torch.distributed.get_global_rank(pg_collection.tp, 0),
+            group=pg_collection.tp,
+        )
+        before = weight.detach().clone()
+
+        optimizer.step()
+
+        # Under fan_in the orthogonalized update is pinned to ||U||_F = sqrt(d_out).
+        update = (before - weight.detach()) / 0.01
+        assert torch.linalg.vector_norm(update).item() == pytest.approx(
+            math.sqrt(out_features), rel=0.05
+        )
+        replicas = [torch.empty_like(update) for _ in range(pg_collection.tp.size())]
+        torch.distributed.all_gather(replicas, update, group=pg_collection.tp)
+        for replica in replicas[1:]:
+            torch.testing.assert_close(replica, replicas[0])
+
 
 def test_md_decoupling_gqa_qkv_split_mechanics():
     param = torch.nn.Parameter(torch.empty(8, 4))
