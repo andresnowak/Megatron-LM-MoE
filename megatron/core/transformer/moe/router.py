@@ -360,6 +360,12 @@ class TopKRouter(Router):
         compatibility with older QB checkpoints, while ``average`` uses bounded
         router scores. The histogram method performs no forward-pass communication:
         it accumulates local counts that are pooled once at the batch boundary.
+
+        Returns probs, routing_map and, when a capacity factor is set, the selection margin
+        ``(qb_scores - qb_beta) - alpha`` used to rank tokens for dropping, where ``alpha`` is
+        each token's Top-(k+1) biased score. It is the quantity whose per-expert quantile the
+        beta update estimates, so dropping the smallest margins acts like raising the
+        overloaded expert's threshold for this microbatch. It is None otherwise.
         """
         assert (
             not self.config.moe_router_fusion
@@ -396,11 +402,18 @@ class TopKRouter(Router):
             use_histogram = (
                 self.config.moe_router_quantile_balancing_method == 'histogram'
             )
-            if should_update_beta and use_histogram:
+            compute_drop_priority = (
+                self.config.moe_expert_capacity_factor is not None
+                and self.config.moe_token_drop_policy == "probs"
+            )
+            if (should_update_beta and use_histogram) or compute_drop_priority:
                 topk_result = biased_scores.topk(self.topk + 1, dim=1)
                 indices = topk_result.indices[:, : self.topk]
             else:
                 indices = biased_scores.topk(self.topk, dim=1).indices
+            drop_priority = None
+            if compute_drop_priority:
+                drop_priority = biased_scores - topk_result.values[:, -1:]
 
             if should_update_beta:
                 if use_histogram:
@@ -466,7 +479,7 @@ class TopKRouter(Router):
                         self.qb_beta_count.add_(1)
 
         # QB only picks the experts; reuse the shared score function for the probs.
-        return topk_routing_with_score_function(
+        probs, routing_map = topk_routing_with_score_function(
             logits,
             self.topk,
             use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -475,6 +488,7 @@ class TopKRouter(Router):
             fused=False,
             precomputed_indices=indices,
         )
+        return probs, routing_map, drop_priority
 
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
         """Return the aux loss coeff for the given auxiliary loss type.
@@ -874,10 +888,13 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         # Calculate probs and routing_map for token dispatching
+        drop_priority = None
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         elif "quantile_balancing" in self.routing_type:
-            probs, routing_map = self.quantile_balancing(logits, padding_mask=padding_mask)
+            probs, routing_map, drop_priority = self.quantile_balancing(
+                logits, padding_mask=padding_mask
+            )
         else:
             probs, routing_map = topk_routing_with_score_function(
                 logits,
@@ -901,6 +918,8 @@ class TopKRouter(Router):
                 capacity_factor=self.config.moe_expert_capacity_factor,
                 drop_policy=self.config.moe_token_drop_policy,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+                drop_priority=drop_priority,
+                padding_mask=padding_mask,
             )
 
         # Apply each aux loss type and attach aux loss autograd function to probs

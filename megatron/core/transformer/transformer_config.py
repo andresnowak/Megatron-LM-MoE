@@ -1197,8 +1197,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_token_drop_policy: Literal['probs', 'position'] = "probs"
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
-    the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
-    be dropped.
+    the lowest probabilities will be dropped; under quantile balancing, the tokens with the lowest
+    QB selection margin (biased score minus the token's Top-(k+1) biased score). If "position",
+    tokens at the end of each batch will be dropped. Padding tokens are always dropped first.
     """
 
     moe_layer_recompute: bool = False
@@ -1962,21 +1963,23 @@ class TransformerConfig(ModelParallelConfig):
                         "aux_loss",
                         "seq_aux_loss",
                         "global_aux_loss",
+                        "quantile_balancing",
                         "none",
                     ]:
                         raise ValueError(
-                            "moe_expert_capacity_factor only works with aux_loss, "
-                            "seq_aux_loss, global_aux_loss or none load balancing"
+                            "moe_expert_capacity_factor only works with aux_loss, seq_aux_loss, "
+                            "global_aux_loss, quantile_balancing or none load balancing"
                         )
             elif self.moe_router_load_balancing_type not in [
                 "aux_loss",
                 "seq_aux_loss",
                 "global_aux_loss",
+                "quantile_balancing",
                 "none",
             ]:
                 raise ValueError(
-                    "moe_expert_capacity_factor only works with aux_loss, "
-                    "seq_aux_loss, global_aux_loss or none load balancing"
+                    "moe_expert_capacity_factor only works with aux_loss, seq_aux_loss, "
+                    "global_aux_loss, quantile_balancing or none load balancing"
                 )
 
         if self.moe_pad_expert_input_to_capacity:

@@ -1054,6 +1054,8 @@ def apply_router_token_dropping(
     capacity_factor: float,
     drop_policy: str = "probs",
     pad_to_capacity: bool = False,
+    drop_priority: Optional[torch.Tensor] = None,
+    padding_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply token dropping to top-k expert selection.
 
@@ -1070,6 +1072,12 @@ def apply_router_token_dropping(
         drop_policy (str, optional): Policy to drop tokens - "probs" or "position".
                                      Defaults to "probs".
         pad_to_capacity (bool, optional): Whether to pad to capacity. Defaults to False.
+        drop_priority (torch.Tensor, optional): [num_tokens, num_experts] scores that replace
+            routing_probs as the ranking of the "probs" policy, non-negative for selected
+            entries. Quantile balancing passes its selection margin here. Defaults to None.
+        padding_mask (torch.Tensor, optional): [num_tokens] bool mask, True for padding
+            tokens. Padding tokens are ranked below every valid token, so they only take
+            capacity that valid tokens leave unused. Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -1090,16 +1098,25 @@ def apply_router_token_dropping(
         # No need to drop tokens if capacity exceeds the number of tokens
         capacity_mask = torch.ones_like(routing_probs).bool()
     else:
+        padded_selection = None
+        if padding_mask is not None:
+            padded_selection = routing_map & padding_mask.unsqueeze(-1)
         if drop_policy == "probs":
-            _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
-            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+            priority = routing_probs if drop_priority is None else drop_priority
+            if drop_priority is not None or padded_selection is not None:
+                # Selected valid entries are >= 0, padded ones -1, unselected ones -inf.
+                priority = priority.masked_fill(~routing_map, float("-inf"))
+                if padded_selection is not None:
+                    priority = priority.masked_fill(padded_selection, -1.0)
         elif drop_policy == "position":
-            _, capacity_indices = torch.topk(
-                routing_map.int(), k=expert_capacity, dim=0, sorted=False
-            )
-            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+            # topk keeps the earliest rows among equal values.
+            priority = routing_map.int()
+            if padded_selection is not None:
+                priority = priority + (routing_map & ~padded_selection).int()
         else:
             raise ValueError(f"Invalid drop_policy: {drop_policy}")
+        _, capacity_indices = torch.topk(priority, k=expert_capacity, dim=0, sorted=False)
+        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
 
     # Apply capacity constraints
     if pad_to_capacity:
