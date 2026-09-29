@@ -237,12 +237,8 @@ _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED = False
 def _warn_kda_legacy_gate_bias_once() -> None:
     """Warn once on rank zero when enabling the legacy gate-bias compatibility path."""
     global _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED
-    if _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED:
-        return
-    if (
-        torch.distributed.is_available()
-        and torch.distributed.is_initialized()
-        and torch.distributed.get_rank() != 0
+    if _KDA_LEGACY_GATE_BIAS_WARNING_EMITTED or (
+        torch.distributed.is_initialized() and torch.distributed.get_rank() != 0
     ):
         return
     logger.warning(
