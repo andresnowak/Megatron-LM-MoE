@@ -1562,6 +1562,8 @@ def load_args_from_checkpoint(
     _set_arg('window_size', force=True)
     _set_arg('window_attn_skip_freq', force=True)
     _set_arg('no_rope_freq', force=True)
+    # Old checkpoints lack this field; preserve their explicit CLI override.
+    _set_arg('kda_legacy_gate_out_proj_bias', force=True)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)

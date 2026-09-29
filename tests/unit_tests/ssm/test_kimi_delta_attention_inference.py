@@ -44,7 +44,7 @@ class TestKimiDeltaAttentionInference:
         cls.kda = cls._build_kda()
 
     @staticmethod
-    def _build_kda():
+    def _build_kda(gate_out_proj_bias=False):
         config = TransformerConfig(
             hidden_size=128,
             linear_conv_kernel_dim=4,
@@ -61,6 +61,7 @@ class TestKimiDeltaAttentionInference:
             bf16=True,
             experimental_attention_variant="kda",
             linear_attention_freq=[1],
+            kda_legacy_gate_out_proj_bias=gate_out_proj_bias,
             transformer_impl="transformer_engine",
         )
         pg_collection = ProcessGroupCollection(
@@ -89,6 +90,60 @@ class TestKimiDeltaAttentionInference:
     def test_packed_prefill_and_indexed_decode_match_full_sequence(self):
         """Packed prompts plus one recurrent step must match full-sequence KDA."""
         self._assert_prefill_and_decode_match_full_sequence(self.kda, [5, 3])
+
+    def test_gate_output_bias_changes_prefill_and_decode(self):
+        """A legacy KDA gate bias must be used by both inference paths."""
+        unbiased = self._build_kda(gate_out_proj_bias=False)
+        biased = self._build_kda(gate_out_proj_bias=True)
+        # TE represents a disabled bias as an empty tensor rather than None.
+        assert unbiased.gate_out_proj.bias is None or unbiased.gate_out_proj.bias.numel() == 0
+        assert biased.gate_out_proj.bias is not None
+        assert biased.gate_out_proj.bias.numel() > 0
+        unbiased_params = dict(unbiased.named_parameters())
+        with torch.no_grad():
+            for name, parameter in biased.named_parameters():
+                if name in unbiased_params:
+                    parameter.copy_(unbiased_params[name])
+            biased.gate_out_proj.bias.fill_(0.5)
+
+        torch.manual_seed(456)
+        hidden = torch.randn(
+            5,
+            1,
+            biased.config.hidden_size,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        with torch.inference_mode():
+            unbiased_output = unbiased(hidden, None)[0]
+            biased_output = biased(hidden, None)[0]
+
+        assert (biased_output - unbiased_output).abs().max() > 1e-3
+
+        # Cover backends that return the projection bias separately.
+        original_gate = biased.gate_out_proj
+
+        class SeparateBiasProjection(torch.nn.Module):
+            def __init__(self, projection):
+                super().__init__()
+                self.weight = projection.weight
+                self.bias = projection.bias
+                self.input = None
+
+            def forward(self, input_):
+                self.input = input_
+                return F.linear(input_, self.weight), self.bias
+
+        separate_gate = SeparateBiasProjection(original_gate)
+        biased.gate_out_proj = separate_gate
+        with torch.inference_mode():
+            projected, _ = biased.in_proj(hidden)
+            _, gate, _, _ = biased._expand_low_rank_inputs(projected)
+            expected_gate = F.linear(separate_gate.input, original_gate.weight, original_gate.bias)
+        torch.testing.assert_close(gate, expected_gate, atol=2e-2, rtol=2e-2)
+        biased.gate_out_proj = original_gate
+
+        self._assert_prefill_and_decode_match_full_sequence(biased, [5, 3])
 
     def test_per_channel_a_log_decode_matches_full_sequence(self, monkeypatch):
         """Decode must apply a non-zero per-channel A_log like the training forward."""
