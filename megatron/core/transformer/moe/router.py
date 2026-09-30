@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import os
 from abc import ABC, abstractmethod
 from typing import Optional, Union
 
@@ -17,6 +18,7 @@ from megatron.core.transformer.moe.moe_utils import (
     compute_qb_histogram,
     compute_routing_scores_for_aux_loss,
     get_tokens_per_expert_and_token_count,
+    pop_routing_oob_accum,
     qb_dual_update,
     router_gating_linear,
     save_to_aux_losses_tracker,
@@ -727,23 +729,31 @@ class TopKRouter(Router):
         Returns:
             torch.Tensor: The logits after applying the z-loss.
         """
-        if self.config.moe_z_loss_coeff is not None and self.training and torch.is_grad_enabled():
+        apply_penalty = self.config.moe_z_loss_coeff not in (None, 0.0)
+        if (apply_penalty or self.config.moe_router_log_z_loss) and self.training and torch.is_grad_enabled():
             # Skip Z loss calculations when using torch.no_grad() or checkpointing.
-            moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
-            z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
-            if self.calculate_per_token_loss:
-                # The expected final scaling for z_loss gradients is
-                # 1/(num_micro_batches * dp_size).
-                # After commit 02648000, Megatron started using the number of total tokens
-                # to scale gradients under the argument of calculate_per_token_loss,
-                # which scales both the main_loss gradient and z_loss gradient by
-                # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
-                # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
-                # Count valid tokens: sum of inverted mask (False -> True = valid)
-                num_tokens = (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
-                logits = MoEAuxLossAutoScaler.apply(logits, z_loss * num_tokens)
+            if apply_penalty:
+                moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
+                z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
+                if self.calculate_per_token_loss:
+                    # The expected final scaling for z_loss gradients is
+                    # 1/(num_micro_batches * dp_size).
+                    # After commit 02648000, Megatron started using the number of total tokens
+                    # to scale gradients under the argument of calculate_per_token_loss,
+                    # which scales both the main_loss gradient and z_loss gradient by
+                    # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
+                    # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
+                    # Count valid tokens: sum of inverted mask (False -> True = valid)
+                    num_tokens = (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
+                    logits = MoEAuxLossAutoScaler.apply(logits, z_loss * num_tokens)
+                else:
+                    logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+
             else:
-                logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+                # Diagnostic only: retain no autograd graph and attach no auxiliary gradient.
+                moe_z_loss_coeff = 1.0
+                with torch.no_grad():
+                    z_loss = z_loss_func(logits.detach().float(), 1.0, padding_mask=padding_mask)
 
             # When using repeated MTP layers, the same MTP layer is called mtp_num_layers times.
             # To avoid accumulating the z_loss multiple times, we scale it by 1/mtp_num_layers
@@ -895,6 +905,26 @@ class TopKRouter(Router):
                 fused=self.config.moe_router_fusion,
                 router_replay=self.router_replay,
             )
+
+        # Debug ($MOE_VALIDATE_ROUTING=1): surface how often the router emitted an
+        # out-of-bounds expert index (clamped upstream to keep the run alive). Logged
+        # per layer via the aux-loss tracker, so the host read happens at the normal
+        # logging interval, not on the hot path. Drained here -- before the aux-loss
+        # recompute below re-invokes the score function -- so the count is not doubled.
+        if os.environ.get("MOE_VALIDATE_ROUTING", "0") == "1":
+            oob = pop_routing_oob_accum(routing_map.device)
+            if oob is not None:
+                num_layers = self.config.num_layers
+                if self.config.mtp_num_layers is not None:
+                    num_layers += self.config.mtp_num_layers
+                layer_number = (
+                    self.layer_number + self.config.num_layers
+                    if self.is_mtp_layer
+                    else self.layer_number
+                )
+                save_to_aux_losses_tracker(
+                    "routing_oob_tokens", oob.float(), layer_number, num_layers
+                )
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:

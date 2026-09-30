@@ -2081,6 +2081,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     grad_norm = None
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        from megatron.training.nan_debug import nan_debug_new_step
+        # Reset diagnostics for every attempt, including reruns of the same step.
+        nan_debug_new_step(iteration + 1, model)
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2155,6 +2158,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # Reset force_all_reduce field.
         for model_chunk in model:
             model_chunk.force_all_reduce = False
+
+        # Zero spurious non-finite grad elements (nan/inf -> 0) so a rare artifact
+        # (e.g. the fp8-offloading wgrad GEMM on a near-dead expert) can't poison
+        # the grad-norm below / the optimizer step. Gated by NAN_DEBUG_SANITIZE=1
+        # (a true no-op otherwise). Runs after backward, before prepare_grad_norm()
+        # and the optimizer consume the grads. To get mask-and-continue behavior,
+        # pair NAN_DEBUG_SANITIZE=1 with CHECK_NAN=0 (the param_and_grad_buffer
+        # NaN check is fatal and fires DURING backward, before this runs).
+        from megatron.training.nan_debug import nan_debug_check_grads, nan_debug_sanitize_grads
+        # Inspect before sanitization removes the evidence of non-finite gradients.
+        nan_debug_check_grads(model, iteration + 1)
+        nan_debug_sanitize_grads(model)
 
         if args.optimizer == 'md_decoupling' and args.check_grad_norm:
             from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
@@ -2502,13 +2517,15 @@ def training_log(
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
+        if os.environ.get("MOE_VALIDATE_ROUTING", "0") == "1":
+            track_names.append("routing_oob_tokens")
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
         if "seq_aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("seq_load_balancing_loss")
         if "global_aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("global_load_balancing_loss")
-        if args.moe_z_loss_coeff is not None:
+        if args.moe_z_loss_coeff not in (None, 0.0) or args.moe_router_log_z_loss:
             track_names.append("z_loss")
         if "mbs" in args.moe_router_violation_metrics:
             track_names.append("expert_max_violation")
@@ -2823,18 +2840,11 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     # Free overlap param-gather buffers and release cached GPU memory so
     # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers. GUARDED on async_save: torch.cuda.empty_cache()
-    # unmaps CUDA segments NCCL has registered for pipeline-parallel P2P
-    # (fragile under expandable_segments), so with PP>1 the next P2P after the
-    # save touches an unmapped address -> CUDA illegal memory access (the run
-    # dies right after checkpointing; a fresh resume re-registers and continues).
-    # It only buys headroom for the async-save worker PROCESS, so for synchronous
-    # saves it is pure downside -- skip the whole block.
-    if args.async_save:
-        for model_chunk in model:
-            if hasattr(model_chunk, 'free_overlap_buffers'):
-                model_chunk.free_overlap_buffers()
-        torch.cuda.empty_cache()
+    # D2H tensor transfers.
+    for model_chunk in model:
+        if hasattr(model_chunk, 'free_overlap_buffers'):
+            model_chunk.free_overlap_buffers()
+    torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
@@ -2842,6 +2852,7 @@ def save_checkpoint_and_time(
     if should_report_memory:
         # Track memory before checkpoint save.
         report_memory(f"(before save_checkpoint for iteration {iteration})")
+        report_host_memory(f"before save_checkpoint for iteration {iteration}")
     # Save checkpoint.
     save_checkpoint(
         iteration,
@@ -2864,6 +2875,15 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
+    # The checkpoint writer stages every GPU-resident shard through pinned host memory
+    # (tensor.to("cpu", non_blocking=True)). torch's caching host allocator keeps those
+    # blocks forever, so each rank's pinned footprint grows by its whole shard (rounded
+    # up to powers of two) at the first save and never comes back. Return the now-free
+    # blocks to the OS; live pinned buffers (offload pools, parameters) are untouched.
+    if hasattr(torch._C, "_host_emptyCache"):
+        torch._C._host_emptyCache()
+    if should_report_memory:
+        report_host_memory(f"after save_checkpoint for iteration {iteration}")
     timers(timer_key).stop(barrier=True)
     timers.log([timer_key])
 
@@ -2944,7 +2964,8 @@ def post_training_step_callbacks(
     if args.manual_gc:
         if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
             gc.collect()
-            torch.cuda.empty_cache()
+            # Retain cached GPU segments to avoid unmapping memory that may
+            # still be registered with communication libraries.
 
     # Return updated FLOPs accumulator so caller can persist the reset
     return num_floating_point_operations_since_last_log_event
@@ -3065,7 +3086,8 @@ def checkpoint_and_decide_exit(
     if saved_checkpoint:
         # checkpointing can sometimes bring extra memory consumption
         gc.collect()
-        torch.cuda.empty_cache()
+        # Retain cached GPU segments here too; pinned-host cache cleanup is
+        # handled separately in save_checkpoint_and_time.
 
     return False
 

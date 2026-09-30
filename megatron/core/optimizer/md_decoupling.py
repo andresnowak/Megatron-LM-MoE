@@ -152,6 +152,18 @@ def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") 
     return _emerging_get_muon_scale_factor(size_out, size_in, mode=mode)
 
 
+def _tp_partition_dim(p: torch.Tensor) -> Optional[int]:
+    """Dimension along which TP shards ``p``, or None when ``p`` is not TP-sharded.
+
+    TE stamps ``partition_dim=0`` on duplicated-mode weights (e.g. the MoE latent projections)
+    that Megatron marks ``tensor_model_parallel=False``: every TP rank holds the full matrix.
+    """
+    if getattr(p, "tensor_model_parallel", None) is False:
+        return None
+    partition_dim = getattr(p, "partition_dim", None)
+    return None if partition_dim == -1 else partition_dim
+
+
 def _md_gain_retained_axes(gain_kind: str, model_ndim: int) -> tuple[int, ...]:
     """Return model-local axes represented by an MD gain tensor."""
     if model_ndim == 2:
@@ -705,7 +717,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         dim0 = x.size(0)
         if dim0 == total or (allow_groups and dim0 % total == 0):
             return shapes
-        if getattr(p, "partition_dim", None) != 0:
+        if _tp_partition_dim(p) != 0:
             return shapes
 
         tp_size = 1
@@ -758,9 +770,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                         else self.pg_collection.tp)
         else:
             tp_group = None
-        norm_partition_dim = getattr(p, "partition_dim", None)
-        if norm_partition_dim == -1:
-            norm_partition_dim = None
+        norm_partition_dim = _tp_partition_dim(p)
         partition_dim = None if self.tp_mode == "blockwise" else norm_partition_dim
 
         split = self._split_param_tensor(p, grad, is_qkv)
@@ -1014,9 +1024,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_merged_offload_expert: bool,
     ) -> tuple[list[torch.Tensor], Optional[int]]:
         """Return logical matrix blocks and their TP partition dimension."""
-        partition_dim = getattr(p, "partition_dim", None)
-        if partition_dim == -1:
-            partition_dim = None
+        partition_dim = _tp_partition_dim(p)
         split = self._split_param_tensor(p, tensor, is_qkv)
         if split is not None:
             return split[0], self._split_partition_dim(p, partition_dim)
@@ -1138,7 +1146,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if mode is None:
             return
 
-        partition_dim = getattr(p, "partition_dim", None)
+        partition_dim = _tp_partition_dim(p)
         radius_scale = self._resolve_radius_scale(is_out_proj)
 
         is_expert_tp = getattr(p, "expert_tp", False)
@@ -1378,7 +1386,7 @@ class MDDecoupling(_MDDecouplingBase):
         preserve = self.hypersphere_preserve_init
         # TP sharding info: the absorbed norm must be reduced across the TP group when it reduces
         # over the sharded dimension, else TP=1 and TP>1 absorb different magnitudes.
-        partition_dim = getattr(p, "partition_dim", None)
+        partition_dim = _tp_partition_dim(p)
         is_expert_tp = getattr(p, "expert_tp", False)
         layout = self._gain_layout(p)
 
@@ -1526,7 +1534,7 @@ class MDDecoupling(_MDDecouplingBase):
         if self.pg_collection is not None:
             # partition_dim=0 -> column parallel sharding.
             # partition_dim=1 -> row parallel sharding.
-            partition_dim = getattr(p, "partition_dim", None)
+            partition_dim = _tp_partition_dim(p)
             if partition_dim in {0, 1}:  # Otherwise, p is not sharded so we don't need to sync it.
                 tp_group = self.pg_collection.expt_tp if getattr(p, "expert_tp", False) else self.pg_collection.tp
                 if flat is not None:  # Flat gains always need to all-reduce to complete the decomposition.

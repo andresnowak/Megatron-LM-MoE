@@ -585,6 +585,10 @@ class TransformerConfig(ModelParallelConfig):
     Changes the in_proj layout, so checkpoints are not interchangeable with the low-rank variant.
     Only affects Kimi Delta Attention (KDA)."""
 
+    kda_legacy_gate_out_proj_bias: bool = False
+    """Restore the low-rank gate bias for legacy KDA checkpoints trained with a
+    hardcoded gate_out_proj bias, independent of add_bias_linear."""
+
     linear_attention_safe_output_gate: bool = False
     """If True, use the Kimi-K3 / FlashKDA 'safe' bounded reparameterization of the log-decay
     (forget) gate: g = g_min * sigmoid(exp(A_log) * (z + dt_bias)) in (g_min, 0), instead of the
@@ -1152,6 +1156,12 @@ class TransformerConfig(ModelParallelConfig):
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
     a corresponding list of coefficients should be provided here."""
+
+    moe_router_log_z_loss: bool = False
+    """Log unweighted router z-loss without requiring a z-loss penalty.
+
+    When moe_z_loss_coeff is None or zero, this does not alter router gradients.
+    """
 
     moe_z_loss_coeff: Optional[float] = None  # 1e-3 would be a good start value for z-loss
     """Scaling coefficient for the z-loss. A starting value of 1e-3 is recommended."""

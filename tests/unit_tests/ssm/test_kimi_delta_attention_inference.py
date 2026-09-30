@@ -41,7 +41,10 @@ class TestKimiDeltaAttentionInference:
             context_parallel_size=1,
         )
         model_parallel_cuda_manual_seed(123)
+        cls.kda = cls._build_kda()
 
+    @staticmethod
+    def _build_kda(gate_out_proj_bias=False):
         config = TransformerConfig(
             hidden_size=128,
             linear_conv_kernel_dim=4,
@@ -58,6 +61,7 @@ class TestKimiDeltaAttentionInference:
             bf16=True,
             experimental_attention_variant="kda",
             linear_attention_freq=[1],
+            kda_legacy_gate_out_proj_bias=gate_out_proj_bias,
             transformer_impl="transformer_engine",
         )
         pg_collection = ProcessGroupCollection(
@@ -65,7 +69,7 @@ class TestKimiDeltaAttentionInference:
             cp=parallel_state.get_context_parallel_group(),
         )
         submodules = get_experimental_attention_variant_module_spec(config=config).submodules
-        cls.kda = KimiDeltaAttention(
+        kda = KimiDeltaAttention(
             config,
             submodules=submodules,
             layer_number=1,
@@ -76,7 +80,8 @@ class TestKimiDeltaAttentionInference:
             A_init_range=(1, 16),
             pg_collection=pg_collection,
         ).cuda().bfloat16()
-        cls.kda.eval()
+        kda.eval()
+        return kda
 
     @classmethod
     def teardown_class(cls):
@@ -84,10 +89,77 @@ class TestKimiDeltaAttentionInference:
 
     def test_packed_prefill_and_indexed_decode_match_full_sequence(self):
         """Packed prompts plus one recurrent step must match full-sequence KDA."""
+        self._assert_prefill_and_decode_match_full_sequence(self.kda, [5, 3])
+
+    def test_gate_output_bias_changes_prefill_and_decode(self):
+        """A legacy KDA gate bias must be used by both inference paths."""
+        unbiased = self._build_kda(gate_out_proj_bias=False)
+        biased = self._build_kda(gate_out_proj_bias=True)
+        # TE represents a disabled bias as an empty tensor rather than None.
+        assert unbiased.gate_out_proj.bias is None or unbiased.gate_out_proj.bias.numel() == 0
+        assert biased.gate_out_proj.bias is not None
+        assert biased.gate_out_proj.bias.numel() > 0
+        unbiased_params = dict(unbiased.named_parameters())
+        with torch.no_grad():
+            for name, parameter in biased.named_parameters():
+                if name in unbiased_params:
+                    parameter.copy_(unbiased_params[name])
+            biased.gate_out_proj.bias.fill_(0.5)
+
+        torch.manual_seed(456)
+        hidden = torch.randn(
+            5,
+            1,
+            biased.config.hidden_size,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        with torch.inference_mode():
+            unbiased_output = unbiased(hidden, None)[0]
+            biased_output = biased(hidden, None)[0]
+
+        assert (biased_output - unbiased_output).abs().max() > 1e-3
+
+        # Cover backends that return the projection bias separately.
+        original_gate = biased.gate_out_proj
+
+        class SeparateBiasProjection(torch.nn.Module):
+            def __init__(self, projection):
+                super().__init__()
+                self.weight = projection.weight
+                self.bias = projection.bias
+                self.input = None
+
+            def forward(self, input_):
+                self.input = input_
+                return F.linear(input_, self.weight), self.bias
+
+        separate_gate = SeparateBiasProjection(original_gate)
+        biased.gate_out_proj = separate_gate
+        with torch.inference_mode():
+            projected, _ = biased.in_proj(hidden)
+            _, gate, _, _ = biased._expand_low_rank_inputs(projected)
+            expected_gate = F.linear(separate_gate.input, original_gate.weight, original_gate.bias)
+        torch.testing.assert_close(gate, expected_gate, atol=2e-2, rtol=2e-2)
+        biased.gate_out_proj = original_gate
+
+        self._assert_prefill_and_decode_match_full_sequence(biased, [5, 3])
+
+    def test_per_channel_a_log_decode_matches_full_sequence(self, monkeypatch):
+        """Decode must apply a non-zero per-channel A_log like the training forward."""
+        monkeypatch.setenv("KDA_ALOG_PER_CHANNEL", "1")
+        kda = self._build_kda()
+        assert kda.A_log.numel() == kda.num_v_heads_local_tp * kda.key_head_dim
+        torch.manual_seed(7)
+        with torch.no_grad():
+            kda.A_log.copy_(torch.empty_like(kda.A_log).uniform_(1, 16).log())
+        self._assert_prefill_and_decode_match_full_sequence(kda, [37, 3])
+
+    @staticmethod
+    def _assert_prefill_and_decode_match_full_sequence(kda, prompt_lengths):
         torch.manual_seed(123)
         device = torch.cuda.current_device()
-        hidden_size = self.kda.config.hidden_size
-        prompt_lengths = [5, 3]
+        hidden_size = kda.config.hidden_size
         prompts = [
             torch.randn(length, 1, hidden_size, device=device, dtype=torch.bfloat16)
             for length in prompt_lengths
@@ -95,14 +167,14 @@ class TestKimiDeltaAttentionInference:
         next_tokens = torch.randn(2, 1, hidden_size, device=device, dtype=torch.bfloat16)
 
         with torch.no_grad():
-            reference_prompt_outputs = [self.kda(prompt, None)[0] for prompt in prompts]
+            reference_prompt_outputs = [kda(prompt, None)[0] for prompt in prompts]
             reference_decode_outputs = [
-                self.kda(torch.cat((prompt, next_tokens[i : i + 1]), dim=0), None)[0][-1]
+                kda(torch.cat((prompt, next_tokens[i : i + 1]), dim=0), None)[0][-1]
                 for i, prompt in enumerate(prompts)
             ]
 
             packed_prompt = torch.cat(prompts, dim=0)
-            projected_prompt, _ = self.kda.in_proj(packed_prompt)
+            projected_prompt, _ = kda.in_proj(packed_prompt)
             cu_seqlens_list = [0, prompt_lengths[0], sum(prompt_lengths)]
             cu_seqlens = torch.tensor(
                 cu_seqlens_list, dtype=torch.int32, device=device
@@ -131,7 +203,7 @@ class TestKimiDeltaAttentionInference:
                 batch_dimensions=SimpleNamespace(prefill_req_count=2),
             )
 
-            conv_shape, recurrent_shape = self.kda.kda_state_shapes_per_request()
+            conv_shape, recurrent_shape = kda.kda_state_shapes_per_request()
             conv_state = torch.zeros(
                 (3,) + conv_shape, dtype=torch.bfloat16, device=device
             )
@@ -139,10 +211,10 @@ class TestKimiDeltaAttentionInference:
                 (3,) + recurrent_shape, dtype=torch.float32, device=device
             )
 
-            packed_inner_output = self.kda._dynamic_inference_prefill(
+            packed_inner_output = kda._dynamic_inference_prefill(
                 projected_prompt, context, conv_state, recurrent_state
             )
-            packed_output, _ = self.kda.out_proj(packed_inner_output)
+            packed_output, _ = kda.out_proj(packed_inner_output)
 
             start = 0
             for length, reference in zip(prompt_lengths, reference_prompt_outputs):
@@ -158,21 +230,27 @@ class TestKimiDeltaAttentionInference:
                 ),
                 dim=0,
             )
-            projected_decode, _ = self.kda.in_proj(padded_next_tokens)
+            projected_decode, _ = kda.in_proj(padded_next_tokens)
             decode_indices = torch.tensor([0, 1, -1], dtype=torch.int32, device=device)
-            decode_inner_output = self.kda._dynamic_inference_decode(
+            decode_inner_output = kda._dynamic_inference_decode(
                 projected_decode,
                 conv_state,
                 recurrent_state,
                 decode_indices,
                 dummy_state_idx=2,
             )
-            decode_output, _ = self.kda.out_proj(decode_inner_output)
+            decode_output, _ = kda.out_proj(decode_inner_output)
 
             for i, reference in enumerate(reference_decode_outputs):
                 torch.testing.assert_close(
                     decode_output[i], reference, atol=3e-2, rtol=3e-2
                 )
+                # A wrong decay can stay inside the elementwise tolerance on
+                # small outputs; bf16 noise is ~0.5% of the norm.
+                relative_error = (decode_output[i] - reference).float().norm() / (
+                    reference.float().norm()
+                )
+                assert relative_error < 2e-2, relative_error
 
     def test_mixed_decode_and_packed_prefill_match_dense_sequences(self):
         """A decode request and a newly admitted prompt may share one engine step."""
