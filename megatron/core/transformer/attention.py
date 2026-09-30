@@ -946,7 +946,7 @@ class Attention(MegatronModule, ABC):
         else:  # decode only
             assert block_table is not None
             # If using MLA we use the FlashMLA kernel
-            if isinstance(self.config, MLATransformerConfig):
+            if isinstance(self.config, MLATransformerConfig) and hasattr(self, "softmax_scale"):
                 assert HAVE_FMLA
                 softmax_scale = self.softmax_scale
 

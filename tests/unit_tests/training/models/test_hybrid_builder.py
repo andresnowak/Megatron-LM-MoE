@@ -5,8 +5,15 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    hybrid_inference_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.transformer import ModuleSpec
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
 # ---------------------------------------------------------------------------
@@ -221,6 +228,36 @@ class TestHybridModelBuilderBuildModel:
             self.builder.build_model(self.pg, pre_process=True, post_process=True)
         call_kwargs = mock_model.call_args.kwargs
         assert call_kwargs["hybrid_stack_spec"] is mock_default
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_dsa_pattern_uses_real_default_provider(self, mock_model, *_):
+        self.config.hybrid_layer_pattern = "MDM"
+        self.builder.build_model(self.pg, pre_process=True, post_process=True)
+
+        spec = mock_model.call_args.kwargs["hybrid_stack_spec"]
+        assert spec is hybrid_stack_spec
+        dsa_spec = spec.submodules.dsa_layer
+        assert dsa_spec.module is TransformerLayer
+        attention_spec = dsa_spec.submodules.self_attention
+        assert attention_spec.module is MLASelfAttention
+        assert attention_spec.submodules.core_attention.module is DSAttention
+
+    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
+    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_dsa_pattern_uses_real_inference_provider(self, mock_model, *_):
+        self.config.hybrid_layer_pattern = "MDM"
+        self.config.transformer.transformer_impl = "inference_optimized"
+        self.builder.build_model(self.pg, pre_process=True, post_process=True)
+
+        spec = mock_model.call_args.kwargs["hybrid_stack_spec"]
+        assert spec is hybrid_inference_stack_spec
+        assert spec.submodules.dsa_layer.module is TransformerLayer
+        assert spec.submodules.dsa_layer.submodules.self_attention.module is MLASelfAttention
 
     @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)

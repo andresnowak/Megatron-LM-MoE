@@ -162,6 +162,30 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_ids == -1)
 
     @pytest.mark.internal
+    def test_dsa_and_mamba_use_separate_layer_maps(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=True,
+            layer_type_list=[
+                Symbols.DS_ATTENTION,
+                Symbols.MAMBA,
+                Symbols.DS_ATTENTION,
+                Symbols.MAMBA,
+            ],
+        )
+
+        assert dynamic_context.num_attention_layers == 2
+        assert dynamic_context.num_mamba_layers == 2
+        assert dynamic_context.layer_map == {0: 0, 1: 0, 2: 1, 3: 1}
+
+    @pytest.mark.internal
     def test_is_static_batching(self):
 
         dynamic_context = self._get_dynamic_context(
