@@ -22,6 +22,7 @@ from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.jit import jit_fuser
 from megatron.core.utils import get_model_config, internal_api, is_te_min_version, get_attr_wrapped_model
 
 if HAVE_TE:
@@ -1128,6 +1129,33 @@ def apply_router_token_dropping(
         final_probs = routing_probs * final_map
 
     return final_probs, final_map
+
+
+@jit_fuser
+def dropped_token_fraction(
+    routing_map: torch.Tensor,
+    dropped_routing_map: torch.Tensor,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fraction of token-expert assignments removed by the capacity limit.
+
+    Args:
+        routing_map (torch.Tensor): [num_tokens, num_experts] bool selection before dropping.
+        dropped_routing_map (torch.Tensor): The selection after apply_router_token_dropping.
+        padding_mask (torch.Tensor, optional): [num_tokens] bool mask, True for padding tokens.
+            Padding tokens are excluded from both the numerator and the denominator.
+
+    Returns:
+        torch.Tensor: 0-dim float32 tensor on the routing_map device. Fused, static shape and
+            no host sync, so it is cheap on every MoE layer and CUDA-graph safe.
+    """
+    dropped = routing_map & ~dropped_routing_map
+    if padding_mask is not None:
+        valid = ~padding_mask.unsqueeze(-1)
+        routing_map = routing_map & valid
+        dropped = dropped & valid
+    num_assigned = routing_map.sum(dtype=torch.float32)
+    return dropped.sum(dtype=torch.float32) / num_assigned.clamp(min=1.0)
 
 
 def expert_load_entropy(tokens_per_expert: torch.Tensor) -> torch.Tensor:

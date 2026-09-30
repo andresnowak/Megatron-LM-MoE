@@ -13,6 +13,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_router_token_dropping,
     clear_aux_losses_tracker,
     compute_qb_histogram,
+    dropped_token_fraction,
     get_capacity,
     get_moe_layer_wise_logging_tracker,
     qb_dual_update,
@@ -661,3 +662,56 @@ class TestQuantileBalancingCapacityFactor:
 
         assert torch.equal(routing_map, dropless_map)
         torch.testing.assert_close(probs, dropless_probs)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("drop_policy", ["probs", "position"])
+    def test_logs_dropped_token_fraction(self, drop_policy):
+        seq_length, bsz = 32, 2
+        logits = torch.randn(seq_length, bsz, self.num_moe_experts, device="cuda")
+        logits[..., :2] += 1.5
+        qb_beta = torch.zeros(self.num_moe_experts, device="cuda")
+        padding_mask = torch.zeros(seq_length, bsz, dtype=torch.bool, device="cuda")
+        padding_mask[-4:] = True
+        padding_mask = padding_mask.reshape(-1)
+
+        def logged():
+            # The tracker is process-global; clearing zeroes its entries but keeps them.
+            entry = get_moe_layer_wise_logging_tracker().get("dropped_token_fraction")
+            return None if entry is None else entry["values"]
+
+        _, dropless_map = self._route(self._router("histogram", None), logits, qb_beta)
+        assert logged() is None or not logged().any()
+
+        router = self._router("histogram", 0.5, drop_policy)
+        _, routing_map = self._route(router, logits, qb_beta, padding_mask)
+        expected = dropped_token_fraction(dropless_map, routing_map, padding_mask)
+        assert expected.item() > 0
+        torch.testing.assert_close(logged()[0], expected)
+        assert logged()[1].item() == 0
+
+        # A second microbatch accumulates; no_grad and eval passes are not counted.
+        router.routing(logits.clone().requires_grad_(), padding_mask=padding_mask)
+        with torch.no_grad():
+            router.routing(logits, padding_mask=padding_mask)
+        router.eval()
+        router.routing(logits, padding_mask=padding_mask)
+        torch.testing.assert_close(logged()[0], 2 * expected)
+
+
+def test_dropped_token_fraction_excludes_padding():
+    routing_map = torch.tensor([[1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 0]], dtype=torch.bool)
+    dropped_map = torch.tensor([[1, 0, 0], [1, 0, 1], [0, 1, 1], [0, 1, 0]], dtype=torch.bool)
+    # 8 assignments, 2 dropped.
+    torch.testing.assert_close(dropped_token_fraction(routing_map, dropped_map), torch.tensor(0.25))
+    # Row 3 is padding: 6 valid assignments, 1 of them dropped.
+    padding_mask = torch.tensor([False, False, False, True])
+    torch.testing.assert_close(
+        dropped_token_fraction(routing_map, dropped_map, padding_mask), torch.tensor(1 / 6)
+    )
+    # All padding: no division by zero.
+    all_padding = torch.ones(4, dtype=torch.bool)
+    assert dropped_token_fraction(routing_map, dropped_map, all_padding).item() == 0
+    # pad_to_capacity can add unselected entries to the kept map; they are not drops.
+    padded_map = dropped_map | torch.tensor([[0, 0, 1]] * 4, dtype=torch.bool)
+    torch.testing.assert_close(dropped_token_fraction(routing_map, padded_map), torch.tensor(0.25))

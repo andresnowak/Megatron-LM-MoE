@@ -16,6 +16,7 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_router_token_dropping,
     compute_qb_histogram,
     compute_routing_scores_for_aux_loss,
+    dropped_token_fraction,
     get_tokens_per_expert_and_token_count,
     qb_dual_update,
     router_gating_linear,
@@ -860,6 +861,37 @@ class TopKRouter(Router):
             self.seq_expert_load_samples.index_copy_(0, sample_index, seq_sample.unsqueeze(0))
         self.expert_load_sample_count.add_(1)
 
+    def _log_dropped_token_fraction(
+        self,
+        routing_map: torch.Tensor,
+        dropped_routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
+        """Log the fraction of valid token-expert assignments the capacity factor dropped.
+
+        Recorded only in training with grad enabled, like the aux losses: under activation
+        recompute the no-grad forward is skipped and the recompute is counted, so each
+        microbatch counts once. The logged value is the mean over microbatches and over
+        TP/DP/CP ranks, which equals the global fraction when every microbatch has the same
+        number of valid tokens.
+        """
+        if not (self.training and torch.is_grad_enabled()):
+            return
+        fraction = dropped_token_fraction(routing_map, dropped_routing_map, padding_mask)
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+        layer_number = (
+            self.layer_number + self.config.num_layers if self.is_mtp_layer else self.layer_number
+        )
+        save_to_aux_losses_tracker(
+            "dropped_token_fraction",
+            fraction,
+            layer_number,
+            num_layers,
+            avg_group=self.tp_dp_cp_group,
+        )
+
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function
 
@@ -911,6 +943,7 @@ class TopKRouter(Router):
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
+            dropless_routing_map = routing_map
             probs, routing_map = apply_router_token_dropping(
                 probs,
                 routing_map,
@@ -921,6 +954,7 @@ class TopKRouter(Router):
                 drop_priority=drop_priority,
                 padding_mask=padding_mask,
             )
+            self._log_dropped_token_fraction(dropless_routing_map, routing_map, padding_mask)
 
         # Apply each aux loss type and attach aux loss autograd function to probs
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
