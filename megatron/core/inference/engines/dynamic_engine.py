@@ -19,6 +19,10 @@ import torch
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
+from megatron.core.inference.batch_dimensions_utils import (
+    CUDAGraphBatchDimensionBuilder,
+    InferenceBatchDimensions,
+)
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
@@ -252,6 +256,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
+        self.cuda_graph_all_prefills = inference_config.cuda_graph_all_prefills
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
@@ -260,6 +265,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
+        # Throw a cudagraph-admission warning if deferred for > max_sequence_length steps.
+        # The floor avoids warnings in small test configs.
+        self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
         # Initialize engine.
         self.reset()
 
@@ -1592,6 +1600,21 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.context.check_availability(req)
             )
             if request_can_be_added and request_tokens_can_be_added and kv_cache_available:
+                if self._cg_admission_gating_active():
+                    # Prefix caching can reduce the tokens actually submitted for prefill.
+                    # Gate on that effective length so a raw prompt length cannot defer a
+                    # request whose captured shape is valid after prefix skipping.
+                    effective_prefill_tokens = self.context._compute_prefix_match(
+                        req, req.remaining_prompt_length
+                    )[-1]
+                    candidate = InferenceBatchDimensions(
+                        token_count=self.context.active_token_count + effective_prefill_tokens,
+                        prefill_req_count=self.context.num_prefill_requests + 1,
+                        decode_req_count=self.context.num_decode_requests,
+                    )
+                    if not self._cg_admission_check(req, candidate):
+                        break
+
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
@@ -1610,6 +1633,68 @@ class DynamicInferenceEngine(AbstractEngine):
         # Prepend pending request ids to waiting queue.
         if prefix_caching_enabled and pending_request_ids:
             self.waiting_request_ids.extendleft(reversed(pending_request_ids))
+
+    def _cg_admission_gating_active(self) -> bool:
+        """Whether prefill admission should be aligned to captured CUDA graphs."""
+        return (
+            self.cuda_graph_all_prefills
+            and self.context.use_cuda_graphs_for_non_decode_steps
+            and bool(self.context.cuda_graph_batch_dimensions_list)
+        )
+
+    def _find_cg_chunk_size(self, max_chunk_tokens: int) -> Optional[int]:
+        """Return the largest compatible captured-graph chunk within the token budget."""
+        active_tok = self.context.active_token_count
+        active_prefills = self.context.num_prefill_requests
+        active_decodes = self.context.num_decode_requests
+        strict = self.context.is_hybrid_model or self.context.has_kda
+        best_chunk_tokens = 0
+
+        # Examine captured boundaries independently: token sizes can be noncontiguous and P/D
+        # compatibility is not monotonic across graph shapes, so do not binary-search this list.
+        for graph_dim in self.context.cuda_graph_batch_dimensions_list:
+            chunk_tokens = graph_dim.token_count - active_tok
+            if not 1 <= chunk_tokens <= max_chunk_tokens:
+                continue
+            candidate = InferenceBatchDimensions(
+                token_count=graph_dim.token_count,
+                prefill_req_count=active_prefills + 1,
+                decode_req_count=active_decodes,
+            )
+            if graph_dim.is_applicable_for_batch_dim(candidate, strict=strict):
+                best_chunk_tokens = max(best_chunk_tokens, chunk_tokens)
+        return best_chunk_tokens or None
+
+    def _register_cg_wait(self, req: DynamicInferenceRequest) -> None:
+        """Track a consecutive CUDA-graph admission deferral and warn on starvation."""
+        req.cg_wait_iters += 1
+        if req.cg_wait_iters % self._cg_admission_warn_after == 0:
+            logging.warning(
+                "request %d has been deferred by CG-aware admission for %d steps — "
+                "possible starvation (strict=%s, active P=%d D=%d tok=%d)",
+                req.request_id,
+                req.cg_wait_iters,
+                self.context.is_hybrid_model or self.context.has_kda,
+                self.context.num_prefill_requests,
+                self.context.num_decode_requests,
+                self.context.active_token_count,
+            )
+
+    def _cg_admission_check(
+        self, req: DynamicInferenceRequest, candidate: InferenceBatchDimensions
+    ) -> bool:
+        """Return whether a candidate matches a captured graph; record misses as waits."""
+        matched_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
+            real_batch_dim=candidate,
+            cuda_graph_batch_dimensions_list=self.context.cuda_graph_batch_dimensions_list,
+            strict=self.context.is_hybrid_model or self.context.has_kda,
+            match_ep_token_counts=False,
+        )
+        if matched_graph is not None:
+            req.cg_wait_iters = 0
+            return True
+        self._register_cg_wait(req)
+        return False
 
     def schedule_chunked_prefill(self):
         """
@@ -1663,25 +1748,42 @@ class DynamicInferenceEngine(AbstractEngine):
             if mamba_caching_enabled and not is_continuing_chunked_prefill:
                 req._mamba_num_matched_blocks = self._find_mamba_match_count(req)
 
-            # Use remaining prompt tokens for scheduling decisions
+            # Use remaining prompt tokens for scheduling decisions.
             remaining_len = len(req.remaining_prompt_tokens)
-            token_fully_can_be_added = (
-                self.context.active_token_count + remaining_len <= self.context.max_tokens
-            )
             token_partially_can_be_added = self.context.active_token_count < self.context.max_tokens
             request_can_be_added, _, kv_cache_available = self.context.check_availability(req)
             request_can_be_added = is_continuing_chunked_prefill or request_can_be_added
 
-            if request_can_be_added and kv_cache_available:
-                if token_fully_can_be_added:
-                    # Add these hashes to pending.
-                    if prefix_caching_enabled:
-                        for block_hash in req.precomputed_block_hashes:
-                            if (
-                                block_hash
-                                not in self.context.kv_block_allocator.kv_hash_to_block_id
-                            ):
-                                pending_block_hashes.add(block_hash)
+            if request_can_be_added and kv_cache_available and token_partially_can_be_added:
+                token_budget = self.context.max_tokens - self.context.active_token_count
+                max_chunk = min(remaining_len, token_budget)
+
+                # An in-flight chunk must progress even if its next shape is not captured.
+                if self._cg_admission_gating_active() and not is_continuing_chunked_prefill:
+                    snapped_chunk = self._find_cg_chunk_size(max_chunk)
+                    prefill_chunk_length = snapped_chunk if snapped_chunk is not None else max_chunk
+                    # A chunked miss uses the documented eager fallback, not a CG deferral.
+                    req.cg_wait_iters = 0
+                else:
+                    prefill_chunk_length = max_chunk
+
+                # Flash-attn requires at least two tokens in the final prefill chunk.
+                # A snapped shape remains covered after reducing its token count by one.
+                if remaining_len - prefill_chunk_length == 1:
+                    if prefill_chunk_length > 1:
+                        prefill_chunk_length -= 1
+                    else:
+                        # One token of budget with two remaining tokens cannot make progress.
+                        can_schedule = False
+                        break
+
+                # Reserve hashes only once this request can actually be admitted.
+                if prefix_caching_enabled:
+                    for block_hash in req.precomputed_block_hashes:
+                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                            pending_block_hashes.add(block_hash)
+
+                if prefill_chunk_length >= remaining_len:
                     self.context.chunked_prefill_request_id = -1
                     self.context.add_request(req)
                     self._loop.call_soon_threadsafe(
@@ -1689,35 +1791,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                     req.add_event_add_context()
-                    # Fully scheduled, so we remove from waiting pool
                     self.waiting_request_ids.popleft()
-                    # Only this case we keep checking the rest of the waiting queue
                     can_schedule = True
-                elif token_partially_can_be_added:
-                    # Add these hashes to pending.
-                    if prefix_caching_enabled:
-                        for block_hash in req.precomputed_block_hashes:
-                            if (
-                                block_hash
-                                not in self.context.kv_block_allocator.kv_hash_to_block_id
-                            ):
-                                pending_block_hashes.add(block_hash)
-                    prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
-
-                    # If this chunk would leave exactly 1 token for the final chunk, reduce
-                    # this chunk by 1 or skip scheduling so the final chunk has 2 tokens.
-                    # This avoids the edge case where max_seqlen_q=1 which results in a bug
-                    # with the Flash Attention kernel.
-                    # See https://github.com/Dao-AILab/flash-attention/issues/1537
-                    if remaining_len - prefill_chunk_length == 1:
-                        if prefill_chunk_length > 1:
-                            prefill_chunk_length -= 1
-                        else:
-                            # We only have space for 1 token, but remaining is 2.
-                            # Delay scheduling to avoid leaving exactly 1 token for the final chunk.
-                            can_schedule = False
-                            break
-
+                else:
+                    # Partial admit: schedule this chunk and keep the request at the queue head.
                     self.context.add_request(req, prefill_chunk_length=prefill_chunk_length)
                     self._loop.call_soon_threadsafe(
                         self._loop.create_task, self._notify_cond_for_new_request()
@@ -1725,9 +1802,6 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.chunked_prefill_request_id = req.request_id
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[prefill_chunk_length:]
                     req.finished_chunk_token_count += prefill_chunk_length
-                    # Still have tokens to prefill, so we break and keep the
-                    # chunked prefill request at the head of the waiting queue
-                    # Note that we do not need to continue check the queue, as the tokens are full
 
         # Prepend pending request ids to waiting queue.
         if prefix_caching_enabled and pending_request_ids:

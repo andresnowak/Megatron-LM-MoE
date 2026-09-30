@@ -366,6 +366,8 @@ class DynamicInferenceRequest(InferenceRequest):
     routing_indices: Optional[torch.Tensor] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+    # Consecutive steps deferred by CUDA-graph-aware admission, used for starvation warnings.
+    cg_wait_iters: int = 0
 
     # Prefix caching fields
     block_size_tokens: Optional[int] = None  # Block size for hash computation

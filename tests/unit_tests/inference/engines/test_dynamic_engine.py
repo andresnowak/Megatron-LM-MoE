@@ -1783,6 +1783,55 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    def test_chunked_prefill_skips_request_when_token_budget_exhausted(self):
+        """Do not schedule a zero-length chunk after the batch token budget is full."""
+        max_tokens = 16
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=None,
+            num_tokens_total=max_tokens,
+            context_max_tokens=max_tokens,
+            context_max_requests=2,
+            context_block_size_tokens=256,
+            max_sequence_length=128,
+            enable_chunked_prefill=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+            cuda_graph_all_prefills=True,
+        )
+
+        env = self._build_test_env(test_config)
+        ctx = env.engine.context
+        assert env.engine.cuda_graph_all_prefills
+        model_instance = env.engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+
+        req_a = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (max_tokens,), device="cuda"),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        req_b = DynamicInferenceRequest(
+            request_id=2,
+            prompt_tokens=torch.randint(0, test_config.vocab_size, (8,), device="cuda"),
+            sampling_params=SamplingParams(num_tokens_to_generate=1),
+        )
+        env.engine._add_request(req_a)
+        env.engine._add_request(req_b)
+        env.engine.schedule_waiting_requests()
+
+        assert ctx.active_token_count == max_tokens
+        assert ctx.total_request_count == 1
+        assert ctx.num_prefill_requests == 1
+        assert ctx.chunked_prefill_request_id == -1
+        assert req_b.finished_chunk_token_count == 0
+        assert list(env.engine.waiting_request_ids) == [2]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
     def test_prefix_caching_avoid_single_token_effective_chunk(self):
         """
         Test that prefix caching combined with chunked prefill avoids leaving exactly
