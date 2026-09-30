@@ -124,9 +124,7 @@ class KDAInferenceStateConfig:
         if not kda_layers:
             return None
 
-        conv_states_shape, recurrent_states_shape = kda_layers[0][
-            1
-        ].kda_state_shapes_per_request()
+        conv_states_shape, recurrent_states_shape = kda_layers[0][1].kda_state_shapes_per_request()
 
         return cls(
             kda_layer_map={layer_number: i for i, (layer_number, _) in enumerate(kda_layers)},
@@ -193,6 +191,16 @@ class CudaGraphSizingDistribution(str, Enum):
 
     EXPONENTIAL = "exponential"
     LINEAR = "linear"
+
+
+class AsyncScheduleMode(str, Enum):
+    """Async scheduling mode for dynamic inference."""
+
+    LEGACY = "legacy"
+    """Resolve requests before preparing the next forward pass."""
+
+    SERIAL = "serial"
+    """Prepare and forward speculatively before resolving sampled requests."""
 
 
 @dataclass
@@ -403,6 +411,9 @@ class InferenceConfig:
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference."""
 
+    async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
+    """Mode used to schedule dynamic batching inference work."""
+
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
     """Whether returned log-probs are modified by the sampling parameters or not."""
 
@@ -434,6 +445,7 @@ class InferenceConfig:
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
+        self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
         if not (0.0 <= self.prefix_caching_routing_alpha <= 1.0):
             raise ValueError(
                 f"prefix_caching_routing_alpha must be in [0, 1], "

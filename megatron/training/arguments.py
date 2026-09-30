@@ -2182,6 +2182,11 @@ def _add_inference_args(parser):
                        choices=['torch', 'flashinfer'],
                        help='Which sampling kernels to use during inference. '
                             'Selecting "flashinfer" requires the flashinfer package.')
+    group.add_argument('--inference-dynamic-batching-async-sched-mode',
+                       type=str, default='legacy', choices=['legacy', 'serial'],
+                       help='Async scheduling mode for dynamic batching. "legacy" (default) '
+                            'preserves the existing resolve-before-prepare path; "serial" '
+                            'prepares and forwards decode-only steps before resolving finished requests.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],

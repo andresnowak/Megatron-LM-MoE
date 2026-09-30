@@ -23,7 +23,7 @@ from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
 )
-from megatron.core.inference.config import KVCacheManagementMode
+from megatron.core.inference.config import AsyncScheduleMode, KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     MaxSequenceLengthOverflowError,
@@ -265,6 +265,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
         self.cuda_graph_modules = model_config.cuda_graph_modules
+        self._validate_async_sched_support_for_config()
         # Throw a cudagraph-admission warning if deferred for > max_sequence_length steps.
         # The floor avoids warnings in small test configs.
         self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
@@ -418,9 +419,7 @@ class DynamicInferenceEngine(AbstractEngine):
             tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
             sp_enabled = model_config.sequence_parallel and tp_size > 1
             mtp_pass_depth = not mtp_model.mtp.mtp_use_repeated_layer
-            mtp_warmup_depths = (
-                range(controller._num_mtp_depths) if mtp_pass_depth else [None]
-            )
+            mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
             mtp_seen_batch_sizes = set()
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
@@ -963,9 +962,49 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return self.requests[request_id].record[-1]
 
+    def _validate_async_sched_support_for_config(self) -> None:
+        """Reject engine configurations unsupported by serial async scheduling."""
+        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+            return
+
+        model_config = self.controller.inference_wrapped_model.model.config
+        if self.num_speculative_tokens > 0:
+            raise ValueError("Async scheduling does not support speculative tokens.")
+        if self.context.is_hybrid_model:
+            raise ValueError("Async scheduling does not support hybrid/Mamba models.")
+        if self.context.has_kda:
+            raise ValueError("Async scheduling does not support KDA models.")
+        if self.context.enable_prefix_caching:
+            raise ValueError("Async scheduling does not support prefix caching.")
+        if not self.materialize_only_last_token_logits:
+            raise ValueError("Async scheduling requires materialize_only_last_token_logits=True.")
+        if model_config.expert_model_parallel_size > 1:
+            raise ValueError("Async scheduling does not support expert parallelism.")
+        if model_config.num_moe_experts is not None:
+            raise ValueError("Async scheduling does not support MoE models.")
+        if model_config.moe_enable_routing_replay:
+            raise ValueError("Async scheduling does not support routing replay.")
+
+    def _validate_async_sched_support_for_request(self, request: DynamicInferenceRequest) -> None:
+        """Reject requests unsupported by serial async scheduling before adding them."""
+        if self.context.config.async_sched_mode != AsyncScheduleMode.SERIAL:
+            return
+
+        sampling_params = request.sampling_params
+        if sampling_params.top_k != 1 or sampling_params.top_p != 0.0:
+            raise ValueError(
+                "Async scheduling only supports greedy sampling "
+                "(SamplingParams.top_k == 1 and top_p == 0.0)."
+            )
+        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
+            raise ValueError("Async scheduling does not support log probabilities.")
+        if sampling_params.stop_words:
+            raise ValueError("Async scheduling does not support stop words.")
+
     def _add_request(
         self, request: DynamicInferenceRequest
     ) -> asyncio.Future[DynamicInferenceRequest]:
+        self._validate_async_sched_support_for_request(request)
 
         request_id = request.request_id
 
@@ -1223,9 +1262,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     len(request.generated_tokens) + len(tokens)
                     >= request.sampling_params.num_tokens_to_generate
                 ):
-                    remaining_tokens = (
-                        request.sampling_params.num_tokens_to_generate
-                        - len(request.generated_tokens)
+                    remaining_tokens = request.sampling_params.num_tokens_to_generate - len(
+                        request.generated_tokens
                     )
                     num_length_trim = len(tokens) - remaining_tokens
                     tokens = tokens[:remaining_tokens]
@@ -2192,15 +2230,9 @@ class DynamicInferenceEngine(AbstractEngine):
             return local_work
 
         global_work = torch.tensor(
-            local_work,
-            dtype=torch.int32,
-            device=torch.cuda.current_device(),
+            local_work, dtype=torch.int32, device=torch.cuda.current_device()
         )
-        torch.distributed.all_reduce(
-            global_work,
-            op=torch.distributed.ReduceOp.MAX,
-            group=ep_group,
-        )
+        torch.distributed.all_reduce(global_work, op=torch.distributed.ReduceOp.MAX, group=ep_group)
         return bool(global_work.item())
 
     def _run_ep_dummy_step(self) -> None:

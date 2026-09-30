@@ -30,11 +30,11 @@ from megatron.core.inference.unified_memory import (
 )
 from megatron.core.inference.utils import device_memory_summary, tensor_swap
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     get_layer_maps_from_layer_type_list,
 )
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
@@ -285,8 +285,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.prefix_cache_hits = 0  # requests that matched at least one cached block
         self.prefix_cache_blocks_matched = 0  # total matched blocks across all requests
 
-        # Engine step counter (used for logging, metrics, and event tracking)
+        # Engine step counters (used for logging, metrics, and event tracking)
         self.step_count = 0
+        self.async_sched_step_count = 0
+        self.async_sched_compaction_step_count = 0
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -350,9 +352,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         kda_inference_state_config = inference_config.kda_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
         self.has_kda = kda_inference_state_config is not None
-        assert not (self.is_hybrid_model and self.has_kda), (
-            "Models containing both Mamba and KDA layers are not supported yet"
-        )
+        assert not (
+            self.is_hybrid_model and self.has_kda
+        ), "Models containing both Mamba and KDA layers are not supported yet"
 
         if self.has_kda:
             assert cp_size == 1, "Dynamic KDA inference currently requires CP=1"
@@ -377,14 +379,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
             # layer type.
-            (
-                mamba_layer_map,
-                gdn_layer_map,
-                attention_layer_map,
-                _,
-                _,
-            ) = get_layer_maps_from_layer_type_list(
-                mamba_inference_state_config.layer_type_list
+            (mamba_layer_map, gdn_layer_map, attention_layer_map, _, _) = (
+                get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list)
             )
             dsa_layer_map = {}
 
@@ -698,7 +694,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             else:
                 moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
                 NVLSAllGatherVDispatcher.allocate_buffers(
-                    per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
+                    per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens)
+                    // tp_size,
                     topk=model_config.moe_router_topk,
                     hidden_size=moe_hidden_size,
                     ep_group=self.expert_model_parallel_group,
@@ -1175,17 +1172,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             _off : _off + _req_int32_bytes
         ].view(torch.int32)
         _off += _req_int32_bytes
-        self._staging_temperature = self._cpu_bookkeeping_buf[
-            _off : _off + _req_int32_bytes
-        ].view(torch.float32)
+        self._staging_temperature = self._cpu_bookkeeping_buf[_off : _off + _req_int32_bytes].view(
+            torch.float32
+        )
         _off += _req_int32_bytes
-        self._staging_top_k = self._cpu_bookkeeping_buf[
-            _off : _off + _req_int32_bytes
-        ].view(torch.int32)
+        self._staging_top_k = self._cpu_bookkeeping_buf[_off : _off + _req_int32_bytes].view(
+            torch.int32
+        )
         _off += _req_int32_bytes
-        self._staging_top_p = self._cpu_bookkeeping_buf[
-            _off : _off + _req_int32_bytes
-        ].view(torch.float32)
+        self._staging_top_p = self._cpu_bookkeeping_buf[_off : _off + _req_int32_bytes].view(
+            torch.float32
+        )
         _off += _req_int32_bytes
         self.active_request_last_token_idxs = self._cpu_bookkeeping_buf[
             _off : _off + _req_int32_bytes
@@ -1637,10 +1634,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Return the convolution and recurrent KDA buffers for one layer."""
         assert self.has_kda, "The model does not have KDA inference states"
         kda_layer_number = self.kda_layer_map[layer_number - 1]
-        return (
-            self.kda_conv_states[kda_layer_number],
-            self.kda_recurrent_states[kda_layer_number],
-        )
+        return (self.kda_conv_states[kda_layer_number], self.kda_recurrent_states[kda_layer_number])
 
     def _allocate_kda_slot(self, request_idx: int, request_id: int) -> None:
         """Allocate and zero the KDA state slot for a newly admitted request."""
@@ -2380,9 +2374,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def _execute_pending_mamba_ops(self) -> None:
         """Execute deferred Mamba and KDA state initialization operations."""
         if not (
-            self._pending_mamba_restores
-            or self._pending_mamba_zeros
-            or self._pending_kda_zeros
+            self._pending_mamba_restores or self._pending_mamba_zeros or self._pending_kda_zeros
         ):
             return
 
@@ -2517,8 +2509,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
-        # Reset step counter and LRU clock
+        # Reset step counters and LRU clock
         self.step_count = 0
+        self.async_sched_step_count = 0
+        self.async_sched_compaction_step_count = 0
         self.prefix_cache_lru_clock = 0
 
         # Reset chunked prefill state
@@ -3311,6 +3305,160 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
+    def prepare_requests(self, new_tokens: Tensor) -> None:
+        """Prepare decode requests for the next async-scheduled forward pass.
+
+        This path only supports decode steps that need no pause, eviction, or resume
+        lifecycle changes. If any request needs a new KV block that is unavailable,
+        the caller receives an error instead of changing the active request set.
+
+        Args:
+            new_tokens (Tensor): Newly sampled token for each active request.
+        """
+        if new_tokens.is_cuda:
+            new_tokens = new_tokens.cpu()
+
+        active_request_count = self.total_request_count - self.paused_request_count
+        if self.num_speculative_tokens != 0:
+            raise RuntimeError("Async scheduling does not support speculative tokens.")
+        if self.num_prefill_requests != 0:
+            raise RuntimeError("Async scheduling only supports decode-only steps.")
+        if self.paused_request_count != 0:
+            raise RuntimeError("Async scheduling does not support paused requests.")
+        if self.has_kda:
+            raise RuntimeError("Async scheduling does not support KDA models.")
+        if new_tokens.numel() != active_request_count:
+            raise RuntimeError(
+                f"Expected {active_request_count} new tokens, got {new_tokens.numel()}."
+            )
+
+        if active_request_count == 0:
+            self.active_token_count = 0
+            return
+
+        active_slice = slice(0, active_request_count)
+        rows_requiring_new_block = (
+            self.request_last_kv_block_offset[active_slice] >= self.block_size_tokens - 1
+        )
+        num_new_blocks = rows_requiring_new_block.sum().item()
+        if num_new_blocks > 0:
+            active_block_count_avail = self.kv_block_allocator.get_active_avail()
+            if num_new_blocks > active_block_count_avail:
+                raise RuntimeError("Async scheduling cannot pause requests to allocate new blocks.")
+
+            block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
+            if block_ids is None:
+                raise RuntimeError("Async scheduling cannot evict requests to allocate new blocks.")
+
+            row_idx = torch.nonzero(rows_requiring_new_block, as_tuple=True)[0]
+            col_idx = self.request_kv_block_counts[row_idx]
+            self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
+            self.request_kv_block_counts[row_idx] += 1
+            self.request_last_kv_block_id[row_idx] = block_ids
+
+        self.request_kv_length_offsets[active_slice].add_(self.request_query_lengths[active_slice])
+        self.request_query_lengths[active_slice].fill_(1)
+        self.request_last_kv_block_offset[active_slice] = (
+            self.request_last_kv_block_offset[active_slice] + 1
+        ) % self.block_size_tokens
+
+        self.active_token_count = active_request_count
+        self.token_to_input_ids[:active_request_count] = new_tokens
+        self.token_to_pos_ids[:active_request_count] = self.request_kv_length_offsets[active_slice]
+        self.token_to_request_idx[:active_request_count] = torch.arange(
+            active_request_count, device='cpu'
+        )
+        self.token_to_position_in_request[:active_request_count] = self.token_to_pos_ids[
+            :active_request_count
+        ]
+        self.token_to_local_position_within_kv_block[:active_request_count] = (
+            self.token_to_pos_ids[:active_request_count] % self.block_size_tokens
+        )
+        self.token_to_block_idx[:active_request_count] = self.request_last_kv_block_id[active_slice]
+
+    def resolve_requests(self, active_requests_mask: Tensor) -> Tensor:
+        """Resolve finished requests and compact surviving async decode rows.
+
+        Async scheduling supports request completion only. Active request rows and
+        their current decode-token rows are compacted in survivor order.
+
+        Args:
+            active_requests_mask (Tensor): Mask of requests that remain active.
+
+        Returns:
+            Tensor: Request IDs for requests that finished during resolution.
+        """
+        if active_requests_mask.is_cuda:
+            active_requests_mask = active_requests_mask.cpu()
+
+        if self.num_speculative_tokens != 0:
+            raise RuntimeError("Async scheduling does not support speculative tokens.")
+        if self.num_prefill_requests != 0:
+            raise RuntimeError("Async scheduling only supports decode-only steps.")
+        if self.paused_request_count != 0:
+            raise RuntimeError("Async scheduling does not support paused requests.")
+        if self.has_kda:
+            raise RuntimeError("Async scheduling does not support KDA models.")
+
+        old_active_request_count = self.total_request_count
+        if active_requests_mask.numel() != old_active_request_count:
+            raise RuntimeError(
+                f"Expected active mask of length {old_active_request_count}, "
+                f"got {active_requests_mask.numel()}."
+            )
+
+        survivor_idxs = torch.nonzero(active_requests_mask == 1, as_tuple=True)[0]
+        finished_idxs = torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
+        finished_request_ids = self.request_ids[finished_idxs].clone()
+
+        self.reset_attention_state()
+
+        if finished_idxs.numel() > 0:
+            self.release_memory_blocks_from_request_indexes(finished_idxs)
+
+        active_request_count = survivor_idxs.numel()
+        if active_request_count == 0:
+            self.request_to_kv_block_ids.fill_(-1)
+            self.total_request_count = 0
+            self.active_token_count = 0
+            self.reset_mamba_state()
+            return finished_request_ids
+
+        dst_idxs = torch.arange(active_request_count, device='cpu')
+        if not torch.equal(survivor_idxs, dst_idxs):
+            self.request_kv_length_offsets[dst_idxs] = self.request_kv_length_offsets[survivor_idxs]
+            self.request_in_prefill_status_tensor[dst_idxs] = self.request_in_prefill_status_tensor[
+                survivor_idxs
+            ]
+            self.request_query_lengths[dst_idxs] = self.request_query_lengths[survivor_idxs]
+            self.request_output_lengths[dst_idxs] = self.request_output_lengths[survivor_idxs]
+            self.request_ids[dst_idxs] = self.request_ids[survivor_idxs]
+            self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[survivor_idxs]
+            self.request_kv_block_counts[dst_idxs] = self.request_kv_block_counts[survivor_idxs]
+            self.request_last_kv_block_id[dst_idxs] = self.request_last_kv_block_id[survivor_idxs]
+            self.request_last_kv_block_offset[dst_idxs] = self.request_last_kv_block_offset[
+                survivor_idxs
+            ]
+            for metadata_tensor in self.request_metadata.values():
+                metadata_tensor[dst_idxs] = metadata_tensor[survivor_idxs]
+
+            self.token_to_input_ids[dst_idxs] = self.token_to_input_ids[survivor_idxs]
+            self.token_to_pos_ids[dst_idxs] = self.token_to_pos_ids[survivor_idxs]
+            self.token_to_block_idx[dst_idxs] = self.token_to_block_idx[survivor_idxs]
+            self.token_to_local_position_within_kv_block[dst_idxs] = (
+                self.token_to_local_position_within_kv_block[survivor_idxs]
+            )
+            self.token_to_position_in_request[dst_idxs] = self.token_to_position_in_request[
+                survivor_idxs
+            ]
+
+        self.token_to_request_idx[:active_request_count] = dst_idxs
+        self.request_to_kv_block_ids[active_request_count:old_active_request_count] = -1
+        self.total_request_count = active_request_count
+        self.active_token_count = active_request_count
+        self.num_prefill_requests = 0
+        return finished_request_ids
+
     def update_requests(
         self,
         active_requests_mask: Tensor,
@@ -3790,9 +3938,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         active_request_slice = slice(self.paused_request_count, self.total_request_count)
         md = self.request_metadata
-        temperature = md["temperature"][active_request_slice].to(
-            logits.device, torch.float32
-        )[row_to_request]
+        temperature = md["temperature"][active_request_slice].to(logits.device, torch.float32)[
+            row_to_request
+        ]
         top_k = md["top_k"][active_request_slice].to(logits.device, torch.long)[row_to_request]
         top_p = md["top_p"][active_request_slice].to(logits.device, torch.float32)[row_to_request]
         return sampling.log_probs_kernel(logits, temperature, top_k, top_p)

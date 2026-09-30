@@ -136,6 +136,10 @@ class InferenceSetupConfig:
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""
 
+    inference_dynamic_batching_async_sched_mode: Literal["legacy", "serial"] = "legacy"
+    """Async scheduling mode for dynamic batching. "legacy" preserves the existing scheduling path;
+    "serial" prepares and forwards decode-only steps before resolving finished requests."""
+
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
     )
@@ -274,6 +278,7 @@ class InferenceSetupConfig:
             A fully-populated runtime ``InferenceConfig``.
         """
         from megatron.core.inference.config import (
+            AsyncScheduleMode,
             CudaGraphSizingDistribution,
             InferenceConfig,
             KDAInferenceStateConfig,
@@ -364,5 +369,8 @@ class InferenceSetupConfig:
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
+            async_sched_mode=AsyncScheduleMode(
+                self.inference_dynamic_batching_async_sched_mode
+            ),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
         )
