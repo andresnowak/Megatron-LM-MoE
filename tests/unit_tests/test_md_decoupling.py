@@ -934,7 +934,7 @@ def test_md_projected_row_gain_reshards(tmp_path_dist_ckpt):
                 'linear.weight',
                 param,
                 (0, rank, fragments),
-                replica_id=(0, 0, 0),
+                replica_id=(0, 0, Utils.rank),
             )
             optimizer = MDDecoupling(
                 params=[param],
@@ -1306,7 +1306,11 @@ def _md_sharded_optimizer(param):
 
 
 def _linear_weight_sharded_state(param):
-    return {'linear.weight': ShardedTensor.from_rank_offsets('linear.weight', param)}
+    return {
+        'linear.weight': ShardedTensor.from_rank_offsets(
+            'linear.weight', param, replica_id=Utils.rank
+        )
+    }
 
 
 def test_md_decoupling_torch_dist_round_trips_gain_tensors(tmp_path_dist_ckpt):
