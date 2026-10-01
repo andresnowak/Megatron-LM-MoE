@@ -206,12 +206,8 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import (
-    track_moe_metrics, 
-    clear_aux_losses_tracker,
-    save_router_state,
-    restore_router_state,
-)
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.moe.moe_utils import save_router_state, restore_router_state
 from megatron.core.transformer.moe.experts_offloading_fp8_util import (
     FP8ExpertsParameterManager,
     OffloadingFP8Config,
@@ -1051,7 +1047,6 @@ def pretrain(
         )
         set_ideal_affinity_for_current_gpu()
 
-
     if cfg_container.logger.log_progress:
         append_to_progress_log(args.save, "Starting job")
 
@@ -1199,9 +1194,7 @@ def pretrain(
     )
     # upon state restore, clear moe metrics to avoid double counting
     rerun_state_machine.register_state_save_restore_funcs(
-        "moe_metrics",
-        lambda: None,
-        lambda state: clear_aux_losses_tracker(),
+        "moe_metrics", lambda: None, lambda state: get_moe_metrics_tracker().clear()
     )
 
     # Build a separate inference model for RL if requested.
@@ -1825,7 +1818,6 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
     }
     kwargs.update({name: value for name, value in overrides.items() if name in ddp_fields})
     return DistributedDataParallelConfig(**kwargs)
-
 
 
 def _dense_model_config_for_upcycling(model_config, moe_ffn_hidden_size, granularity):
@@ -2559,6 +2551,7 @@ def training_log(
             wandb_writer.log(md_gain_stats, iteration)
 
     # Log MoE metrics.
+    moe_log_string = ""
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -2614,12 +2607,11 @@ def training_log(
         else:
             layers = args.num_layers
 
-        track_moe_metrics(
+        moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,
-            total_loss_dict=total_loss_dict,
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
@@ -2627,6 +2619,7 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
+            total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
@@ -2752,6 +2745,8 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+        if args.num_experts is not None and moe_log_string:
+            log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
@@ -3761,7 +3756,7 @@ def train(
             if args.log_energy:
                 energy_monitor.resume()
             if args.num_experts is not None:
-                clear_aux_losses_tracker()
+                get_moe_metrics_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
