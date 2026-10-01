@@ -188,6 +188,7 @@ from megatron.core.optimizer.muon_logging import (
     collect_md_gain_stats,
     collect_muon_stats,
 )
+from megatron.core.transformer.moe import router_input_logging
 from megatron.core.optimizer.router_update_logging import (
     collect_router_update_stats,
     pop_router_update_stats,
@@ -3374,6 +3375,12 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
+            # Router-input diagnostics: record during this step's forwards; collected below.
+            log_router_input = bool(
+                args.router_input_log_interval
+                and (iteration + 1) % args.router_input_log_interval == 0
+            )
+            router_input_logging.set_active(log_router_input, args.router_diag_layers)
             (
                 loss_dict,
                 skipped_iter,
@@ -3506,6 +3513,14 @@ def train(
         router_update_stats = pop_router_update_stats()
         if router_update_stats:
             md_gain_stats = {**(md_gain_stats or {}), **router_update_stats}
+        if router_input_logging.is_active():
+            router_input_stats = router_input_logging.collect(
+                model,
+                args.num_layers + (args.mtp_num_layers or 0),
+                zero_centered_gamma=getattr(config, "layernorm_zero_centered_gamma", False),
+            )
+            if router_input_stats:
+                md_gain_stats = {**(md_gain_stats or {}), **router_input_stats}
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:

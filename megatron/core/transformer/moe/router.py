@@ -27,6 +27,7 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
     z_loss_func,
 )
+from megatron.core.transformer.moe import router_input_logging
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -1044,6 +1045,12 @@ class TopKRouter(Router):
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
+
+        if router_input_logging.is_active() and self.layer_number is not None:
+            layer_index = self.layer_number - 1
+            if getattr(self, "is_mtp_layer", False):
+                layer_index += self.config.num_layers
+            router_input_logging.record(layer_index, input, logits, padding_mask)
 
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
