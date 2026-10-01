@@ -228,6 +228,11 @@ class LoggerConfig:
     muon_log_interval: int | None = None
     """Muon logging interval. Defaults to log_interval when unset."""
 
+    router_update_log_interval: int | None = None
+    """If set, every N steps log per-layer MoE router update statistics: the per-expert relative
+    update ||dW_i|| / ||W_i||, the row rotation angle, and the row norm change. Costs one router
+    weight copy and one small all-reduce on logged steps. Disabled when unset."""
+
     muon_sparsity_thresholds: list[float] = field(
         default_factory=lambda: [1e-20, 1e-10, 1e-30]
     )

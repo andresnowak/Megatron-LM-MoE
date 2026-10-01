@@ -188,6 +188,11 @@ from megatron.core.optimizer.muon_logging import (
     collect_md_gain_stats,
     collect_muon_stats,
 )
+from megatron.core.optimizer.router_update_logging import (
+    collect_router_update_stats,
+    pop_router_update_stats,
+    snapshot_router_weights,
+)
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -2077,11 +2082,24 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     skip_reduce_check = args.skip_reduce_check and \
         (args.optimizer == 'md_decoupling' and isinstance(optimizer, LayerWiseDistributedOptimizer))
 
+    # Router relative-update logging: snapshot router rows before the step, compare after.
+    # `iteration` is the pre-increment count, so the logged step is iteration + 1.
+    log_router_update = (
+        args.router_update_log_interval
+        and iteration is not None
+        and (iteration + 1) % args.router_update_log_interval == 0
+    )
+    if log_router_update:
+        snapshot_router_weights(optimizer)
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    if log_router_update:
+        collect_router_update_stats(args.num_layers + (args.mtp_num_layers or 0))
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -3485,6 +3503,9 @@ def train(
                     log_sparsity=args.log_muon_sparsity,
                     log_param_rms=args.log_muon_param_rms,
                 )
+        router_update_stats = pop_router_update_stats()
+        if router_update_stats:
+            md_gain_stats = {**(md_gain_stats or {}), **router_update_stats}
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
