@@ -476,6 +476,29 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                                         is_embedding=is_embedding, is_router=is_router,
                                         is_merged_offload_expert=is_merged_offload_expert)
 
+    def load_state_dict(self, state_dict):
+        """Load optimizer state, keeping this run's per-group LR bounds.
+
+        Param groups (including max_lr / min_lr) are saved in the checkpoint, and
+        torch.optim.Optimizer.load_state_dict restores the saved values, so a changed
+        --matrix-lr / --router-lr / --output-lr on resume would be silently ignored. The
+        scheduler recomputes group['lr'] from max_lr / min_lr every step, so restoring the
+        configured bounds after the load is enough. Groups are matched by position, which is
+        how torch pairs saved and current groups.
+        """
+        configured = [(g.get('max_lr'), g.get('min_lr')) for g in self.param_groups]
+        super().load_state_dict(state_dict)
+        for i, (group, (max_lr, min_lr)) in enumerate(zip(self.param_groups, configured)):
+            for key, value in (('max_lr', max_lr), ('min_lr', min_lr)):
+                if value is None:
+                    continue
+                if group.get(key) != value:
+                    logger.info(
+                        f"MDDecoupling param group {i}: {key} {group.get(key)} from checkpoint "
+                        f"-> {value} from current config"
+                    )
+                group[key] = value
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -1750,15 +1773,21 @@ def _mddecoupling_config_overrides(
     router_override: ParamGroupOverride = {}
     if config.md_router_use_orthogonal_updates is not None:
         router_override['use_orthogonal_updates'] = config.md_router_use_orthogonal_updates
-    if router_uses_adam:
-        # Adam routers use base lr (matrix_lr is Muon-tuned; doesn't fit Adam).
-        router_override['max_lr'] = config.lr
-        router_override['min_lr'] = _group_min_lr(config, config.lr)
+    # Router LR: explicit --router-lr wins on either branch; otherwise Adam routers use base lr
+    # (matrix_lr is Muon-tuned; doesn't fit Adam) and Muon routers fall through to matrix_lr.
+    router_lr = config.router_lr if config.router_lr is not None else (
+        config.lr if router_uses_adam else None
+    )
+    router_has_own_lr = router_lr is not None
+    if router_has_own_lr:
+        router_override['max_lr'] = router_lr
+        router_override['min_lr'] = _group_min_lr(config, router_lr)
     if router_override:
         overrides[ParamKey(attr='is_router')] = router_override
 
-    # Matrix LR for non-embedding/non-output matrix weights. Adam-branch routers are excluded — they
-    # get base lr from the router_override above.
+    # Matrix LR for non-embedding/non-output matrix weights. Routers with their own LR are
+    # excluded — they get it from the router_override above (two different max_lr overrides on
+    # one param would be a conflict).
     # Offloaded inplace-FP8 expert weights are stored as a merged 3D tensor (E, out, in),
     # but mathematically they are still per-expert matrices and must stay on the matrix LR schedule.
     non_emb_2d = ParamPredicate(
@@ -1766,7 +1795,7 @@ def _mddecoupling_config_overrides(
         fn=lambda p: (not getattr(p, "is_embedding_or_output_parameter", False)
                       and (len(p.shape) == 2 or getattr(p, "merged_offload_expert", False))
                       and not getattr(p, "is_kda_decay_parameter", False)
-                      and not (router_uses_adam and getattr(p, "is_router", False))),
+                      and not (router_has_own_lr and getattr(p, "is_router", False))),
     )
     overrides[ParamKey(predicate=non_emb_2d)] = {
         'max_lr': matrix_lr,
