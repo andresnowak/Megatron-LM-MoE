@@ -63,6 +63,22 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """
 
         self.pg_collection = pg_collection
+
+        intra_dp_cp = (
+            getattr(pg_collection, 'intra_dp_cp', None) if pg_collection is not None else None
+        )
+        # LayerWise assigns whole params to ranks of the full dp_cp group and all-gathers over
+        # that same group, so it has no notion of optimizer instances. With more than one
+        # instance, DDP reduce-scatters gradients over the smaller intra-instance group, so a
+        # rank would be asked to update params whose gradients it does not hold. Reject the
+        # combination instead of silently training on partial gradients.
+        assert intra_dp_cp is None or get_pg_size(intra_dp_cp) == get_pg_size(
+            pg_collection.dp_cp
+        ), (
+            "LayerWiseDistributedOptimizer does not support "
+            "num_distributed_optimizer_instances > 1."
+        )
+
         self.shard_params(optimizers)
 
         # Set up async all-gather using DDP bucket infrastructure.

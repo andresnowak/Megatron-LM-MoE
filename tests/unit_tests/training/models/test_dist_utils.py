@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core.enums import ModelType
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training.models.dist_utils import (
     _ddp_wrap,
     _print_num_params,
@@ -22,13 +23,17 @@ from megatron.training.models.dist_utils import (
 
 
 def _make_pg():
-    """Mock ProcessGroupCollection with dp, cp, tp, pp sub-groups."""
+    """Mock ProcessGroupCollection with full and intra-instance DP groups."""
     pg = Mock()
     pg.dp.rank.return_value = 0
     pg.cp.rank.return_value = 0
     pg.tp.rank.return_value = 0
     pg.pp.rank.return_value = 0
     pg.pp.size.return_value = 1
+    pg.dp_cp.size.return_value = 1
+    pg.expt_dp.size.return_value = 1
+    pg.intra_dp_cp.size.return_value = 1
+    pg.intra_expt_dp.size.return_value = 1
     return pg
 
 
@@ -628,11 +633,19 @@ class TestDdpWrapFullParamLayout:
 
     def setup_method(self):
         self.pg = _make_pg()
-        self._mpu_patcher = patch("megatron.training.models.dist_utils.mpu")
+        self.pg.dp_cp.size.return_value = 80
+        self.pg.expt_dp.size.return_value = 40
+        self.pg.intra_dp_cp.size.return_value = 30
+        self.pg.intra_expt_dp.size.return_value = 20
+        self.mpu_pg = _make_pg()
+        self.mpu_pg.dp_cp.size.return_value = 8
+        self.mpu_pg.expt_dp.size.return_value = 4
+        self.mpu_pg.intra_dp_cp.size.return_value = 4
+        self.mpu_pg.intra_expt_dp.size.return_value = 2
+        self._mpu_patcher = patch.object(
+            ProcessGroupCollection, "use_mpu_process_groups", return_value=self.mpu_pg
+        )
         self._mpu = self._mpu_patcher.start()
-        self._mpu.get_data_parallel_world_size.return_value = 4
-        self._mpu.get_pipeline_model_parallel_rank.return_value = 0
-        self._mpu.get_expert_data_parallel_world_size.return_value = 2
         self._opt_patcher = patch("megatron.training.models.dist_utils.DistributedOptimizer")
         self._opt = self._opt_patcher.start()
         self._opt.compute_full_param_layout.return_value = "LAYOUT"
@@ -647,6 +660,7 @@ class TestDdpWrapFullParamLayout:
         cfg.bucket_size = 8_000
         cfg.overlap_grad_reduce = True
         cfg.use_distributed_optimizer = True
+        cfg.num_distributed_optimizer_instances = 1
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
@@ -670,18 +684,58 @@ class TestDdpWrapFullParamLayout:
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
         chunk, param = self._make_chunk_with_params()
-        ddp_config = self._ddp_config()
+        ddp_config = self._ddp_config(num_distributed_optimizer_instances=2)
         _ddp_wrap([chunk], False, ddp_config, False, pg_collection=self.pg)
         self._opt.compute_full_param_layout.assert_called_once()
-        # full_param_layout passed through to DDP construction.
+        self._mpu.assert_called_once_with()
+        # full_param_layout passed through to DDP construction without changing its PG argument.
         assert mock_ddp.call_args.kwargs["full_param_layout"] == "LAYOUT"
-        # Layout call receives the requires_grad params, dp world size, ddp_config,
-        # and expert dp world size as a kwarg.
+        assert "pg_collection" not in mock_ddp.call_args.kwargs
+        # Standard DDP ignores the model/provider collection and resolves its MPU intra groups.
         layout_args = self._opt.compute_full_param_layout.call_args
         assert layout_args.args[0] == [param]
-        assert layout_args.args[2] == 4  # dp world size
+        assert layout_args.args[2] == self.mpu_pg.intra_dp_cp.size.return_value == 4
+        assert layout_args.args[2] != self.pg.intra_dp_cp.size.return_value
         assert layout_args.args[3] is ddp_config
-        assert layout_args.kwargs["expert_data_parallel_world_size"] == 2
+        assert (
+            layout_args.kwargs["expert_data_parallel_world_size"]
+            == (self.mpu_pg.intra_expt_dp.size.return_value)
+            == 2
+        )
+        assert (
+            layout_args.kwargs["expert_data_parallel_world_size"]
+            != self.pg.intra_expt_dp.size.return_value
+        )
+
+    @patch("megatron.training.models.dist_utils.DistributedDataParallel")
+    @patch("megatron.training.models.dist_utils.get_model_config")
+    @patch("torch.cuda.stream", new_callable=MagicMock)
+    @patch("torch.cuda.current_stream")
+    @patch("torch.cuda.Stream")
+    def test_layout_uses_mpu_groups_not_provider_groups_for_one_instance(
+        self, mock_stream, mock_curr, mock_ctx, mock_cfg, mock_ddp
+    ):
+        mock_ctx.return_value.__enter__ = Mock(return_value=None)
+        mock_ctx.return_value.__exit__ = Mock(return_value=False)
+        chunk, _ = self._make_chunk_with_params()
+        ddp_config = self._ddp_config(num_distributed_optimizer_instances=1)
+
+        _ddp_wrap([chunk], False, ddp_config, False, pg_collection=self.pg)
+
+        layout_args = self._opt.compute_full_param_layout.call_args
+        assert self._mpu.call_count == 1
+        assert layout_args.args[2] == self.mpu_pg.intra_dp_cp.size.return_value == 4
+        assert (
+            layout_args.kwargs["expert_data_parallel_world_size"]
+            == (self.mpu_pg.intra_expt_dp.size.return_value)
+            == 2
+        )
+        assert layout_args.args[2] != self.pg.intra_dp_cp.size.return_value
+        assert (
+            layout_args.kwargs["expert_data_parallel_world_size"]
+            != self.pg.intra_expt_dp.size.return_value
+        )
+        assert "pg_collection" not in mock_ddp.call_args.kwargs
 
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")
@@ -777,7 +831,7 @@ class TestDdpWrapFullParamLayout:
     ):
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
-        self._mpu.get_pipeline_model_parallel_rank.return_value = 1
+        self.mpu_pg.pp.rank.return_value = 1
         chunk, _ = self._make_chunk_with_params()
         ddp_config = self._ddp_config()
         _ddp_wrap([chunk], False, ddp_config, False, pg_collection=self.pg)

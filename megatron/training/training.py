@@ -1639,17 +1639,62 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
-            model = [
-                DP(
-                    config=config,
-                    ddp_config=ddp_config,
-                    module=model_chunk,
-                    # Turn off bucketing for model_chunk 2 onwards, since communication
-                    # for these model chunks is overlapped with compute anyway.
-                    disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
+            wrapped_model = []
+            for model_chunk_idx, model_chunk in enumerate(model):
+                disable_bucketing = (
+                    model_chunk_idx > 0 or args.overlap_param_gather_with_optimizer_step
                 )
-                for (model_chunk_idx, model_chunk) in enumerate(model)
-            ]
+                chunk_kwargs = {}
+                if args.use_distributed_optimizer and DP is DDP:
+                    # Pre-compute parameter layouts for the distributed optimizer.
+                    # Only pass to DDP; FSDP variants don't accept full_param_layout.
+                    # Legacy DDP is constructed without pg_collection, so it resolves
+                    # its groups from parallel_state. Use the same groups for the layout.
+                    # The distributed optimizer shards each bucket over the intra-instance group, which
+                    # is what DDP hands to the buffer as its data_parallel_group. Size the layout by that
+                    # same group, otherwise the layout reports more shards than the reduce-scatter uses
+                    # and the trailing shards of every bucket end up owned by no rank. intra_dp_cp is
+                    # the full dp_cp when num_distributed_optimizer_instances is 1, so this only differs
+                    # when there are several instances.
+                    layout_pgs = ProcessGroupCollection.use_mpu_process_groups()
+                    intra_dp_cp_group = getattr(layout_pgs, "intra_dp_cp", None)
+                    intra_expt_dp_group = getattr(layout_pgs, "intra_expt_dp", None)
+                    dense_layout_group = (
+                        intra_dp_cp_group
+                        if intra_dp_cp_group is not None
+                        else layout_pgs.dp_cp
+                    )
+                    expert_layout_group = (
+                        intra_expt_dp_group
+                        if intra_expt_dp_group is not None
+                        else layout_pgs.expt_dp
+                    )
+                    pp_rank = get_pg_rank(layout_pgs.pp)
+                    effective_bucket_size = (
+                        None
+                        if disable_bucketing or pp_rank > 0
+                        else ddp_config.bucket_size
+                    )
+                    chunk_kwargs["full_param_layout"] = (
+                        DistributedOptimizer.compute_full_param_layout(
+                            [param for param in model_chunk.parameters() if param.requires_grad],
+                            effective_bucket_size,
+                            get_pg_size(dense_layout_group),
+                            ddp_config,
+                            expert_data_parallel_world_size=get_pg_size(expert_layout_group),
+                        )
+                    )
+
+                wrapped_model.append(
+                    DP(
+                        config=config,
+                        ddp_config=ddp_config,
+                        module=model_chunk,
+                        disable_bucketing=disable_bucketing,
+                        **chunk_kwargs,
+                    )
+                )
+            model = wrapped_model
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)

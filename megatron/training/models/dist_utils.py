@@ -266,7 +266,14 @@ def _ddp_wrap(
                 all_params = [
                     p for p in model_chunk.parameters() if p.requires_grad
                 ]
-                pp_rank = mpu.get_pipeline_model_parallel_rank()
+                # Standard DDP is constructed without pg_collection below, so it resolves
+                # groups from parallel_state. Match that resolver, not the provider collection.
+                # Size the layout by the group the optimizer actually shards over, which is
+                # the intra-instance group when there are several optimizer instances. Using
+                # the full dp_cp would report more shards than the reduce-scatter uses and
+                # leave the trailing shard of every bucket owned by no rank.
+                ddp_process_groups = ProcessGroupCollection.use_mpu_process_groups()
+                pp_rank = ddp_process_groups.pp.rank()
                 effective_bucket_size = (
                     None
                     if disable_bucketing or pp_rank > 0
@@ -276,11 +283,9 @@ def _ddp_wrap(
                     DistributedOptimizer.compute_full_param_layout(
                         all_params,
                         effective_bucket_size,
-                        mpu.get_data_parallel_world_size(with_context_parallel=True),
+                        ddp_process_groups.intra_dp_cp.size(),
                         ddp_config,
-                        expert_data_parallel_world_size=(
-                            mpu.get_expert_data_parallel_world_size()
-                        ),
+                        expert_data_parallel_world_size=ddp_process_groups.intra_expt_dp.size(),
                     )
                 )
 
