@@ -1782,6 +1782,21 @@ def _mddecoupling_config_overrides(
     if router_has_own_lr:
         router_override['max_lr'] = router_lr
         router_override['min_lr'] = _group_min_lr(config, router_lr)
+    if config.router_weight_decay is not None:
+        router_sphere = (
+            config.hypersphere_router_mode
+            if config.hypersphere_router_mode is not None
+            else config.hypersphere_mode
+        )
+        if router_sphere not in (None, 'none'):
+            raise ValueError(
+                f"--router-weight-decay has no effect on a hypersphere-normalized router "
+                f"(router mode {router_sphere!r}): the post-step projection undoes the decay. "
+                f"Use --hypersphere-router-mode none."
+            )
+        # Constant per-group decay via the scheduler's start_wd/end_wd group override.
+        router_override['start_wd'] = config.router_weight_decay
+        router_override['end_wd'] = config.router_weight_decay
     if router_override:
         overrides[ParamKey(attr='is_router')] = router_override
 
