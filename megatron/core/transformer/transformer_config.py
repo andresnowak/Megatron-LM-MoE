@@ -1182,7 +1182,8 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
-    will be dropped. The default is None."""
+    will be dropped. The default is None. When set, the fraction of valid token-expert
+    assignments dropped per layer is logged as ``dropped_token_fraction``."""
 
     moe_pad_expert_input_to_capacity: bool = False
     """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match
