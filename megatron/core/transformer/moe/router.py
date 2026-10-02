@@ -1066,7 +1066,8 @@ class TopKRouter(Router):
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
 
-        if router_input_logging.is_active() and self.layer_number is not None:
+        log_router_input = router_input_logging.is_active() and self.layer_number is not None
+        if log_router_input:
             layer_index = self.layer_number - 1
             if getattr(self, "is_mtp_layer", False):
                 layer_index += self.config.num_layers
@@ -1083,6 +1084,12 @@ class TopKRouter(Router):
             )
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+
+        if log_router_input:
+            # Selected-expert statistics: the raw logits that actually feed the gates.
+            router_input_logging.record_selected(
+                layer_index, logits, probs, routing_map, padding_mask
+            )
 
         return probs, routing_map
 
