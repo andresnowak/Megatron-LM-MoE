@@ -27,7 +27,8 @@ whose level logit-space QB leaves free.
   "selected" router z-loss mode, logged without gradient; ``sel_lse_mean`` (signed, to tell
   saturated-high from tiny gates) and ``sel_lse_max``.
 - ``sel_logit_mean`` / ``sel_logit_max``: raw logits of the dispatched experts.
-- ``sel_gate_sat_frac``: share of dispatched entries with sigmoid(z) > 0.99 (z > ln 99).
+- ``sel_gate_sat_frac``: share of dispatched entries with sigmoid(z) > 0.99 (z > ln 99), plus
+  ``sel_gate_frac_gt_{50,75,90}`` for sigmoid(z) > 0.5 / 0.75 / 0.9 (z > 0 / ln 3 / ln 9).
 - ``combine_cv_mean``: mean over tokens of std/mean of the token's combine weights; 0 when all
   selected experts get the same weight (what saturated gates produce).
 
@@ -51,10 +52,13 @@ _N_FIELDS = _ARGMAX_CHANNEL + 1
 
 # Selected-expert accumulator layout per layer: sums, then maxima.
 (_S_SUM_LSE_SQ, _S_SUM_LSE, _S_N_TOK, _S_SUM_LOGIT, _S_N_SEL, _S_N_SAT, _S_SUM_CV) = range(7)
-_S_N_SUM = 7
+_SAT_LOGIT = 4.59511985013459  # ln(99): sigmoid(z) > 0.99
+# Extra gate thresholds: sigmoid(z) > p  <=>  z > ln(p / (1 - p)).
+_GATE_THRESHOLDS = ((0.5, 0.0), (0.75, 1.0986122886681098), (0.9, 2.1972245773362196))
+_S_CNT_GATE = 7  # .. 7 + len(_GATE_THRESHOLDS)
+_S_N_SUM = _S_CNT_GATE + len(_GATE_THRESHOLDS)
 _S_MAX_LSE, _S_MAX_LOGIT = _S_N_SUM, _S_N_SUM + 1
 _S_N_FIELDS = _S_N_SUM + 2
-_SAT_LOGIT = 4.59511985013459  # ln(99): sigmoid(z) > 0.99
 
 _active = False
 _layers: Optional[frozenset] = None
@@ -169,6 +173,7 @@ def record_selected(
             selectedf.sum(),
             ((logits > _SAT_LOGIT) & selected).sum().float(),
             (cv * has_self).sum(),
+            *[((logits > cut) & selected).sum().float() for _, cut in _GATE_THRESHOLDS],
         ]
     ).to(torch.float64)
     acc[:_S_N_SUM] += sums
@@ -273,6 +278,9 @@ def collect(model, num_layers: int, zero_centered_gamma: bool = False) -> Dict[s
             out[f"{prefix}sel_logit_mean_layer_{layer}"] = float(sel_sums[layer, _S_SUM_LOGIT]) / n_sel
             out[f"{prefix}sel_logit_max_layer_{layer}"] = float(sel_maxima[layer, 1])
             out[f"{prefix}sel_gate_sat_frac_layer_{layer}"] = float(sel_sums[layer, _S_N_SAT]) / n_sel
+            for k, (p, _) in enumerate(_GATE_THRESHOLDS):
+                name = f"sel_gate_frac_gt_{int(round(p * 100))}"
+                out[f"{prefix}{name}_layer_{layer}"] = float(sel_sums[layer, _S_CNT_GATE + k]) / n_sel
             out[f"{prefix}combine_cv_mean_layer_{layer}"] = float(sel_sums[layer, _S_SUM_CV]) / n_tok
         if sums[layer, _N_TOK] > 0:
             n = float(sums[layer, _N_TOK])
