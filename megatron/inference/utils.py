@@ -12,8 +12,10 @@ from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference.moe import InferenceGroupedGemmBackend
-from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+from megatron.core.inference.quantization.utils import (
+    quantize_model_to_mxfp8,
+    resolve_mxfp8_backend,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -114,13 +116,8 @@ def get_model_for_inference() -> MegatronModule:
     model.eval()
 
     if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
-        backend = InferenceGroupedGemmBackend(args.inference_grouped_gemm_backend)
-        if backend != InferenceGroupedGemmBackend.TORCH:
-            raise ValueError(
-                "MXFP8 inference requires inference_grouped_gemm_backend='torch', "
-                f"got '{backend.value}'."
-            )
-        quantize_model_to_mxfp8(unwrap_model(model), backend="triton")
+        quant_backend = resolve_mxfp8_backend(args.inference_grouped_gemm_backend)
+        quantize_model_to_mxfp8(unwrap_model(model), backend=quant_backend)
     return model
 
 
