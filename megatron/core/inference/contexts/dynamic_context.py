@@ -687,9 +687,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         )
 
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+
         # Allocate process-global per-step dispatcher buffers before CUDA graph capture.
         # The inference providers support one active dynamic MoE context per process.
-        if get_pg_size(self.expert_model_parallel_group) > 1:
+        # TE keeps the standard dispatcher, so it does not use these provider buffers.
+        if (
+            model_config.transformer_impl == "inference_optimized"
+            and model_config.num_moe_experts is not None
+            and model_config.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TE
+            and get_pg_size(self.expert_model_parallel_group) > 1
+        ):
             if self._nccl_ep_dispatcher:
                 NCCLAllGatherDispatcher.allocate_buffers()
             else:

@@ -10,13 +10,6 @@ class _FakeMoELayer(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self._inference_token_dispatcher = SimpleNamespace(_runs_metadata_sync=True)
-        self.graph_enabled = False
-
-    def set_inference_cuda_graphed_iteration(self):
-        self.graph_enabled = True
-
-    def unset_inference_cuda_graphed_iteration(self):
-        self.graph_enabled = False
 
 
 class TestInferenceUtils:
@@ -38,15 +31,21 @@ class TestInferenceUtils:
         first_layers = [_FakeMoELayer(), _FakeMoELayer()]
         first_model = torch.nn.Sequential(*first_layers)
         inference_utils.set_moe_metadata_sync(first_model)
+        assert inference_utils.moe_layer_cache == first_layers
+        assert inference_utils._moe_layer_cache_model is first_model
+        assert inference_utils._moe_metadata_sync_model is first_model
         assert first_layers[0]._inference_token_dispatcher._runs_metadata_sync
         assert not first_layers[1]._inference_token_dispatcher._runs_metadata_sync
 
         second_layers = [_FakeMoELayer(), _FakeMoELayer()]
         second_model = torch.nn.Sequential(*second_layers)
         inference_utils.set_moe_metadata_sync(second_model)
-        inference_utils.set_inference_cuda_graphed_iteration_for_ep_inference(second_model)
 
+        assert inference_utils.moe_layer_cache == second_layers
+        assert inference_utils._moe_layer_cache_model is second_model
+        assert inference_utils._moe_metadata_sync_model is second_model
         assert second_layers[0]._inference_token_dispatcher._runs_metadata_sync
         assert not second_layers[1]._inference_token_dispatcher._runs_metadata_sync
-        assert all(layer.graph_enabled for layer in second_layers)
-        assert not any(layer.graph_enabled for layer in first_layers)
+        # Rebinding the cache must not mutate the first model's dispatchers.
+        assert first_layers[0]._inference_token_dispatcher._runs_metadata_sync
+        assert not first_layers[1]._inference_token_dispatcher._runs_metadata_sync

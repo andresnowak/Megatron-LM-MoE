@@ -46,12 +46,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.inference.utils import (
-    Counter,
-    await_process_call,
-    set_inference_cuda_graphed_iteration_for_ep_inference,
-    unset_inference_cuda_graphed_iteration_for_ep_inference,
-)
+from megatron.core.inference.utils import Counter, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
@@ -398,17 +393,8 @@ class DynamicInferenceEngine(AbstractEngine):
         for graph in context.cuda_graph_batch_dimensions_list:
             logging.info(graph)
 
-        # Enable inference dispatcher for EP during graph capture
-        model_config = controller.inference_wrapped_model.model.config
-        is_inference_optimized_ep = (
-            model_config.transformer_impl == "inference_optimized"
-            and model_config.expert_model_parallel_size > 1
-        )
-        if is_inference_optimized_ep:
-            unwrapped_model = controller.inference_wrapped_model.model
-            set_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
-
         # Capture MTP graphs alongside decoder graphs for each distinct request count.
+        model_config = controller.inference_wrapped_model.model.config
         mtp_model = unwrap_model(controller.inference_wrapped_model.model)
         mtp_warmup_enabled = (
             controller.num_mtp_heads > 0
@@ -440,7 +426,6 @@ class DynamicInferenceEngine(AbstractEngine):
 
             # Enable routing recording during warmup if routing replay is enabled.
             # This ensures the record_indices copy operation is captured in the CUDA graph.
-            model_config = controller.inference_wrapped_model.model.config
             if model_config.moe_enable_routing_replay:
                 RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
@@ -477,10 +462,6 @@ class DynamicInferenceEngine(AbstractEngine):
                         )
 
             context.reset()
-
-        # Disable inference dispatcher after graph capture
-        if is_inference_optimized_ep:
-            unset_inference_cuda_graphed_iteration_for_ep_inference(unwrapped_model)
 
             # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
             # This isolates pool growth from process-wide scratch churn (KV cache,

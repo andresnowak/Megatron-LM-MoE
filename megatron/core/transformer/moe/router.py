@@ -1080,8 +1080,9 @@ class InferenceTopKRouter(TopKRouter):
     method is @torch.compile()'d and returns dense [num_tokens, topk] tensors
     instead of sparse [num_tokens, num_experts] for compatibility with FlashInfer.
 
-    Falls back to the parent TopKRouter.forward() for training or
-    non-CUDA-graphed inference iterations.
+    Uses compact routing for optimized Torch/FlashInfer inference and falls back
+    to the parent TopKRouter.forward() for training and TE inference, where dense
+    routing tensors are required by the standard dispatcher.
     """
 
     def __init__(
@@ -1096,27 +1097,22 @@ class InferenceTopKRouter(TopKRouter):
             config (TransformerConfig): The configuration for the transformer model.
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
-        # Enforce constraints before calling super().__init__
-        assert config.moe_router_num_groups is None, (
-            f"InferenceTopKRouter requires moe_router_num_groups=None, "
-            f"got {config.moe_router_num_groups}"
-        )
-        assert config.moe_router_score_function in ["sigmoid", "softmax"], (
-            f"InferenceTopKRouter requires moe_router_score_function in "
-            f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
-        )
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+
+        # Enforce constraints before calling super().__init__.
+        # TE uses the parent router and standard dispatcher, so the compact
+        # inference routing restrictions do not apply to its eager path.
+        if config.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TE:
+            assert config.moe_router_num_groups is None, (
+                f"InferenceTopKRouter requires moe_router_num_groups=None, "
+                f"got {config.moe_router_num_groups}"
+            )
+            assert config.moe_router_score_function in ["sigmoid", "softmax"], (
+                f"InferenceTopKRouter requires moe_router_score_function in "
+                f"['sigmoid', 'softmax'], got '{config.moe_router_score_function}'"
+            )
 
         super().__init__(config=config, pg_collection=pg_collection)
-
-        self.is_inference_cuda_graphed_iteration = False
-
-    def set_inference_cuda_graphed_iteration(self):
-        """Enable CUDA graph-compatible operations for the router."""
-        self.is_inference_cuda_graphed_iteration = True
-
-    def unset_inference_cuda_graphed_iteration(self):
-        """Disable CUDA graph-compatible operations for the router."""
-        self.is_inference_cuda_graphed_iteration = False
 
     @staticmethod
     @torch.compile
@@ -1195,7 +1191,16 @@ class InferenceTopKRouter(TopKRouter):
                 - top_indices: Selected expert indices [num_tokens, topk]
         """
 
-        if self.training or not self.is_inference_cuda_graphed_iteration:
+        if self.training:
+            return super().forward(input, padding_mask)
+
+        # TE inference uses the regular MoE dispatcher, which requires the dense
+        # routing map and probabilities produced by TopKRouter. Torch and
+        # FlashInfer inference consume compact top-k routing and can use the
+        # compiled inference path on every eval iteration (not only graph replay).
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+
+        if self.config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TE:
             return super().forward(input, padding_mask)
 
         return self._forward(input, padding_mask)

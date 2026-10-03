@@ -109,11 +109,7 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
-from megatron.core.inference.moe import (
-    InferenceGroupedGemmBackend,
-    mcore_fused_moe,
-    resolve_inference_grouped_gemm_backend,
-)
+from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe
 
 logger = logging.getLogger(__name__)
 
@@ -792,10 +788,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
     """Inference-optimized GroupedMLP with GPU-resident offsets.
 
     Inherits from TEGroupedMLP to reuse weight initialization and checkpoint compatibility.
-    Supports three forward paths:
-    - Training: delegates to parent TEGroupedMLP
-    - Inference + CUDA graphed: FlashInfer cutlass_fused_moe (fused permute + GEMM)
-    - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
+    Uses the explicit inference backend selected in the config. The TE backend delegates
+    to TEGroupedMLP with CPU expert token counts; FlashInfer and torch use optimized
+    inference paths. Non-TE backends delegate to TEGroupedMLP during training.
     """
 
     def __init__(
@@ -817,13 +812,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
         # checkpoint loading has already populated the per-expert parameters.
         self._concatenated_weights_built = False
 
-        self.is_inference_cuda_graphed_iteration = False
-
-        if HAVE_FLASHINFER:
-            self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
-
-        self._mcore_activation_type = self._resolve_mcore_activation_type()
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
+        if self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TE:
+            if HAVE_FLASHINFER:
+                self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
+
+            self._mcore_activation_type = self._resolve_mcore_activation_type()
         self._nvls_dispatcher = getattr(config, "inference_moe_token_dispatcher_type", "nccl") == "nvls"
 
     def _resolve_flashinfer_activation_type(self):
@@ -848,14 +842,6 @@ class InferenceGroupedMLP(TEGroupedMLP):
         if func == squared_relu:
             return McoreActivationType.SQUARED_RELU
         raise ValueError(f"No mcore_fused_moe ActivationType mapping for activation_func={func}")
-
-    def set_inference_cuda_graphed_iteration(self):
-        """Enable CUDA-graphed iteration mode."""
-        self.is_inference_cuda_graphed_iteration = True
-
-    def unset_inference_cuda_graphed_iteration(self):
-        """Disable CUDA-graphed iteration mode."""
-        self.is_inference_cuda_graphed_iteration = False
 
     def _build_concatenated_mxfp8_weights(self):
         """Build stacked MXFP8 weight tensors from per-expert MXFP8Tensor attributes.
@@ -952,7 +938,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.register_buffer('_fc2_weight', _fc2_weight, persistent=False)
 
     def _flashinfer_forward(self, hidden_states, routing_map, probs):
-        """FlashInfer fused MoE kernel for CUDA-graphed inference iterations."""
+        """FlashInfer fused MoE kernel for optimized inference."""
         assert HAVE_FLASHINFER, "flashinfer-python is required for FlashInfer forward path."
         assert probs.dtype == torch.float32, "FlashInfer forward path requires fp32 probabilities."
         output = fused_moe.cutlass_fused_moe(
@@ -970,9 +956,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )[0]
         return output, None
 
-    def _mcore_fused_moe_forward(
-        self, hidden_states, probs, routing_map=None, tokens_per_expert=None, skip_permute=False
-    ):
+    def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
@@ -997,22 +981,23 @@ class InferenceGroupedMLP(TEGroupedMLP):
         permuted_probs: torch.Tensor,
         routing_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass with three modes:
+        """Forward using the configured inference backend.
 
-        - Training: delegates to parent TEGroupedMLP.
-        - Inference + CUDA graphed: FlashInfer cutlass_fused_moe. tokens_per_expert
-          is not used in this path; the FlashInfer kernel operates directly on
-          routing_map.
-        - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        The TE backend delegates directly to TEGroupedMLP, including in eval mode.
+        Other backends delegate to TEGroupedMLP during training; inference uses
+        FlashInfer or torch grouped_mm with GPU-resident offsets.
 
         Args:
             permuted_local_hidden_states: [num_tokens, hidden_size] input hidden states.
             tokens_per_expert: [num_experts] number of tokens routed to each expert.
-                None when using the CUDA-graphed FlashInfer path.
+                Required for TE; unused by the optimized inference paths.
             permuted_probs: [num_tokens, topk] routing probabilities.
             routing_map: [num_tokens, topk] token-to-expert assignment indices.
-                Required for the FlashInfer CUDA-graphed path, None otherwise.
+                Required for optimized inference; unused by TE.
         """
+
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TE:
+            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         if self.training:
             assert (
@@ -1031,30 +1016,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
-        resolved_backend = resolve_inference_grouped_gemm_backend(
-            self.inference_grouped_gemm_backend,
-            self.is_inference_cuda_graphed_iteration,
-            is_mxfp8=self.config.fp8_recipe == "mxfp8",
-        )
-
-        if resolved_backend == InferenceGroupedGemmBackend.FLASHINFER:
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
-            assert (
-                self.is_inference_cuda_graphed_iteration
-            ), "FlashInfer forward path is only used in CUDA-graphed inference iterations."
+            assert not self.training, "FlashInfer forward path is only used in inference mode."
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
-        elif resolved_backend == InferenceGroupedGemmBackend.TORCH:
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
             return self._mcore_fused_moe_forward(
-                permuted_local_hidden_states,
-                permuted_probs,
-                routing_map=routing_map,
-                tokens_per_expert=tokens_per_expert,
-                skip_permute=(not self.is_inference_cuda_graphed_iteration),
+                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
-        elif resolved_backend == InferenceGroupedGemmBackend.TE:
-            return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
 
 class SequentialMLP(MegatronModule):
@@ -1214,7 +1185,6 @@ class SequentialMLP(MegatronModule):
 
             sharded_state_dict.update(expert_state_dict)
         return sharded_state_dict
-    
 
 
 class OffloadingExpertsMLP(MegatronModule):

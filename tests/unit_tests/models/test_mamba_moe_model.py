@@ -295,7 +295,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     },
     "inference_disable_triton_nvls_kernels": False,
     "moe_router_force_biased": None,
-    "inference_grouped_gemm_backend": "auto",
+    "inference_grouped_gemm_backend": "te",
+    "inference_moe_token_dispatcher_type": "nccl",
     "inference_moe_disable_fused_quant_kernels": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
