@@ -2623,6 +2623,55 @@ def training_log(
     return report_memory_flag
 
 
+# Per-group learning rates for logging, beside the canonical 'learning-rate' (the base --lr
+# schedule). Each group is classified by the parameters it holds.
+_GROUP_LR_CATEGORIES = ("router", "matrix", "embedding", "output")
+
+
+def _param_group_category(group):
+    for param in group["params"]:
+        if getattr(param, "is_router", False):
+            return "router"
+        if getattr(param, "is_md_output_parameter", False):
+            return "output"
+        if getattr(param, "is_md_embedding_parameter", False) or getattr(
+            param, "is_embedding_or_output_parameter", False
+        ):
+            return "embedding"
+        if group.get("use_orthogonal_updates", False):
+            return "matrix"
+    return None
+
+
+@torch.no_grad()
+def _per_group_learning_rates(optimizer):
+    """Return {'learning-rate/<category>': lr}. Collective: call on every rank.
+
+    Under the layer-wise optimizer a rank only holds the groups' parameters it owns, so the
+    logging rank may hold no router or matrix parameter; each rank reports the lr of the groups
+    it can classify and a MAX all-reduce (absent = -1) merges them.
+    """
+    local = torch.full(
+        (len(_GROUP_LR_CATEGORIES),), -1.0, dtype=torch.float64,
+        device=torch.cuda.current_device() if torch.cuda.is_available() else "cpu",
+    )
+    if optimizer is not None:
+        for group in optimizer.param_groups:
+            category = _param_group_category(group)
+            lr = group.get("lr")
+            if category is None or lr is None:
+                continue
+            index = _GROUP_LR_CATEGORIES.index(category)
+            local[index] = max(float(local[index]), float(lr))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.MAX)
+    return {
+        f"learning-rate/{name}": float(value)
+        for name, value in zip(_GROUP_LR_CATEGORIES, local.tolist())
+        if value >= 0
+    }
+
+
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
     args = get_args()
     if args.save is None:
@@ -3521,6 +3570,10 @@ def train(
             )
             if router_input_stats:
                 md_gain_stats = {**(md_gain_stats or {}), **router_input_stats}
+        if args.tensorboard_log_interval and iteration % args.tensorboard_log_interval == 0:
+            group_lrs = _per_group_learning_rates(optimizer)
+            if group_lrs:
+                md_gain_stats = {**(md_gain_stats or {}), **group_lrs}
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
