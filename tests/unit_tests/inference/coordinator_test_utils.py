@@ -48,6 +48,11 @@ def make_coordinator_direct(
     coordinator.prefix_caching_coordinator_policy = policy
     coordinator.prefix_caching_routing_alpha = prefix_caching_routing_alpha
     coordinator.max_requests = max_requests
+    coordinator.request_id_to_client_id = {}
+    coordinator.request_id_to_client_request_id = {}
+    coordinator.client_request_to_request_id = {}
+    coordinator.request_id_to_rank = {}
+    coordinator.removed_engine_identities = set()
 
     # Create fake rank identities.
     coordinator.identities_of_data_parallel_ranks = deque(

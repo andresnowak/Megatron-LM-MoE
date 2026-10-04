@@ -21,6 +21,8 @@ class Headers(Enum):
     DISCONNECT = auto()
     SHUTDOWN = auto()
     TP_BROADCAST = auto()
+    ENGINE_REPLY_PARTIAL = auto()
+    ABORT_REQUEST = auto()
 
 
 class UnknownHeaderError(Exception):

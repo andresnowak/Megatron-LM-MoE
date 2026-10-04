@@ -7,11 +7,14 @@ import time
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 
+from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..openai_streaming import openai_stream
+
 logger = logging.getLogger(__name__)
 
 
 try:
-    from quart import Blueprint, current_app, jsonify, request
+    from quart import Blueprint, Response, current_app, jsonify, request
 
     bp = Blueprint('completions_api', __name__)
 
@@ -101,11 +104,24 @@ try:
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 num_tokens_to_generate=int(req.get("max_tokens", 16)),
                 stop_words=stop,
+                streaming_interval=int(req.get("streaming_interval", 1)),
             )
         except ValueError as e:
             return f"Invalid sampling parameter: {e}", 400
 
         # --- 3. Send Requests to Engine ---
+        stream_requested = bool(req.get("stream", False))
+        incremental_detokenizers = []
+        if stream_requested:
+            # Streaming currently supports only Hugging Face fast tokenizers.
+            try:
+                incremental_detokenizers = [
+                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    for prompt_tokens in prompts_as_tokens
+                ]
+            except ValueError as error:
+                return str(error), 400
+
         tasks = []
         for prompt_tokens in prompts_as_tokens:
             per_req_params = SamplingParams(
@@ -117,8 +133,29 @@ try:
                 skip_prompt_log_probs=sampling_params.skip_prompt_log_probs,
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
                 stop_words=sampling_params.stop_words,
+                streaming_interval=sampling_params.streaming_interval,
             )
-            tasks.append(client.add_request(prompt_tokens, per_req_params))
+            if stream_requested:
+                tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
+            else:
+                tasks.append(client.add_request(prompt_tokens, per_req_params))
+
+        if stream_requested:
+            include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
+            response = Response(
+                openai_stream(
+                    tasks,
+                    tokenizer,
+                    incremental_detokenizers,
+                    chat=False,
+                    return_log_probs=return_log_probs,
+                    include_usage=include_usage,
+                    prompt_indices=list(range(len(prompts_as_tokens))),
+                ),
+                content_type="text/event-stream",
+            )
+            response.timeout = None
+            return response
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
