@@ -31,7 +31,14 @@ class TestInferenceConfig:
         assert resolve_mxfp8_backend(grouped_gemm_backend) == expected_backend
 
     @pytest.mark.parametrize(
-        "grouped_gemm_backend", ["te", InferenceGroupedGemmBackend.TE, "unsupported-backend"]
+        "grouped_gemm_backend",
+        [
+            "te",
+            InferenceGroupedGemmBackend.TE,
+            "vllm",
+            InferenceGroupedGemmBackend.VLLM,
+            "unsupported-backend",
+        ],
     )
     def test_resolve_mxfp8_backend_rejects_unsupported_backend(self, grouped_gemm_backend):
         with pytest.raises(ValueError, match="does not support inference_grouped_gemm_backend"):

@@ -3,6 +3,7 @@
 import enum
 
 from .fused_moe import ActivationType, mcore_fused_moe
+from .vllm_fused_moe import vllm_fused_moe
 
 
 class InferenceGroupedGemmBackend(enum.Enum):
@@ -15,3 +16,4 @@ class InferenceGroupedGemmBackend(enum.Enum):
     FLASHINFER = "flashinfer"
     TORCH = "torch"
     TE = "te"
+    VLLM = "vllm"

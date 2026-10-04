@@ -9,6 +9,7 @@ from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
@@ -18,8 +19,6 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.fixture
 def expert_parallel_group():
-    if Utils.world_size < 2:
-        pytest.skip("TE inference context regression requires at least two EP ranks")
     if not torch.cuda.is_available():
         pytest.skip("DynamicInferenceContext requires CUDA allocations")
 
@@ -40,8 +39,14 @@ def test_te_context_does_not_allocate_optimized_dispatcher_buffers(
 ):
     nccl_allocate = Mock(side_effect=AssertionError("TE must not allocate NCCL buffers"))
     nvls_allocate = Mock(side_effect=AssertionError("TE must not allocate NVLS buffers"))
+    scalar_allocate = Mock(
+        side_effect=AssertionError("TE must not allocate optimized token counts")
+    )
     monkeypatch.setattr(NCCLAllGatherDispatcher, "allocate_buffers", nccl_allocate)
     monkeypatch.setattr(NVLSAllGatherVDispatcher, "allocate_buffers", nvls_allocate)
+    monkeypatch.setattr(
+        InferenceAllGatherDispatcherBase, "allocate_valid_tokens_tensor", scalar_allocate
+    )
 
     with pytest.warns(UserWarning, match="eager compatibility path"):
         model_config = TransformerConfig(
@@ -76,3 +81,4 @@ def test_te_context_does_not_allocate_optimized_dispatcher_buffers(
     assert context.inference_grouped_gemm_backend is InferenceGroupedGemmBackend.TE
     nccl_allocate.assert_not_called()
     nvls_allocate.assert_not_called()
+    scalar_allocate.assert_not_called()

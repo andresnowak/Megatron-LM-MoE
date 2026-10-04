@@ -57,6 +57,7 @@ class TestInferenceBackendConfig:
         [
             ("te", "TE inference grouped GEMM backend.*MXFP8"),
             ("flashinfer", "FlashInfer is not compatible with MXFP8"),
+            ("vllm", "vLLM Triton fused MoE only supports BF16"),
         ],
     )
     def test_rejects_unsupported_mxfp8_backend(self, backend, message):

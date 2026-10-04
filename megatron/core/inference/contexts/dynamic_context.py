@@ -37,6 +37,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
@@ -696,11 +697,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             model_config.transformer_impl == "inference_optimized"
             and model_config.num_moe_experts is not None
             and model_config.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TE
-            and get_pg_size(self.expert_model_parallel_group) > 1
         ):
-            if self._nccl_ep_dispatcher:
+            # Both dispatchers need _valid_tokens_tensor initialized even at EP=1:
+            # mcore_fused_moe's Triton kernel reads it as a pointer regardless of EP size.
+            if model_config.inference_moe_token_dispatcher_type == 'nccl':
                 NCCLAllGatherDispatcher.allocate_buffers()
-            else:
+            elif get_pg_size(self.expert_model_parallel_group) > 1:
+                # Use moe_latent_size if set, else hidden_size.
                 moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
                 NVLSAllGatherVDispatcher.allocate_buffers(
                     per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens)
@@ -709,6 +712,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                     hidden_size=moe_hidden_size,
                     ep_group=self.expert_model_parallel_group,
                 )
+            else:
+                # EP=1 with nvls: skip symmetric memory init (requires NVLink between
+                # multiple GPUs) and just initialize the shared valid_tokens scalar.
+                InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
 
         self.smallest_non_decode_cuda_graph_size = min(
             inference_config.cuda_graph_mixed_prefill_count, self.max_requests

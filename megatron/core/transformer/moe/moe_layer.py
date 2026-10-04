@@ -45,6 +45,13 @@ try:
 except ImportError:
     HAVE_FLASHINFER = False
 
+try:
+    import triton  # pylint: disable=unused-import
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
 if HAVE_FLASHINFER:
     try:
         import flashinfer_cubin  # pylint: disable=unused-import
@@ -347,6 +354,11 @@ class MoELayer(BaseMoELayer):
                 assert hasattr(torch.nn.functional, 'grouped_mm'), (
                     "inference_grouped_gemm_backend='torch' requires "
                     "torch.nn.functional.grouped_mm (available since PyTorch 2.10)."
+                )
+            elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
+                assert HAVE_TRITON, (
+                    "inference_grouped_gemm_backend='vllm' requires Triton. "
+                    "Install triton (pip install triton)."
                 )
             if config.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TE:
                 self._setup_inference_mode(pg_collection)
