@@ -1985,7 +1985,6 @@ def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
 
 
-
 def _add_transformer_engine_args(parser):
     group = parser.add_argument_group(title='Transformer-Engine')
 
@@ -2149,15 +2148,22 @@ def _add_inference_args(parser):
                        '"ref_zero" (default) immediately returns blocks to the '
                        'free pool when ref_count hits 0. "lru" keeps blocks '
                        'cached and evicts via LRU only when space is needed.')
-    group.add_argument('--inference-dynamic-batching-prefix-caching-coordinator-policy',
-                       type=str, default='first_prefix_block',
-                       choices=['longest_prefix', 'first_prefix_block', 'round_robin'],
-                       dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
-                       help='Coordinator routing policy for prefix caching. '
-                       '"first_prefix_block" (default) routes based on the first '
-                       'block hash only. "longest_prefix" routes to the rank with '
-                       'the longest matching prefix. "round_robin" ignores prefix '
-                       'affinity and cycles through ranks.')
+    group.add_argument(
+        '--inference-dynamic-batching-prefix-caching-coordinator-policy',
+        type=str,
+        default='load_balanced',
+        choices=['longest_prefix', 'first_prefix_block', 'load_balanced'],
+        dest='inference_dynamic_batching_prefix_caching_coordinator_policy',
+        help='Coordinator routing policy for prefix caching. '
+        '"load_balanced" (default) routes to the rank with the fewest '
+        'in-flight requests, ignoring prefix affinity. '
+        '"first_prefix_block" routes based on the first block hash only. '
+        '"longest_prefix" routes to the rank with the longest matching '
+        'prefix. "first_prefix_block" and "longest_prefix" both combine '
+        'prefix affinity with load balancing and fall back to '
+        'load-balanced routing when prefix caching is disabled or no '
+        'prefix match exists.',
+    )
     group.add_argument('--inference-dynamic-batching-prefix-caching-routing-alpha',
                        type=float, default=0.5,
                        dest='inference_dynamic_batching_prefix_caching_routing_alpha',
