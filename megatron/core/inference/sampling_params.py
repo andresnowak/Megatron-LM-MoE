@@ -34,8 +34,16 @@ class SamplingParams:
         None  # List of strings that will stop generation when produced
     )
     detokenize_stop_sequence: bool = False  # Keep stop words and EOD in generated text
+    # When False, the DP coordinator skips detokenizing this request's output. The
+    # coordinator is a single process serving every DP rank, so per-request work there
+    # is a throughput ceiling; callers that can detokenize themselves (e.g. the HTTP
+    # frontend, which is replicated) should set this to False.
+    detokenize_generations: bool = True
     streaming: bool = False  # Emit incremental ENGINE_REPLY_PARTIAL frames.
     streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
+    # Preserve the fork's prompt-echo default. Explicit False drops the prompt
+    # tokens from the wire payload while retaining prompt_length for usage.
+    return_prompt_tokens: bool = True
 
     def __post_init__(self):
         """Validate parameters and maintain backward compatibility.

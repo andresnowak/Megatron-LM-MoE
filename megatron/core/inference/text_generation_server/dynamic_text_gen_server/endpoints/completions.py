@@ -67,9 +67,11 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
+            temperature = float(
+                req.get("temperature", current_app.config.get('default_temperature', 1.0))
+            )
+            top_p = float(req.get("top_p", current_app.config.get('default_top_p', 1.0)))
+            top_k = int(req.get("top_k", current_app.config.get('default_top_k', 0)))
             echo = bool(req.get("echo", False))
 
             if temperature == 0.0:
@@ -134,6 +136,7 @@ try:
                 num_tokens_to_generate=sampling_params.num_tokens_to_generate,
                 stop_words=sampling_params.stop_words,
                 streaming_interval=sampling_params.streaming_interval,
+                return_prompt_tokens=True,
             )
             if stream_requested:
                 tasks.append(client.add_request_streaming(prompt_tokens, per_req_params))
