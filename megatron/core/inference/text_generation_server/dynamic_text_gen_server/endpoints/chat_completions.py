@@ -18,6 +18,7 @@ from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import openai_stream
+from .common import abort_requests
 
 logger = logging.getLogger(__name__)
 
@@ -805,13 +806,41 @@ try:
             response.timeout = None
             return response
 
-        tasks = [client.add_request(prompt_tokens, sampling_params) for _ in range(n)]
+        # add_request_with_id, not add_request: a non-streaming response writes
+        # nothing to the socket while generating, so a disconnect is never
+        # discovered as a broken pipe. Aborting needs the request ids.
+        #
+        # Submitted one at a time rather than in a comprehension so a failure on
+        # admission k -- a zmq send error, or multimodal serialization on a
+        # malformed payload -- can abort the k-1 already in flight. Left to
+        # escape they would generate to their token limit holding batch slots,
+        # the same leak the abort below the gather closes.
+        request_ids = []
+        tasks = []
+        try:
+            for _ in range(n):
+                request_id, future = client.add_request_with_id(prompt_tokens, sampling_params)
+                request_ids.append(request_id)
+                tasks.append(future)
+        except Exception as e:
+            abort_requests(client, request_ids, f"submission failed: {e}")
+            logger.error(f"Error submitting request: {e}")
+            return Response(f"Error submitting request: {e}", status=500)
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
         try:
             batch_results = await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            # Quart cancels this handler when the peer goes away (its ASGI
+            # connection races handle_messages against handle_request and
+            # cancels the loser). Without this the engine would keep generating
+            # for a client that is gone, holding a slot until it hit the token
+            # limit -- orphans then accumulate faster than they retire and the
+            # batch saturates.
+            abort_requests(client, request_ids, "client disconnected")
+            raise
         except Exception as e:
             logger.error(f"Error during inference: {e}")
             return Response(f"Error during inference: {e}", status=500)
@@ -855,8 +884,11 @@ try:
         # at submit time (above) and drive both the response shape here and whether the
         # engine kept the prompt_tokens tensor on the payload.
         request_idx = 0
+        response_uid = None
         for result_item in batch_results:
             result = unwrap_serialized_tensors(result_item)
+            if response_uid is None:
+                response_uid = result["uid"]
 
             text_output = TextGenerationController.detokenize(
                 tokenizer,
@@ -958,11 +990,6 @@ try:
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
-            choice_data["policy_epoch"] = result["policy_epoch"]
-            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
-            choice_data["num_evictions"] = sum(
-                1 for e in result["events"] if e.get("type") == "EVICT"
-            )
             if current_app.config['verbose']:
                 logging.info(_redact_token_id_lists_for_logging(result))
 
@@ -984,7 +1011,7 @@ try:
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         response = {
-            "id": str(uuid.uuid4()),
+            "id": response_uid,
             "created": int(time.time()),
             "model": "EMPTY",
             "object": "chat.completion",

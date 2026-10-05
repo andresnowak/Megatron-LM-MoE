@@ -13,6 +13,7 @@ from functools import partial
 from typing import Dict, List, Optional, Tuple
 from unittest import mock
 
+import msgpack
 import pytest
 import torch
 from tqdm import tqdm
@@ -34,6 +35,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
@@ -660,6 +662,20 @@ class DynamicInferenceEngineTestBase:
         return env
 
 
+def _assert_streaming_partial(engine, request_id, new_tokens):
+    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
+    (frames,) = engine.socket_for_receiving_requests.send_multipart.call_args.args
+    assert len(frames) == 2
+    assert msgpack.unpackb(frames[0], raw=False) == [
+        Headers.ENGINE_REPLY_PARTIAL.value,
+        [request_id],
+    ]
+    assert msgpack.unpackb(frames[1], raw=False) == {
+        "request_id": request_id,
+        "new_tokens": new_tokens,
+    }
+
+
 def test_streaming_partials_are_sent():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}
@@ -673,7 +689,7 @@ def test_streaming_partials_are_sent():
 
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_called_once()
+    _assert_streaming_partial(engine, 7, [11, 12, 13])
     assert engine._partial_emit_lengths == {7: 3}
 
 
@@ -692,14 +708,39 @@ def test_streaming_partials_buffer_until_token_interval():
 
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_not_called()
+    engine.socket_for_receiving_requests.send_multipart.assert_not_called()
     assert engine._partial_emit_lengths == {}
 
     request.generated_tokens.append(13)
     engine._try_send_streaming_partials()
 
-    engine.socket_for_receiving_requests.send.assert_called_once()
+    _assert_streaming_partial(engine, 7, [11, 12, 13])
     assert engine._partial_emit_lengths == {7: 3}
+
+
+@pytest.mark.parametrize("weight_epoch", [0, 1])
+@pytest.mark.parametrize("current_domain", [False, True])
+def test_supplied_routing_hashes_use_the_engine_weight_domain(weight_epoch, current_domain):
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(block_size_tokens=4, enable_prefix_caching=True)
+    engine._weight_epoch = weight_epoch
+    engine._add_request = mock.Mock()
+    tokens = torch.arange(8, dtype=torch.int64, device="cuda")
+    raw_hashes = compute_block_hashes_batched(tokens, 4)
+    expected = engine._compute_request_block_hashes(tokens)
+    supplied = expected if current_domain else raw_hashes
+
+    engine.add_request(
+        7, tokens, SamplingParams(num_tokens_to_generate=2), precomputed_block_hashes=supplied
+    )
+    (request,) = engine._add_request.call_args.args
+    assert request.precomputed_block_hashes == expected
+    if weight_epoch:
+        assert set(expected).isdisjoint(raw_hashes)
+    else:
+        assert expected == raw_hashes
+    if current_domain:
+        assert request.precomputed_block_hashes == supplied
 
 
 def _make_prefix_cached_request_for_checkpoint(request_id: int) -> DynamicInferenceRequest:
@@ -3261,6 +3302,67 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         record.checkpoint()
         assert record[-1].policy_epoch == merged.policy_epoch
         assert record[-1].kv_cache_epoch is None
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_local_metadata_ledger_gated_by_engine_enable(self):
+        """Only ledger-enabled engines (RL training) index finished requests."""
+        PROMPT_LEN = 8
+        NUM_TOKENS = 4
+
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,
+            min_prompt_length=PROMPT_LEN,
+            max_prompt_length=PROMPT_LEN,
+            num_tokens_to_generate=NUM_TOKENS,
+        )
+        env = self._build_test_env(test_config)
+        engine = env.engine
+        engine._generation_epoch = 3  # RL mode: requests are epoch-stamped
+        # Take the coordinator reply path so finished requests flow through the
+        # inline ledger indexing in the reply block (socket mocked out).
+        engine.use_coordinator = True
+        engine.is_mp_coordinator = True
+        engine.socket_for_receiving_requests = mock.MagicMock()
+
+        def run_request(request_id):
+            prompt_tokens = torch.full(
+                (PROMPT_LEN,), request_id + 1, dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            engine._add_request(
+                DynamicInferenceRequest(
+                    request_id=request_id,
+                    prompt_tokens=prompt_tokens,
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=NUM_TOKENS, termination_id=-1
+                    ),
+                )
+            )
+            finished_records = []
+            while engine.has_unfinished_requests():
+                result = engine.step_modern()
+                finished_records.extend(result["finished_request_records"])
+            return finished_records
+
+        # Default (plain serving): nothing is indexed, nothing accumulates.
+        finished_records = run_request(0)
+        assert len(finished_records) == 1
+        assert engine.local_metadata_ledger == {}
+
+        # RL launch (MegatronLocal.launch) enables the ledger: every finished
+        # request is indexed, no per-request tagging involved.
+        engine.local_metadata_ledger_enabled = True
+        finished_records = run_request(1)
+        assert len(finished_records) == 1
+
+        # The ledger keys by the request's engine-minted uid — the same string the
+        # endpoints return as the OpenAI response id.
+        merged = finished_records[0].merge()
+        ledger = engine.local_metadata_ledger
+        assert list(ledger.keys()) == [merged.uid]
+        assert ledger[merged.uid].policy_epoch == [(0, 3)]
 
     @pytest.mark.internal
     @pytest.mark.skipif(

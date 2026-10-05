@@ -19,6 +19,7 @@ except ImportError as e:
     HAS_BACKEND = False
 
 import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.utils import trace_async_exceptions
 
@@ -55,6 +56,8 @@ async def _run_text_gen_server(
     default_top_p: float = 1.0,
     default_top_k: int = 0,
     eval_mode: bool = False,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -66,7 +69,15 @@ async def _run_text_gen_server(
         raise NotImplementedError("Multimodal serving is not supported")
 
     # Create and start the client locally inside this process
-    inference_client = InferenceClient(coordinator_addr, deserialize=False)
+    # The client hashes prompts for prefix-affinity routing so the coordinator
+    # does not have to on its single serial loop. It is the only place holding
+    # both the tokens and, for multimodal, the media key that salts them.
+    inference_client = InferenceClient(
+        coordinator_addr,
+        deserialize=False,
+        block_size_tokens=block_size_tokens,
+        prefix_caching_coordinator_policy=prefix_caching_coordinator_policy,
+    )
     inference_client.start()
     logger.info(f"Rank {rank}: InferenceClient connected.")
 
@@ -162,6 +173,8 @@ def _server_process_worker(
     default_top_p: float = 1.0,
     default_top_k: int = 0,
     eval_mode: bool = False,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -182,6 +195,8 @@ def _server_process_worker(
                 default_top_p,
                 default_top_k,
                 eval_mode,
+                block_size_tokens,
+                prefix_caching_coordinator_policy,
             )
         )
     except KeyboardInterrupt:
@@ -243,6 +258,8 @@ def start_text_gen_server(
     default_top_p: float = 1.0,
     default_top_k: int = 0,
     eval_mode: bool = False,
+    block_size_tokens: Optional[int] = None,
+    prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
 ) -> Optional[str]:
     """Start the text generation server.
 
@@ -309,6 +326,8 @@ def start_text_gen_server(
                 default_top_p,
                 default_top_k,
                 eval_mode,
+                block_size_tokens,
+                prefix_caching_coordinator_policy,
             ),
             daemon=True,
         )

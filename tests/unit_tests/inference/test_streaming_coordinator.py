@@ -11,7 +11,21 @@ from tests.unit_tests.inference.coordinator_test_utils import make_coordinator_d
 
 
 def _message(sender, header, *payload):
-    return [sender, msgpack.packb([header.value, *payload], use_bin_type=True)]
+    if header == Headers.SUBMIT_REQUEST:
+        request_id, prompt, params = payload
+        metadata = [header.value, request_id, params, None]
+        bodies = [msgpack.packb(value, use_bin_type=True) for value in (prompt, None, None)]
+    elif header in (Headers.ENGINE_REPLY, Headers.ENGINE_REPLY_PARTIAL):
+        requests = payload[0]
+        routing = [request["request_id"] for request in requests]
+        if header == Headers.ENGINE_REPLY:
+            routing = [[request_id, True] for request_id in routing]
+        metadata = [header.value, routing]
+        bodies = [msgpack.packb(request, use_bin_type=True) for request in requests]
+    else:
+        metadata = [header.value, *payload]
+        bodies = []
+    return [sender, msgpack.packb(metadata, use_bin_type=True), *bodies]
 
 
 def _coordinator(messages):
@@ -30,10 +44,12 @@ def _coordinator(messages):
 def _replies(coordinator, header):
     replies = []
     for call in coordinator.router_socket.send_multipart.call_args_list:
-        identity, packed = call.args[0]
-        payload = msgpack.unpackb(packed, raw=False)
-        if payload[0] == header.value:
-            replies.append((identity, payload))
+        identity, packed, *bodies = call.args[0]
+        metadata = msgpack.unpackb(packed, raw=False)
+        if metadata[0] == header.value:
+            assert len(metadata) == 2
+            assert len(bodies) == 1
+            replies.append((identity, [*metadata, msgpack.unpackb(bodies[0], raw=False)]))
     return replies
 
 
@@ -98,9 +114,10 @@ def test_abort_uses_client_identity_and_does_not_release_pending_state():
     coordinator.start()
 
     assert coordinator._send_to_engine.call_count == 3
-    assigned_rank, packed = coordinator._send_to_engine.call_args.args
+    assigned_rank, frames = coordinator._send_to_engine.call_args.args
     assert assigned_rank == b"rank_1"
-    assert msgpack.unpackb(packed, raw=False) == [Headers.ABORT_REQUEST.value, 1]
+    assert len(frames) == 1
+    assert msgpack.unpackb(frames[0], raw=False) == [Headers.ABORT_REQUEST.value, 1]
     assert coordinator.client_request_to_request_id == {(b"client-A", 7): 0, (b"client-B", 7): 1}
     assert coordinator._pending_counts.tolist() == [1, 1]
 

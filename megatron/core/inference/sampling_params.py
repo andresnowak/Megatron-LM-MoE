@@ -44,6 +44,7 @@ class SamplingParams:
     # Preserve the fork's prompt-echo default. Explicit False drops the prompt
     # tokens from the wire payload while retaining prompt_length for usage.
     return_prompt_tokens: bool = True
+    do_kv_handoff: bool = False  # Pin KV blocks and expose metadata for peer transfer.
 
     def __post_init__(self):
         """Validate parameters and maintain backward compatibility.

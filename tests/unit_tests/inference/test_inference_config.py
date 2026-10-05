@@ -99,6 +99,14 @@ class TestInferenceConfig:
         with pytest.raises(ValueError):
             InferenceConfig(async_sched_mode=invalid_mode)
 
+    def test_routing_alpha_accepts_values_above_one(self):
+        """Alpha penalizes relative load and is not a bounded blend weight."""
+        assert InferenceConfig(prefix_caching_routing_alpha=5.0).prefix_caching_routing_alpha == 5.0
+
+    def test_routing_alpha_must_be_non_negative(self):
+        with pytest.raises(ValueError, match="prefix_caching_routing_alpha"):
+            InferenceConfig(prefix_caching_routing_alpha=-0.1)
+
     def test_async_sched_argparse_plumbing(self):
         parser = _add_inference_args(ArgumentParser())
         assert parser.parse_args([]).inference_dynamic_batching_async_sched_mode == "legacy"

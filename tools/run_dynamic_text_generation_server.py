@@ -171,6 +171,13 @@ async def run_text_generation_server(
                 default_top_p=default_top_p,
                 default_top_k=default_top_k,
                 eval_mode=eval_mode,
+                # Taken from the engine so the frontend hashes on the same block
+                # boundaries the engine caches on; a mismatch would name blocks it
+                # never held and every routing decision would miss.
+                block_size_tokens=engine.context.block_size_tokens,
+                prefix_caching_coordinator_policy=(
+                    engine.context.prefix_caching_coordinator_policy
+                ),
             )
 
         if getattr(args, 'frontend_on_all_ranks', False):

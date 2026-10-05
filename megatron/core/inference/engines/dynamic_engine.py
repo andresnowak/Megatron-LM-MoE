@@ -41,7 +41,9 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    FinishedRequestRecord,
     Status,
+    compute_block_hashes_batched,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -149,6 +151,45 @@ def format_mem_bytes(mem_bytes):
     return "%d bytes" % mem_bytes
 
 
+def _weight_scoped_salt(weight_epoch: int, media_cache_key: Optional[str]) -> Optional[str]:
+    """Keep persistent prefix-cache chains disjoint across weight generations."""
+    if weight_epoch == 0:
+        return media_cache_key
+    if media_cache_key is None:
+        return f"w{weight_epoch}"
+    return f"w{weight_epoch}\x00{media_cache_key}"
+
+
+def _engine_reply_frames(finished_requests: List[dict]) -> List[bytes]:
+    """Frame finished requests as [metadata, body, body, ...] for the coordinator.
+
+    The metadata frame carries only what the coordinator needs to route each
+    reply: the request id, and whether it must detokenize into the body. Every
+    body stays a separate opaque frame so the coordinator can forward it without
+    decoding -- a finished request echoes the prompt back, so decoding it costs
+    more than the inbound submission did.
+
+    Args:
+        finished_requests: Serialized requests, in the order their frames follow.
+
+    Returns:
+        The frames to send, metadata first.
+    """
+    metadata = [
+        Headers.ENGINE_REPLY.value,
+        [
+            [
+                request["request_id"],
+                bool((request.get("sampling_params") or {}).get("detokenize_generations")),
+            ]
+            for request in finished_requests
+        ],
+    ]
+    return [msgpack.packb(metadata, use_bin_type=True)] + [
+        msgpack.packb(request, use_bin_type=True) for request in finished_requests
+    ]
+
+
 def _get_decode_only_log_state(
     mode: AsyncScheduleMode, decode_only: DecodeOnly
 ) -> Tuple[str, Optional[bool]]:
@@ -248,6 +289,8 @@ class DynamicInferenceEngine(AbstractEngine):
         EngineState.STOPPED,
     )
 
+    _weight_epoch: int = 0
+
     @deprecate_args(
         *DEPRECATED_ARGS,
         message="Argument `{name}` has been deprecated. Only pass `controller` and `context`",
@@ -302,6 +345,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # Throw a cudagraph-admission warning if deferred for > max_sequence_length steps.
         # The floor avoids warnings in small test configs.
         self._cg_admission_warn_after = max(100, self.context.max_sequence_length)
+        self._initialize_disaggregation_state()
         # Initialize engine.
         self.reset()
 
@@ -338,9 +382,90 @@ class DynamicInferenceEngine(AbstractEngine):
         # Create cuda graphs.
         self.create_cuda_graphs()
 
+    def _initialize_disaggregation_state(self) -> None:
+        """Hook overridden by the KV-handoff engine composition."""
+
+    def _reset_pending_kv_imports(self) -> None:
+        """Hook overridden by the KV-handoff engine composition."""
+
+    @property
+    def pending_kv_import_count(self) -> int:
+        """Number of decode requests awaiting a KV import (none here)."""
+        return 0
+
+    @property
+    def has_admittable_kv_import(self) -> bool:
+        """Whether a completed KV import is eligible for admission (false here)."""
+        return False
+
+    def _poll_pending_kv_imports(self) -> int:
+        return 0
+
+    def _admit_pending_kv_imports(self) -> int:
+        return 0
+
+    def _setup_handoff_completion_tracking(self, hostname: str | None = None) -> None:
+        """Hook overridden by the KV-handoff engine composition."""
+
+    def _drain_handoff_completion_notifications(self) -> list[tuple[int, bool]]:
+        """Hook overridden by the KV-handoff engine composition."""
+        return []
+
+    def _record_handoff_completion_notification(self, request_id: int, failed: bool) -> None:
+        """Hook overridden by the KV-handoff engine composition."""
+        self._raise_kv_handoff_not_enabled("KV handoff completion notification")
+
+    def _prepare_handoff_metadata_batch(
+        self, requests_and_blocks: list[tuple], decode_tokens_by_request: Dict[int, list[int]]
+    ) -> dict:
+        """Hook overridden by the KV-handoff engine composition."""
+        if any(request.sampling_params.do_kv_handoff for request, _ in requests_and_blocks):
+            self._raise_kv_handoff_not_enabled("KV handoff completion")
+        return {}
+
+    def _capture_handoff_meta(self, request, prepared) -> None:
+        self._raise_kv_handoff_not_enabled("KV handoff completion")
+
+    def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
+        return 0
+
+    def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
+        """Raising stub; the hand-off engine composition overrides it."""
+        self._raise_kv_handoff_not_enabled("KV transfer setup")
+
+    def push_handoff_kv(self, request_id: int, decode_metas: list) -> None:
+        """Raising stub; the hand-off engine composition overrides it."""
+        self._raise_kv_handoff_not_enabled("SEND_KV")
+
+    def _poll_pending_kv_pushes(self) -> int:
+        return 0
+
+    @property
+    def pending_kv_push_count(self) -> int:
+        """Number of prefill sends awaiting completion (none here)."""
+        return 0
+
+    def add_request_with_kv_handoff(
+        self, request_id, prompt, sampling_params, kv_meta, src_block_ids
+    ) -> asyncio.Future[DynamicInferenceRequest]:
+        """Raising stub; the hand-off engine composition overrides it."""
+        self._raise_kv_handoff_not_enabled("SUBMIT_REQUEST_WITH_KV")
+
+    def release_handoff_blocks(self, request_id: int) -> None:
+        """Raising stub; the hand-off engine composition overrides it."""
+        self._raise_kv_handoff_not_enabled("RELEASE_KV")
+
+    @staticmethod
+    def _raise_kv_handoff_not_enabled(operation: str) -> None:
+        raise RuntimeError(
+            f"{operation} requires KV handoff, but it is not enabled. "
+            "Use DisaggDynamicInferenceEngine with KV transfer configured."
+        )
+
     def reset(self) -> None:
         """Reset by removing all requests and reset all state."""
 
+        self._reset_pending_kv_imports()
         self.context.reset()
 
         # Request state.
@@ -350,10 +475,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
+        if hasattr(self, "_pinned_handoff_blocks"):
+            self._pinned_handoff_blocks.clear()
         self.failed_request_ids = []
         # Generated token count already streamed for each request.
         self._partial_emit_lengths: Dict[int, int] = {}
         self._generation_epoch: Optional[int] = None
+        self._weight_epoch: int = 0
+        self.local_metadata_ledger_enabled: bool = False
+        self.local_metadata_ledger: dict[str, FinishedRequestRecord] = {}
         # Track requests that should stop due to stop words (detected in post_process_requests)
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
@@ -557,6 +687,7 @@ class DynamicInferenceEngine(AbstractEngine):
         launch_inference_coordinator: bool = True,
         *,
         hostname: str | None = None,
+        inference_coordinator_address: str | None = None,
         coordinator_schedule_output_path: str | None = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ):
@@ -597,6 +728,9 @@ class DynamicInferenceEngine(AbstractEngine):
             hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
                 If None, defaults to `socket.gethostname()`. Should be set to a routable
                 address in multi-node settings where gethostname() may return 127.0.0.1.
+            inference_coordinator_address (str | None): Existing coordinator endpoint
+                when launch_inference_coordinator is False. This keeps remote connection
+                addressing separate from each rank's local ZMQ binding hostname.
 
         Returns:
             inference_coordinator_addresss (str): The network address of the central
@@ -651,6 +785,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "enable_prefix_caching": self.context.enable_prefix_caching,
                     "prefix_caching_coordinator_policy": self.context.prefix_caching_coordinator_policy,
                     "prefix_caching_routing_alpha": self.context.prefix_caching_routing_alpha,
+                    "prefix_cache_ttl_seconds": self.context.prefix_cache_ttl_seconds,
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
                 },
@@ -669,7 +804,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     f"is already in use."
                 )
         elif not launch_inference_coordinator:
-            dp_addr = f"tcp://{local_ip}:{inference_coordinator_port}"
+            dp_addr = (
+                inference_coordinator_address or f"tcp://{local_ip}:{inference_coordinator_port}"
+            )
         else:
             dp_addr = None
 
@@ -715,6 +852,8 @@ class DynamicInferenceEngine(AbstractEngine):
         self.model_parallel_subscriber_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
         self.zmq_sockets += [self.model_parallel_subscriber_socket]
+
+        self._setup_handoff_completion_tracking(hostname)
 
         torch.distributed.barrier(mp_group)
 
@@ -867,6 +1006,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state not in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
+        # Bump before admitting anything under the resumed weights. Re-added
+        # requests retain their original hash salt through checkpoint/merge.
+        self._weight_epoch += 1
+
         # Resume.
         with self.__class__.suspend_resume_ctx(
             "resumed", unified_memory_level=self.unified_memory_level
@@ -928,6 +1071,26 @@ class DynamicInferenceEngine(AbstractEngine):
         async with self._cond:
             self._cond.notify_all()
 
+    def _send_request_records_to_coordinator(
+        self, records: List[DynamicInferenceRequestRecord]
+    ) -> None:
+        """Send completed or failed request records from the MP coordinator."""
+
+        merged_requests = [record.merge() for record in records]
+        if self.local_metadata_ledger_enabled:
+            # Failed requests are sent immediately but remain in the engine until the
+            # next bookkeeping pass. Index only completed requests as they are dropped.
+            for merged in merged_requests:
+                if merged.status == Status.FAILED:
+                    continue
+                assert (
+                    merged.uid not in self.local_metadata_ledger
+                ), f"finished-request ledger: duplicate uid {merged.uid!r}"
+                self.local_metadata_ledger[merged.uid] = FinishedRequestRecord.from_request(merged)
+        self.socket_for_receiving_requests.send_multipart(
+            _engine_reply_frames([request.serialize() for request in merged_requests])
+        )
+
     def _handle_failed_request(self, request_id: int):
         """Handle a failed request by sending the reply immediately.
 
@@ -953,11 +1116,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Send the reply immediately, because it may never get a chance to be sent again.
         if self.use_coordinator and self.is_mp_coordinator:
-            payload = msgpack.packb(
-                [Headers.ENGINE_REPLY.value, [request_entry.record.merge().serialize()]],
-                use_bin_type=True,
-            )
-            self.socket_for_receiving_requests.send(payload)
+            self._send_request_records_to_coordinator([request_entry.record])
         elif not self.use_coordinator:
             if request.prompt is None:
                 request.prompt = self.controller.tokenizer.detokenize(
@@ -1115,11 +1274,20 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return self.requests[request_id].future
 
+    def _compute_request_block_hashes(self, prompt_tokens: Tensor) -> List[int]:
+        """Hash engine-cache entries in the current weight generation's domain."""
+        return compute_block_hashes_batched(
+            prompt_tokens,
+            self.context.block_size_tokens,
+            cache_salt=_weight_scoped_salt(self._weight_epoch, None),
+        )
+
     def add_request(
         self,
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
+        precomputed_block_hashes: Optional[List[int]] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -1127,6 +1295,9 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
             sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
+            precomputed_block_hashes (Optional[List[int]]): Routing hashes for the
+                prompt's complete blocks. The engine recomputes them in its current
+                weight generation before using them as allocator cache keys.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -1161,6 +1332,11 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
+        # Routing hashes have no engine-weight provenance. Recompute locally before
+        # admitting them to the allocator; already-correct hashes remain identical.
+        if self.context.enable_prefix_caching and precomputed_block_hashes:
+            precomputed_block_hashes = self._compute_request_block_hashes(tokens)
+
         # Initialize request.
         request = DynamicInferenceRequest(
             request_id=request_id,
@@ -1169,6 +1345,8 @@ class DynamicInferenceEngine(AbstractEngine):
             sampling_params=sampling_params,
             block_size_tokens=self.context.block_size_tokens,
             enable_prefix_caching=self.context.enable_prefix_caching,
+            precomputed_block_hashes=precomputed_block_hashes or [],
+            block_hash_salt=_weight_scoped_salt(self._weight_epoch, None),
         )
 
         # Add request.
@@ -1189,6 +1367,8 @@ class DynamicInferenceEngine(AbstractEngine):
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
         finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
+        finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
+        finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -1213,6 +1393,9 @@ class DynamicInferenceEngine(AbstractEngine):
             finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
                 finished requests, saved before update_requests released them.
                 Used for per-block routing reconstruction.
+            finished_handoff_block_ids: Prompt KV block IDs retained for state handoff.
+            finished_handoff_decode_tokens: First sampled token and optional MTP proposals
+                needed to resume directly from imported prefill state on decode.
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -1244,8 +1427,21 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
 
+        # Convert the step's request IDs once, then batch-prepare handoff metadata for
+        # finished requests using the KV blocks retained before context cleanup.
+        request_id_list = request_ids.tolist()
+        handoff_blocks_by_request = finished_handoff_block_ids or {}
+        prepared_handoff_metadata = self._prepare_handoff_metadata_batch(
+            [
+                (self.get_request(request_id), handoff_blocks_by_request.get(request_id, []))
+                for request_id in request_id_list
+                if request_id in finished_request_ids
+            ],
+            finished_handoff_decode_tokens or {},
+        )
+
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
+            zip(request_id_list, sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
 
             # Ensure tokens is always a list for consistent handling
@@ -1358,6 +1554,16 @@ class DynamicInferenceEngine(AbstractEngine):
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
                     request.add_event_finish()
+                    # Keep handoff blocks only when the request needs them.
+                    handoff_blocks = handoff_blocks_by_request.get(request_id, [])
+                    if request.sampling_params.do_kv_handoff:
+                        self._capture_handoff_meta(
+                            request, prepared_handoff_metadata.get(request_id)
+                        )
+                    # A prefill-role engine may also serve regular requests; release the
+                    # temporary block references when no handoff was requested.
+                    elif handoff_blocks:
+                        self._release_pinned_handoff_blocks(handoff_blocks)
                     finished_entry = self.requests.pop(request_id)
                     finished_request = finished_entry.record[-1]
                     finished_request.generated_length = len(finished_request.generated_tokens)
@@ -1671,6 +1877,8 @@ class DynamicInferenceEngine(AbstractEngine):
         # Paused requests and insufficient KV capacity likewise require complete
         # lifecycle bookkeeping before preparing the next batch.
         if not self.context.can_prepare_requests():
+            return False
+        if self.has_admittable_kv_import:
             return False
         if not self.waiting_request_ids:
             return True
@@ -2119,9 +2327,16 @@ class DynamicInferenceEngine(AbstractEngine):
         if not partials:
             return
 
-        payload = msgpack.packb([Headers.ENGINE_REPLY_PARTIAL.value, partials], use_bin_type=True)
         nvtx_range_push("coordinator_streaming")
-        self.socket_for_receiving_requests.send(payload)
+        self.socket_for_receiving_requests.send_multipart(
+            [
+                msgpack.packb(
+                    [Headers.ENGINE_REPLY_PARTIAL.value, [p["request_id"] for p in partials]],
+                    use_bin_type=True,
+                )
+            ]
+            + [msgpack.packb(p, use_bin_type=True) for p in partials]
+        )
         nvtx_range_pop("coordinator_streaming")
 
         self._partial_emit_lengths.update(emit_lengths)
@@ -2158,6 +2373,8 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
+            finished_handoff_block_ids = step_result.get("finished_handoff_block_ids", None)
+            finished_handoff_decode_tokens = step_result.get("finished_handoff_decode_tokens", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -2180,6 +2397,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
                 finished_routing_block_ids=finished_routing_block_ids,
+                finished_handoff_block_ids=finished_handoff_block_ids,
+                finished_handoff_decode_tokens=finished_handoff_decode_tokens,
             )
 
         else:
@@ -2227,11 +2446,7 @@ class DynamicInferenceEngine(AbstractEngine):
             ]
             if records_to_send:
                 range_push("coordinator_communication")
-                payload = msgpack.packb(
-                    [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
-                    use_bin_type=True,
-                )
-                self.socket_for_receiving_requests.send(payload)
+                self._send_request_records_to_coordinator(records_to_send)
                 range_pop()
 
             # Stream newly generated tokens for active requests. Finished
@@ -2527,6 +2742,52 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return finished_request_records_list
 
+    @staticmethod
+    def _pack_tp_broadcast(messages: List[List[bytes]]) -> List[bytes]:
+        """Flatten per-message frame lists into one TP-broadcast multipart message.
+
+        A message is a list of frames -- metadata first, then any payload bodies.
+        ZMQ multipart is flat, so the frame boundaries would be lost on the wire.
+        They are carried instead in a manifest frame holding one frame count per
+        message, which lets peer ranks rebuild the grouping without any payload
+        being copied, decoded, or re-packed.
+
+        Args:
+            messages: One frame list per message, in delivery order.
+
+        Returns:
+            ``[tp_broadcast_header, manifest, *flattened frames]``.
+        """
+        manifest = msgpack.packb([len(message) for message in messages], use_bin_type=True)
+        return [bytes([Headers.TP_BROADCAST.value]), manifest] + [
+            frame for message in messages for frame in message
+        ]
+
+    @staticmethod
+    def _unpack_tp_broadcast(frames: List[bytes]) -> List[List[bytes]]:
+        """Rebuild per-message frame lists from a TP broadcast.
+
+        Inverse of :meth:`_pack_tp_broadcast`.
+
+        Args:
+            frames: The received multipart message, header frame first.
+
+        Returns:
+            One frame list per message, in the order they were packed.
+        """
+        frame_counts = msgpack.unpackb(frames[1], raw=False)
+        flat = frames[2:]
+        messages = []
+        offset = 0
+        for count in frame_counts:
+            messages.append(flat[offset : offset + count])
+            offset += count
+        assert offset == len(flat), (
+            f"TP broadcast manifest accounts for {offset} frames but {len(flat)} were received; "
+            "sender and receiver disagree on message framing"
+        )
+        return messages
+
     def schedule_requests(self) -> int:
         """Drains the ZMQ socket for a batch of requests and adds them to the engine.
 
@@ -2561,19 +2822,32 @@ class DynamicInferenceEngine(AbstractEngine):
         range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
+            # Locally-generated notifications are single-frame messages, so they
+            # are wrapped to match the frame-list shape of socket traffic.
+            all_messages.extend(
+                [
+                    msgpack.packb(
+                        [Headers.KV_HANDOFF_COMPLETE.value, request_id, failed], use_bin_type=True
+                    )
+                ]
+                for request_id, failed in self._drain_handoff_completion_notifications()
+            )
             while True:
                 try:
                     # Receive messages in a non-blocking way.
-                    all_messages.append(self.socket_for_receiving_requests.recv(flags=zmq.NOBLOCK))
+                    all_messages.append(
+                        self.socket_for_receiving_requests.recv_multipart(flags=zmq.NOBLOCK)
+                    )
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
             self.model_parallel_publisher_socket.send_multipart(
-                [bytes([Headers.TP_BROADCAST.value])] + all_messages
+                self._pack_tp_broadcast(all_messages)
             )
         else:
-            frames = self.model_parallel_subscriber_socket.recv_multipart()
-            all_messages = frames[1:]
+            all_messages = self._unpack_tp_broadcast(
+                self.model_parallel_subscriber_socket.recv_multipart()
+            )
 
         range_pop()
 
@@ -2581,14 +2855,38 @@ class DynamicInferenceEngine(AbstractEngine):
         # Control signals are queued for the second pass.
         new_generation_epoch = None
         for message in all_messages:
-            data = msgpack.unpackb(message, raw=False)
+            data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                request_id, prompt, sampling_params = data[1:]
+                request_id, sampling_params, media_meta = data[1:]
+                if media_meta is not None or msgpack.unpackb(message[2], raw=False) is not None:
+                    raise ValueError("Multimodal submissions are not supported by this engine")
+                prompt = msgpack.unpackb(message[1], raw=False)
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 range_push("add_request")
                 self.add_request(request_id, prompt, sampling_params)
                 range_pop()
+            elif header == Headers.SUBMIT_REQUEST_WITH_KV:
+                # Decode-side KV import. As on the plain path, the prompt rides
+                # in its own frame and the engine is its first consumer.
+                request_id, sampling_params, kv_meta = data[1:]
+                prompt = msgpack.unpackb(message[1], raw=False)
+                src_block_ids = msgpack.unpackb(message[2], raw=False)
+                sampling_params = SamplingParams.deserialize(sampling_params)
+                range_push("add_request_with_kv_handoff")
+                self.add_request_with_kv_handoff(
+                    request_id, prompt, sampling_params, kv_meta, src_block_ids
+                )
+                range_pop()
+            elif header == Headers.RELEASE_KV:
+                # Coordinator-broadcast release. Unknown request ids are no-ops.
+                self.release_handoff_blocks(int(data[1]))
+            elif header == Headers.SEND_KV:
+                # Push transport: send a pinned hand-off's KV to the decode
+                # instance the coordinator picked.
+                self.push_handoff_kv(int(data[1]), data[2])
+            elif header == Headers.KV_HANDOFF_COMPLETE:
+                self._record_handoff_completion_notification(int(data[1]), bool(data[2]))
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])
                 entry = self.requests.get(request_id)
@@ -2610,6 +2908,9 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 # Control signal: queue for second pass.
                 self._pending_signals.append(message)
+
+        self._poll_pending_kv_imports()
+        self._poll_pending_kv_pushes()
 
         if new_generation_epoch is not None:
             self._generation_epoch = new_generation_epoch
@@ -2633,7 +2934,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # processes one state transition per iteration).
         if self._pending_signals:
             message = self._pending_signals.popleft()
-            data = msgpack.unpackb(message, raw=False)
+            data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
 
             if header == Headers.PAUSE:
@@ -2720,10 +3021,25 @@ class DynamicInferenceEngine(AbstractEngine):
                             and (
                                 self.context.get_active_request_count() > 0
                                 or self.waiting_request_ids
+                                or self.pending_kv_import_count > 0
+                                or self.pending_kv_push_count > 0
                             )
                         )
                     )
-                await self.async_step()
+                self._poll_pending_kv_imports()
+                self._poll_pending_kv_pushes()
+                if (
+                    self.context.get_active_request_count() > 0
+                    or self.waiting_request_ids
+                    or self.has_admittable_kv_import
+                ):
+                    await self.async_step()
+                else:
+                    # Reached when there is no model work to step but a handoff transfer is
+                    # still pending. Handles expose polling rather than an async completion
+                    # callback, so yield briefly to avoid busy-spinning while keeping decode
+                    # admission responsive when the transfer completes.
+                    await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             pass
 
@@ -2813,9 +3129,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.schedule_requests()
 
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):
-                    local_pending = self.context.get_active_request_count() + len(
-                        self.waiting_request_ids
+                    local_schedulable = (
+                        self.context.get_active_request_count()
+                        + len(self.waiting_request_ids)
+                        + int(self.has_admittable_kv_import)
                     )
+                    local_pending_imports = self.pending_kv_import_count
                     if self.disable_ep_consensus:
                         # Skip the EP consensus all-reduce; act on local state only.
                         # NOTE: even with no consensus we must still participate in EP
@@ -2827,8 +3146,12 @@ class DynamicInferenceEngine(AbstractEngine):
                             await self._world_barrier()
                             self.state = EngineState.PAUSED
                             self._state_events[EngineState.PAUSED].set()
-                        elif local_pending > 0:
+                        elif local_schedulable > 0:
                             await self.async_step()
+                        elif self.ep_world_size == 1 and local_pending_imports > 0:
+                            # No model work is ready; poll the network transfer without
+                            # spending a dummy forward while waiting for decode admission.
+                            await asyncio.sleep(0.001)
                         else:
                             self.step_start_event.record()
                             nvtx_range_push("EP-dummy-forward")
@@ -2856,7 +3179,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         # In the worst case, this delays pausing by 20 steps which is around
                         # 200-400 milliseconds.
                         self._last_ep_consensus = await self._ep_establish_consensus(
-                            local_pending, signal_consensus=(self.state == EngineState.PAUSING)
+                            local_schedulable, signal_consensus=(self.state == EngineState.PAUSING)
                         )
                     global_work, all_pausing = self._last_ep_consensus
                     self._ep_consensus_loop_counter += 1
@@ -2868,14 +3191,14 @@ class DynamicInferenceEngine(AbstractEngine):
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
-                        if local_pending > 0:
+                        if local_schedulable > 0:
                             await self.async_step()
                         else:
                             # Dummy forward to participate in the EP collective.
                             self._run_ep_dummy_step()
                     else:
                         # No work, but not all pausing: idle.
-                        await asyncio.sleep(0.02)
+                        await asyncio.sleep(0.001 if local_pending_imports > 0 else 0.02)
 
                 elif self.state == EngineState.PAUSED:
                     await asyncio.sleep(0.02)

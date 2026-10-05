@@ -276,6 +276,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Hyperparameter for choosing to prioritize prefix hit matches vs minimizing idle load
         self.prefix_caching_routing_alpha = inference_config.prefix_caching_routing_alpha
+        self.prefix_cache_ttl_seconds = inference_config.prefix_cache_ttl_seconds
 
         # Monotonic clock for prefix caching LRU eviction ordering.
         # Incremented each engine step but kept independent so the engine step

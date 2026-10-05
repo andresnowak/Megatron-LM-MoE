@@ -81,10 +81,13 @@ RL_LOGGABLE_TIMER_NAMES = [
     # Top-level RL phases
     'rl/rollout-collection',
     'rl/prepare-data-for-update',
+    'rl/synchronize-cuda-and-collect-garbage',
+    'rl/run-evaluation',
     # Rollout collection breakdown
     'rl/inference-setup',
     'rl/collect-rollouts',
-    'rl/sync-rollouts',
+    'rl/sync-rollout-state',
+    'rl/sync-request-ledger',
     'rl/suspend-engine',
     # Optimizer offload/restore
     'rl/offload-optimizer-before-inference',
@@ -110,6 +113,7 @@ RL_LOGGABLE_TIMER_NAMES = [
     'rl/align-inference-logprobs',
     'rl/log-wandb-tb',
     'rl/pack-sequences',
+    'rl/pack-logprobs',
     'rl/regather-trajectories',
     # Logprobs computation
     'rl/compute-logprobs',
