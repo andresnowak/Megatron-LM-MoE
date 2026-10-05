@@ -1086,16 +1086,6 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
-    if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
-        try:
-            import flashinfer  # noqa: F401
-        except ImportError as e:
-            raise ImportError(
-                "--inference-dynamic-batching-sampling-backend=flashinfer requires "
-                "the flashinfer package; install it or pass "
-                "--inference-dynamic-batching-sampling-backend=torch."
-            ) from e
-
     if args.use_megatron_fsdp:
         # NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.
         #       Please use `use_megatron_fsdp` instead, as all functionality will be migrated there.
@@ -2062,7 +2052,7 @@ def _add_inference_args(parser):
                        help='Enable dynamic batching mode.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
-                       help='Amount of on-GPU memory allocated for the KV cache. '
+                       help='On-GPU portion of the shared KV cache block pool. '
                        'The total amount of memory allocated for the KV cache '
                        '(CPU + GPU memory) depends on the value set for the '
                        'unified virtual memory (UVM) level (via '
@@ -2074,10 +2064,12 @@ def _add_inference_args(parser):
                        'paused_buffer_size_gb`.')
     group.add_argument('--inference-dynamic-batching-paused-buffer-size-gb',
                        type=float, default=None,
-                       help='Amount of memory reserved for paused requests in '
-                       'the dynamic inference context. Active requests are '
-                       'paused when there are not enough active blocks available '
-                       'to continue generating a request.')
+                       help='Memory used to derive the paused-request block retention '
+                       'budget. This does not reserve blocks from active requests: '
+                       'active requests may use the entire shared pool of usable KV '
+                       'cache blocks. Under allocation pressure, paused requests '
+                       'retain blocks only within this budget and excess paused '
+                       'requests may be evicted.')
     group.add_argument('--inference-dynamic-batching-mamba-memory-ratio', type=float, default=None,
                        help='Percentage of memory buffer to allocate for Mamba states. '
                        'If not specified, allocates Mamba state tensors for each KV cache block. '
@@ -2193,11 +2185,18 @@ def _add_inference_args(parser):
                        choices=['torch', 'flashinfer'],
                        help='Which sampling kernels to use during inference. '
                             'Selecting "flashinfer" requires the flashinfer package.')
+    group.add_argument('--use-same-sampling-seed-across-dp-ranks',
+                       action='store_false', dest='offset_sampling_seed_by_dp_rank',
+                       default=True,
+                       help='Use the same inference sampling seed on every data-parallel rank. '
+                            '--deterministic-mode also uses the same seed on every DP rank.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
-                       type=str, default='legacy', choices=['legacy', 'serial'],
-                       help='Async scheduling mode for dynamic batching. "legacy" (default) '
-                            'preserves the existing resolve-before-prepare path; "serial" '
-                            'prepares and forwards decode-only steps before resolving finished requests.')
+                       type=str, default='legacy',
+                       choices=['legacy', 'async'],
+                       help='Async scheduling mode for dynamic batching. '
+                            '"legacy" (default) preserves the existing resolve-before-prepare '
+                            'path. "async" overlaps asynchronous scheduling phases by reordering '
+                            'them to prepare-before-resolve.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],

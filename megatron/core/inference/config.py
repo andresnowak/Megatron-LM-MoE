@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from dataclasses import InitVar, dataclass
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -199,8 +200,8 @@ class AsyncScheduleMode(str, Enum):
     LEGACY = "legacy"
     """Resolve requests before preparing the next forward pass."""
 
-    SERIAL = "serial"
-    """Prepare and forward speculatively before resolving sampled requests."""
+    ASYNC = "async"
+    """Overlap asynchronous scheduling phases by reordering them to prepare-before-resolve."""
 
 
 @dataclass
@@ -219,16 +220,18 @@ class InferenceConfig:
 
     buffer_size_gb: int = 20
     """
-    Buffer size reserved on the GPU for the KV cache.
+    On-GPU portion of the shared KV cache block pool.
     If `unified_memory_level` >= 1, then CPU memory is additionally utilized, resulting in a total
     buffer size of `buffer_size_gb + paused_buffer_size_gb`.
     """
 
     paused_buffer_size_gb: Optional[int] = None
     """
-    Portion of buffer reserved for paused requests. Active requests are paused when there are not
-    enough active blocks available to continue generating a request. The total buffer size
-    (active + paused) depends on `unified_memory_level` (uvm):
+    Memory used to derive the paused-request block retention budget. This does not reserve blocks
+    from active requests: active requests may use the entire shared pool of usable KV cache blocks.
+    When the pool cannot satisfy new allocations, paused requests retain blocks only within this
+    budget and excess paused requests may be evicted. The total buffer size depends on
+    `unified_memory_level` (uvm):
         - uvm 0: buffer_size_gb (paused buffer is inclusive)
         - uvm 1: buffer_size_gb + paused_buffer_size_gb
     """
@@ -409,7 +412,17 @@ class InferenceConfig:
     """
 
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
-    """Which sampling kernels to use during inference."""
+    """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
+    "flashinfer" is requested but the package is not installed."""
+
+    offset_sampling_seed_by_dp_rank: bool = True
+    """
+    If True, offset `inference_sampling_seed` by the data-parallel rank when seeding the
+    sampling RNG. This gives each DP rank a unique generation seed so that the same prompt
+    routed to different ranks produces different samples (important for RL training).
+    If False (or `ModelParallelConfig.deterministic_mode` / `--deterministic-mode` is
+    enabled), then all DP ranks share the same sampling / generation seed.
+    """
 
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.LEGACY
     """Mode used to schedule dynamic batching inference work."""
@@ -468,8 +481,9 @@ class InferenceConfig:
         if self.sampling_backend == 'flashinfer':
             try:
                 import flashinfer  # noqa: F401
-            except ImportError as e:
-                raise ImportError(
-                    "sampling_backend='flashinfer' requires the flashinfer package; "
-                    "install it or set sampling_backend='torch'."
-                ) from e
+            except ImportError:
+                warnings.warn(
+                    "sampling_backend='flashinfer' was requested but the flashinfer "
+                    "package is not installed; falling back to sampling_backend='torch'."
+                )
+                self.sampling_backend = 'torch'

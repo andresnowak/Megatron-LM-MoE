@@ -2373,7 +2373,7 @@ def get_asyncio_loop(loop: asyncio.AbstractEventLoop | None = None) -> asyncio.A
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError as e:
-            if _ASYNC_IO_LOOP is not None:
+            if _ASYNC_IO_LOOP is not None and not _ASYNC_IO_LOOP.is_closed():
                 return _ASYNC_IO_LOOP
             else:
                 _ASYNC_IO_LOOP = loop = asyncio.new_event_loop()
