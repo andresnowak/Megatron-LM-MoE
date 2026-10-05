@@ -135,6 +135,33 @@ class TestInferenceConfig:
 
         assert runtime_config.async_sched_mode == AsyncScheduleMode.ASYNC
 
+    @pytest.mark.parametrize("backend", ["UCX", "UCCL"])
+    def test_nixl_backend_argparse_to_runtime_config(self, backend):
+        parser = _add_inference_args(ArgumentParser())
+        assert parser.parse_args([]).inference_nixl_backend == "UCX"
+        args = parser.parse_args(["--inference-nixl-backend", backend])
+        setup_config = inference_cfg_from_args(args)
+        model = SimpleNamespace(
+            position_embedding_type="rotary",
+            max_sequence_length=2560,
+            pg_collection=None,
+            config=SimpleNamespace(params_dtype=torch.float16),
+            decoder=SimpleNamespace(layer_type_list=None, layers=[]),
+        )
+
+        runtime_config = setup_config.to_inference_config(model, verbose=False)
+
+        assert setup_config.inference_nixl_backend == backend
+        assert runtime_config.nixl_backend == backend
+        assert InferenceConfig().nixl_backend == "UCX"
+
+    def test_nixl_backend_rejects_auto_selection(self):
+        parser = _add_inference_args(ArgumentParser())
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--inference-nixl-backend", "auto"])
+        with pytest.raises(ValueError, match="nixl_backend"):
+            InferenceConfig(nixl_backend="auto")
+
     def test_offset_sampling_seed_argparse_plumbing(self):
         """Ensure the CLI can select a shared sampling seed across DP ranks."""
         parser = _add_inference_args(ArgumentParser())

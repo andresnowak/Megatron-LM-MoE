@@ -490,6 +490,9 @@ class InferenceConfig:
     all-reduce CPU cost for unconditional dummy_forwards on idle ranks.
     """
 
+    nixl_backend: Literal["UCX", "UCCL"] = "UCX"
+    """NIXL plugin used by disaggregated KV handoff setup unless explicitly overridden."""
+
     verbose: InitVar[bool] = False
     """Whether to log detailed context configuration at initialization.
     This is an InitVar and is not stored as a field on the config."""
@@ -497,6 +500,10 @@ class InferenceConfig:
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
         self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
+        if self.nixl_backend not in ("UCX", "UCCL"):
+            raise ValueError(
+                f"Unsupported nixl_backend {self.nixl_backend!r}; expected 'UCX' or 'UCCL'."
+            )
         # Not capped at 1: alpha stopped being a blend weight when the score became
         # cache_score - alpha * relative_load, and values above 1 are meaningful --
         # they let load outweigh a full cache hit once ranks diverge.

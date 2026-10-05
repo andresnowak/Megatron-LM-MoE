@@ -301,10 +301,23 @@ def test_completed_kv_handoff_enters_decode_without_waiting_queue(handoff_loop):
     admit.assert_called_once_with(engine.context, request, [10], [11], [55])
 
 
-def test_setup_pins_handoff_outputs_only_on_prefill():
+@pytest.mark.parametrize(
+    "transport_backend, configured_backend, explicit_backend, expected_backend",
+    [
+        ("nixl", "UCX", None, "UCX"),
+        ("nixl", "UCCL", None, "UCCL"),
+        ("nixl", "UCCL", "UCX", "UCX"),
+        ("nccl", "UCCL", None, None),
+    ],
+)
+def test_setup_pins_handoff_outputs_only_on_prefill(
+    transport_backend, configured_backend, explicit_backend, expected_backend
+):
+    selected_backends = []
+
     class _Backend:
-        def __init__(self, **_kwargs):
-            pass
+        def __init__(self, **kwargs):
+            selected_backends.append(kwargs.get("nixl_backend"))
 
         def export_meta(self):
             return {"transport": "test"}
@@ -315,6 +328,7 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
     )
     engine.context = SimpleNamespace(
+        config=SimpleNamespace(nixl_backend=configured_backend),
         kv_block_allocator=allocator,
         memory_buffer=torch.empty(2, 1, 8, 4, 1, 1),
         is_hybrid_model=False,
@@ -340,10 +354,13 @@ def test_setup_pins_handoff_outputs_only_on_prefill():
         mock.patch(pg_size, return_value=1),
         mock.patch(pg_rank, return_value=0),
     ):
-        engine.setup_kv_transfer("decode")
+        engine.setup_kv_transfer("decode", backend=transport_backend, nixl_backend=explicit_backend)
         assert not allocator.enable_handoff_pinning
-        engine.setup_kv_transfer("prefill")
+        engine.setup_kv_transfer(
+            "prefill", backend=transport_backend, nixl_backend=explicit_backend
+        )
         assert allocator.enable_handoff_pinning
+        assert selected_backends == [expected_backend, expected_backend]
 
 
 def test_reset_cancels_capacity_queued_handoffs(handoff_loop):

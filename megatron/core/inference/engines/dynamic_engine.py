@@ -429,7 +429,9 @@ class DynamicInferenceEngine(AbstractEngine):
     def _release_pinned_handoff_blocks(self, block_ids: list) -> int:
         return 0
 
-    def setup_kv_transfer(self, role: str, backend: str = "nixl") -> None:
+    def setup_kv_transfer(
+        self, role: str, backend: str = "nixl", *, nixl_backend: Optional[str] = None
+    ) -> None:
         """Raising stub; the hand-off engine composition overrides it."""
         self._raise_kv_handoff_not_enabled("KV transfer setup")
 

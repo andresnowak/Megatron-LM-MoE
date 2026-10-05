@@ -221,6 +221,9 @@ class InferenceSetupConfig:
     inference_coordinator_port: int | None = None
     """This port will be used to setup the inference coordinator on node-0."""
 
+    inference_nixl_backend: Literal["UCX", "UCCL"] = "UCX"
+    """NIXL plugin for disaggregated KV transfers. Does not enable handoff or change collectives."""
+
     inference_use_synchronous_zmq_collectives: bool = False
     """Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for
     MoEs."""
@@ -385,6 +388,7 @@ class InferenceSetupConfig:
             num_speculative_tokens=self.num_speculative_tokens,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
             disable_ep_consensus=self.inference_disable_ep_consensus,
+            nixl_backend=self.inference_nixl_backend,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(

@@ -2194,6 +2194,11 @@ def _add_inference_args(parser):
                        required=False, default=False, help='Enable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int,
                        help="This port will be used to setup the inference coordinator on node-0")
+    group.add_argument('--inference-nixl-backend', type=str, default='UCX',
+                       choices=['UCX', 'UCCL'],
+                       help='NIXL plugin for disaggregated KV transfers. Defaults to UCX; '
+                            'the selected plugin must be installed. Does not enable handoff '
+                            'or change NCCL collectives.')
     group.add_argument('--mamba-inference-conv-states-dtype', type=str,
                        choices=['bf16', 'fp16', 'fp32'], default='bf16',
                        help='Dtype for the Mamba inference conv states tensor')

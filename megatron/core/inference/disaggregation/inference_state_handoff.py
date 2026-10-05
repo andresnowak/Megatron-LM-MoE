@@ -195,7 +195,7 @@ class InferenceStateHandoffMixin:
         super().schedule_waiting_requests()
 
     def setup_kv_transfer(
-        self, role: str, backend: str = "nixl", *, nixl_backend: str = "UCX"
+        self, role: str, backend: str = "nixl", *, nixl_backend: str | None = None
     ) -> None:
         """Bring up the KV transfer agents for this engine.
 
@@ -206,7 +206,9 @@ class InferenceStateHandoffMixin:
             role: "prefill" or "decode"; used to name the local transfer agent.
             backend: transfer backend name, resolved through the explicit
                 registry ("nixl"; "nccl" selects the two-sided push family).
-            nixl_backend: Explicit NIXL plugin selection; defaults to UCX.
+            nixl_backend: Explicit NIXL plugin override. When omitted, uses
+                context.config.nixl_backend (UCX by default), configured through
+                --inference-nixl-backend for CLI-created inference configs.
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
@@ -222,8 +224,10 @@ class InferenceStateHandoffMixin:
         backend_cls = construct_kv_transfer_backend_class(backend)
         backend_options = {}
         if backend.lower().replace("_", "-") == "nixl":
-            backend_options["nixl_backend"] = nixl_backend
-        elif nixl_backend != "UCX":
+            backend_options["nixl_backend"] = (
+                self.context.config.nixl_backend if nixl_backend is None else nixl_backend
+            )
+        elif nixl_backend not in (None, "UCX"):
             raise ValueError("nixl_backend is only applicable to the NIXL transfer backend")
 
         # Prefill output blocks stay pinned until the peer finishes reading
