@@ -412,12 +412,11 @@ class TopKRouter(Router):
                 self.config.moe_router_quantile_balancing_method == 'histogram'
             )
             use_marin = self.config.moe_router_quantile_balancing_method == 'marin_histogram'
-            if should_update_beta and (use_histogram or use_marin):
             compute_drop_priority = (
                 self.config.moe_expert_capacity_factor is not None
                 and self.config.moe_token_drop_policy == "probs"
             )
-            if (should_update_beta and use_histogram) or compute_drop_priority:
+            if (should_update_beta and (use_histogram or use_marin)) or compute_drop_priority:
                 topk_result = biased_scores.topk(self.topk + 1, dim=1)
                 indices = topk_result.indices[:, : self.topk]
             else:
