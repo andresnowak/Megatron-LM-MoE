@@ -233,6 +233,8 @@ try:
 
         # --- 5. Format Response (matching old_completions.py) ---
         choices = []
+        total_completion_tokens = 0
+        prompt_tokens_counts = []
 
         request_idx = 0
         response_uid = None
@@ -242,6 +244,17 @@ try:
                 response_uid = result["uid"]
             full_text = result["generated_text"] or ""
             text_output = (prompts_as_strings[request_idx] + full_text) if echo else full_text
+
+            generated_tokens = result.get("generated_tokens") or []
+            prompt_tokens_list = result.get("prompt_tokens") or []
+            total_completion_tokens += len(generated_tokens)
+            prompt_tokens_counts.append(len(prompt_tokens_list))
+
+            finish_reason = "length"
+            sampling_params_result = result.get("sampling_params") or {}
+            num_tokens_requested = sampling_params_result.get("num_tokens_to_generate")
+            if num_tokens_requested is None or len(generated_tokens) < num_tokens_requested:
+                finish_reason = "stop"
 
             logprobs_data = None
             if sampling_params.return_log_probs:
@@ -306,20 +319,44 @@ try:
                     "top_logprobs": top_logprobs,
                 }
 
-            choices.append({"index": request_idx, "text": text_output, "logprobs": logprobs_data})
+            choice_data = {
+                "index": request_idx,
+                "text": text_output,
+                "logprobs": logprobs_data,
+                "finish_reason": finish_reason,
+                "prompt_token_ids": result["prompt_tokens"],
+                "generation_token_ids": result["generated_tokens"],
+                "generation_log_probs": result.get("generated_log_probs", []),
+            }
+
             if result["routing_indices"] is not None:
-                choices[-1]["moe_topk_indices"] = result["routing_indices"]
+                choice_data["moe_topk_indices"] = result["routing_indices"]
                 prompt_length = (
                     len(result["prompt_tokens"]) if result["prompt_tokens"] is not None else 0
                 )
                 if prompt_length:
-                    choices[-1]["prompt_moe_topk_indices"] = result["routing_indices"][
+                    choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_length
                     ]
 
+            choices.append(choice_data)
             request_idx += 1
 
-        return jsonify({"id": response_uid, "choices": choices})
+        prompt_token_count = sum(prompt_tokens_counts)
+        return jsonify(
+            {
+                "id": response_uid,
+                "object": "text_completion",  # as per the openAI spec
+                "created": int(time.time()),
+                "model": "EMPTY",
+                "choices": choices,
+                "usage": {
+                    "prompt_tokens": prompt_token_count,
+                    "completion_tokens": total_completion_tokens,
+                    "total_tokens": prompt_token_count + total_completion_tokens,
+                },
+            }
+        )
 
 except ImportError as e:
     logger.warning(f"Could not import quart: {e}")

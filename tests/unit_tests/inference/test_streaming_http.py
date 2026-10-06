@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import json
 
 import pytest
@@ -89,3 +90,58 @@ async def test_http_streams_deltas_and_usage_through_real_endpoint(chat):
     assert chunks[-1]["usage"]["prompt_tokens"] == prompt_tokens
     assert chunks[-1]["usage"]["completion_tokens"] == 4
     assert chunks[-1]["usage"]["total_tokens"] == prompt_tokens + 4
+
+
+@pytest.mark.asyncio
+async def test_http_batch_completion_fields_and_total_prompt_usage():
+    tokenizer = _Tokenizer()
+
+    class Client:
+        def add_request_with_id(self, prompt, sampling_params):
+            request_id = len(self.requests) + 1
+            self.requests.append((prompt, sampling_params))
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(
+                {
+                    "uid": f"completion-{request_id}",
+                    "generated_text": "ab",
+                    "prompt_tokens": prompt,
+                    "generated_tokens": tokenizer.tokenize("ab"),
+                    "generated_log_probs": [-0.1, -0.2],
+                    "routing_indices": None,
+                    "sampling_params": {
+                        "num_tokens_to_generate": sampling_params.num_tokens_to_generate
+                    },
+                }
+            )
+            return request_id, future
+
+        def __init__(self):
+            self.requests = []
+
+    client = Client()
+    app = quart.Quart(__name__)
+    app.config.update(client=client, tokenizer=tokenizer, verbose=False)
+    app.register_blueprint(completions.bp)
+    response = await app.test_client().post(
+        "/v1/completions", json={"prompt": ["hi", "hello"], "max_tokens": 2, "logprobs": 1}
+    )
+    assert response.status_code == 200
+    data = await response.get_json()
+    assert data["id"] == "completion-1"
+    assert data["object"] == "text_completion"
+    assert isinstance(data["created"], int)
+    assert len(data["choices"]) == 2
+    for choice, (prompt, params) in zip(data["choices"], client.requests):
+        assert params.return_prompt_tokens is True
+        assert choice["finish_reason"] == "length"
+        assert choice["prompt_token_ids"] == prompt
+        assert choice["generation_token_ids"] == tokenizer.tokenize("ab")
+        assert choice["generation_log_probs"] == [-0.1, -0.2]
+        assert choice["text"] == "ab"
+    prompt_count = sum(len(prompt) for prompt, _ in client.requests)
+    assert data["usage"] == {
+        "prompt_tokens": prompt_count,
+        "completion_tokens": 4,
+        "total_tokens": prompt_count + 4,
+    }
