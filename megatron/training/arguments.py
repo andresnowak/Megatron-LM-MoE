@@ -2086,8 +2086,15 @@ def _add_inference_args(parser):
     group.add_argument('--inference-cuda-graph-all-prefills',
                        action='store_true', default=False,
                        help='Extend prefill/mixed CUDA graph capture up to `max_tokens`. '
-                       'By default, all graphs are limited by the decode limit of '
-                       '`max_requests * (num_speculative_tokens + 1)`.')
+                       'By default, prefill/mixed graphs use the clamped '
+                       '`inference_cuda_graph_max_tokens` ceiling (512 tokens).')
+    group.add_argument('--inference-cuda-graph-max-tokens', type=int, default=512,
+                       dest='inference_cuda_graph_max_tokens',
+                       help='Token ceiling for the largest captured prefill/mixed CUDA '
+                       'graph (default: 512). Clamped to at least the decode limit '
+                       '`max_requests * (num_speculative_tokens + 1)` and at most '
+                       '`max_tokens`. Ignored when --inference-cuda-graph-all-prefills '
+                       'is set (which extends capture to the full `max_tokens`).')
     group.add_argument('--inference-dynamic-batching-unified-memory-level',
                        type=int, default=0, choices=[0, 1],
                        help='Set unified memory usage within the dynamic '
@@ -2867,6 +2874,10 @@ def _add_rl_args(parser):
 
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
+    group.add_argument('--rl-profile', action='store_true', default=False,
+                        help='Enable RL profiling to collect detailed timer data (JSONL + CSV).')
+    group.add_argument('--rl-profile-dir', type=str, default=None,
+                        help='Directory to write RL profiling data. Defaults to {save}/profiles.')
     group.add_argument('--rl-inference-parsers', nargs='*', default=[],
                        help='List of response parsers to enable for RL inference '
                             '(e.g. --rl-inference-parsers deepseek-r1-reasoning qwen3-coder-tool).')
