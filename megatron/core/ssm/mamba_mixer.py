@@ -347,6 +347,14 @@ class MambaMixer(MegatronModule):
             self.A_log = nn.Parameter(A_log)
             setattr(self.A_log, "tensor_model_parallel", True)
             setattr(self.A_log, "partition_dim", 0)
+            # Persistent inference cache for -exp(A_log.float()). Allocated
+            # here (outside any later CUDA-graph capture) so its address
+            # lives in the default memory pool and stays valid across every
+            # graph capture and replay, including across RL train/eval
+            # cycles. Never freed -- the memory cost is ``nheads * 4B`` per
+            # layer (a few KB across a full model).
+            self._A_neg_exp_cache = torch.empty_like(A_log, dtype=torch.float32)
+            self._A_neg_exp_cache_stale = True
         # D "skip" parameter
         self.D = nn.Parameter(
             torch.ones(
@@ -1023,6 +1031,37 @@ class MambaMixer(MegatronModule):
 
         return y
 
+    @torch.no_grad()
+    def refresh_cache(self) -> None:
+        """Refresh the existing decode-cache storage from the current ``A_log``."""
+        self._A_neg_exp_cache.copy_(-torch.exp(self.A_log.float()))
+        self._A_neg_exp_cache_stale = False
+
+    def _get_decode_A_neg_exp(self) -> torch.Tensor:
+        """Cached ``-exp(A_log.float())`` pre-expanded to ``(nheads, headdim, dstate)``.
+
+        A_log is frozen during inference; recomputing it per token otherwise
+        launches three small elementwise kernels (float cast, exp, neg) that
+        rival ``selective_state_update`` itself in the decode profile. The
+        stride-0 expand view also triggers the kernel's TIE_HDIM fast path.
+        """
+        if self.training or torch.is_grad_enabled():
+            base = -torch.exp(self.A_log.float())
+            return base.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+        # Inference path. Refill when stale
+        if self._A_neg_exp_cache_stale:
+            self.refresh_cache()
+        return self._A_neg_exp_cache.view(-1, 1, 1).expand(-1, self.headdim, self.d_state)
+
+    def train(self, mode: bool = True):
+        """Mark the decode cache stale in training and refresh it for evaluation."""
+        if mode:
+            self._A_neg_exp_cache_stale = True
+        elif self._A_neg_exp_cache_stale:
+            # CUDA graph replay bypasses the Python lazy-refresh path.
+            self.refresh_cache()
+        return super().train(mode)
+
     def _ssm_decode(
         self,
         zxBCdt: torch.Tensor,
@@ -1101,12 +1140,12 @@ class MambaMixer(MegatronModule):
             ],
             dim=-1,
         )
-        A = -torch.exp(self.A_log.float())
 
         # SSM step
         if selective_state_update is None:
             # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
+            A = -torch.exp(self.A_log.float())
 
             x = x.squeeze(1)
             B = B.squeeze(1)
@@ -1162,7 +1201,7 @@ class MambaMixer(MegatronModule):
 
             y = y.unsqueeze(1)  # Restore seq dimension
         else:
-            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
+            A = self._get_decode_A_neg_exp()
 
             # Incorporate sequence dimension in einops rearrengements
             dt = repeat(dt, "b s h -> b s h p", p=self.headdim)

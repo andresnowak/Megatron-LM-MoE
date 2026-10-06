@@ -48,12 +48,15 @@ def initialize_megatron(
     get_position_embedding_ranks=None,
     parsed_args=None,
     store=None,
+    skip_dependency_compilation=False,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
     `allow_no_cuda` should not be set unless using megatron for cpu only
     data processing. In general this arg should not be set unless you know
     what you are doing.
+    `skip_dependency_compilation` should only be set by workloads that do not
+    use the C++ dataset helpers.
     Returns a function to finalize distributed env initialization
     (optionally, only when args.lazy_mpu_init == True)
     """
@@ -169,7 +172,8 @@ def initialize_megatron(
         _init_autoresume()
 
         # Compile dependencies.
-        _compile_dependencies()
+        if not skip_dependency_compilation:
+            _compile_dependencies()
 
         if args.tp_comm_overlap:
             # TODO: Should this be activated with just decoder-tp-comm-overlap too?
