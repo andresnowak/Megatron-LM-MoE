@@ -112,8 +112,13 @@ class MambaSlotAllocator:
         # CPU flag to skip GPU sync when no intermediates exist
         self._has_intermediates = False
 
-        # Pre-allocated output buffers for CUDA graph compatible extraction (GPU).
-        self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
+        # Pre-allocated "scratch" output buffers for CUDA graph compatible
+        # extraction (GPU): per-step staging that the kernel writes intermediate
+        # states into before commit copies them to the durable cache above. Sized
+        # by the per-step token budget computed once on the context; the budget
+        # accounting in DynamicInferenceContext refers to these as the "scratch"
+        # buffers.
+        self.max_intermediate_count = context.max_mamba_intermediate_states_per_step
         self.intermediate_ssm_out = torch.zeros(
             (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
             dtype=ssm_states_dtype,
@@ -450,7 +455,8 @@ class MambaSlotAllocator:
         penultimate_abs = (overall_required_blocks - 1) * bs
         mamba_chunk_size = ctx.mamba_chunk_size
 
-        # Keep only boundaries inside the computed chunk on a mixer chunk boundary.
+        # Keep only boundaries that land inside this chunk's computed tokens and on
+        # a mamba-chunk boundary (required for mid-sequence state extraction).
         offsets_set = set()
         for abs_pos in (kv_div_abs, last_aligned_abs, penultimate_abs):
             offset = abs_pos - chunk_start
