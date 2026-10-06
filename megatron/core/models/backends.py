@@ -87,7 +87,9 @@ class BackendSpecProvider(Protocol):
         ...
 
     @abstractmethod
-    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool, moe_use_offloading_experts: bool = False,) -> ExpertsBuilder:
+    def grouped_mlp_modules(
+        self, moe_use_grouped_gemm: bool, moe_use_offloading_experts: bool = False
+    ) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         ...
 
@@ -132,14 +134,11 @@ class LocalSpecProvider(BackendSpecProvider):
         return DotProductAttention
 
     def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool,
-        moe_use_offloading_experts: bool = False,
+        self, moe_use_grouped_gemm: bool, moe_use_offloading_experts: bool = False
     ) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
         if moe_use_offloading_experts:
-            return partial(
-                OffloadingExpertsMLP,
-            )
+            return partial(OffloadingExpertsMLP)
         return partial(
             SequentialMLP,
             submodules=MLPSubmodules(
@@ -198,8 +197,12 @@ class InferenceSpecProvider(BackendSpecProvider):
         # design these classes always meet the interface.
         return cast(TEActivationFunctionBuilder, TEActivationOp)
 
-    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
+    def grouped_mlp_modules(
+        self, moe_use_grouped_gemm: bool, moe_use_offloading_experts: bool = False
+    ) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
+        if moe_use_offloading_experts:
+            raise NotImplementedError("InferenceGroupedMLP does not support offloading experts")
         return partial(
             InferenceGroupedMLP,
             submodules=GroupedMLPSubmodules(
