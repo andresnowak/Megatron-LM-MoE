@@ -2901,13 +2901,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         self.setup_model(
             torch.float32,
             static=False,
-            mtp_num_layers=num_spec,
             num_speculative_tokens=num_spec,
+            mtp_num_layers=num_spec,
             max_requests=2,
         )
 
         # Enable speculative decoding
-        self.text_generation_controller.num_speculative_tokens = num_spec
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
@@ -3062,7 +3061,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         self.text_generation_controller.num_speculative_tokens = 2
-        self.text_generation_controller.num_mtp_heads = 2
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
         ctx.total_request_count = 2
         ctx.paused_request_count = 0

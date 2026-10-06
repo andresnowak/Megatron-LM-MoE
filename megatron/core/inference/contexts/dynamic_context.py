@@ -1048,14 +1048,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_speculative_tokens + 1, device='cpu'
         )
 
-        # Track request metadata in pinned CPU memory. The third tuple field is
-        # retained for request-schema compatibility, but CPU bookkeeping does
-        # not use it as an allocation policy. GPU consumers use explicit fields
+        # Track request metadata in pinned CPU memory. GPU consumers use explicit fields
         # in ContextGPUView (temperature/top-k/top-p today), while termination
         # and response metadata remain CPU-side.
         self.request_metadata = {
             label: torch.empty((self.max_requests,), dtype=dtype, device='cpu', pin_memory=True)
-            for label, dtype, _ in self.request_metadata_types
+            for label, dtype in self.request_metadata_types
         }
 
         # Static tensor addresses of active slices to enable fast inference
@@ -1932,7 +1930,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_output_lengths[request_slice] = lengths_tensor + tokens_to_generate_tensor
         self.request_kv_length_offsets[request_slice] = 0
         self.request_kv_block_counts[request_slice] = block_counts
-        for i, (label, dtype, _) in enumerate(self.request_metadata_types):
+        for i, (label, dtype) in enumerate(self.request_metadata_types):
             self.request_metadata[label][request_slice] = torch.tensor(
                 metadata_cols[i], dtype=dtype, device='cpu'
             )
@@ -2185,20 +2183,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         # EP dummy requests are added AFTER the EP sync below.
         if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
-        elif is_expert_parallel_dummy_cuda_graph_step:
-            self.add_dummy_requests_for_expert_parallel_step(
-                InferenceBatchDimensions(
-                    token_count=self.num_speculative_tokens + 1,
-                    prefill_req_count=0,
-                    decode_req_count=1,
-                )
-            )
 
-        batch_dimensions = InferenceBatchDimensions(
-            token_count=self.active_token_count,
-            prefill_req_count=self.num_prefill_requests,
-            decode_req_count=self.num_decode_requests,
-        )
+        if is_expert_parallel_dummy_cuda_graph_step:
+            # No real requests on this EP rank. Pass empty dimensions so the EP
+            # all-reduce in match_graph_config picks up the real ranks' values.
+            batch_dimensions = InferenceBatchDimensions(
+                token_count=0, prefill_req_count=0, decode_req_count=0
+            )
+        else:
+            batch_dimensions = InferenceBatchDimensions(
+                token_count=self.active_token_count,
+                prefill_req_count=self.num_prefill_requests,
+                decode_req_count=self.num_decode_requests,
+            )
 
         self.batch_dimensions = batch_dimensions
 
@@ -2217,6 +2214,23 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if construct_graph_dimensions is not None:
             assert self._using_cuda_graph_this_step
+
+        if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
+            # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
+            # could not find a compatible cuda graph for the dummy forward step.
+            # Now, we need not do the remaining setup. The controller
+            # will directly call the model forward pass with a single token.
+            return
+
+        # Add dummy requests AFTER the EP sync so they match the resolved graph.
+        if is_expert_parallel_dummy_cuda_graph_step:
+            self.add_dummy_requests_for_expert_parallel_step(best_graph)
+            batch_dimensions = InferenceBatchDimensions(
+                token_count=self.active_token_count,
+                prefill_req_count=self.num_prefill_requests,
+                decode_req_count=self.num_decode_requests,
+            )
+            self.batch_dimensions = batch_dimensions
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
@@ -2650,11 +2664,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not preserve_prefix_cache:
             self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
-
-        # Reset step counters and LRU clock only for an actual context reset.
-        if not preserve_counters:
-            self.step_count = 0
-            self.prefix_cache_lru_clock = 0
 
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
@@ -3123,7 +3132,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         metadata = req.tracked_metadata
         metadata_types = req.get_metadata_types()
         for m, m_type in zip(metadata, metadata_types):
-            label, _, _ = m_type
+            label, _ = m_type
             if not isinstance(m, torch.Tensor):
                 m = torch.as_tensor(
                     m,

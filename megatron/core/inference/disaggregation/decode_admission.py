@@ -79,7 +79,7 @@ def admit_prefilled_decode(
 
     context.request_ids[current_id] = request.request_id
     for metadata, metadata_type in zip(request.tracked_metadata, request.get_metadata_types()):
-        label, _, _ = metadata_type
+        label, _ = metadata_type
         value = metadata
         if not isinstance(value, torch.Tensor):
             value = torch.as_tensor(

@@ -4,7 +4,6 @@ import asyncio
 import concurrent
 import copy
 import functools
-import inspect
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Union
@@ -44,6 +43,7 @@ from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
 from megatron.core.utils import (
+    accepts_parameter,
     get_asyncio_loop,
     get_model_config,
     get_pg_size,
@@ -248,7 +248,6 @@ class TextGenerationController:
         # InferenceConfig.offset_sampling_seed_by_dp_rank, but deactivated when enabling
         # --deterministic-mode (model_config.deterministic_mode).
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
-        self.num_mtp_heads = self._get_mtp_num_heads()
         seed = self.model_config.inference_sampling_seed
         offset_by_dp = (
             inference_config.offset_sampling_seed_by_dp_rank
@@ -283,13 +282,6 @@ class TextGenerationController:
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
-
-    def _get_mtp_num_heads(self) -> int:
-        """Get the number of MTP layers from the model config."""
-        model = self.inference_wrapped_model.model
-        if hasattr(model, 'config') and hasattr(model.config, 'mtp_num_layers'):
-            return model.config.mtp_num_layers or 0
-        return 0
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -474,12 +466,7 @@ class TextGenerationController:
             while tokens and tokens[-1] == tokenizer.eod:
                 tokens = tokens[:-1]
 
-        detok_params = inspect.signature(tokenizer.detokenize).parameters.values()
-        detok_accepts_skip = any(
-            param.name == "skip_special_tokens" or param.kind == inspect.Parameter.VAR_KEYWORD
-            for param in detok_params
-        )
-        if detok_accepts_skip:
+        if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
             return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
         else:
             return tokenizer.detokenize(tokens)
@@ -1732,7 +1719,7 @@ class TextGenerationController:
         - When PP > 1: participate in the ``broadcast_from_last_pipeline_stage``
           that the real ranks also perform.
         """
-        if self.num_speculative_tokens == 0 or self.num_mtp_heads == 0:
+        if self.num_speculative_tokens == 0 or self.num_mtp_depths == 0:
             return
         if self.model_config.expert_model_parallel_size <= 1:
             return
@@ -3257,6 +3244,14 @@ class TextGenerationController:
                         )
             range_pop()
 
+            # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
+            # resets num_prefill_requests to 0, which would make num_decode_requests
+            # always equal to the full active count.
+            num_decode_requests = context.num_decode_requests
+            if self.num_speculative_tokens > 0:
+                # Prefill-only batches must not have any accepted speculative tokens.
+                assert num_decode_requests > 0 or (self._accepted_tokens_per_request == -1).all()
+
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
                 # a one-shot D2H here to keep "sample" as a CPU tensor for
@@ -3271,9 +3266,9 @@ class TextGenerationController:
 
             ret = {
                 "accepted_tokens": (
-                    # Clone needed: .fill_(-1) on line 1480 would corrupt the returned value.
+                    # Clone needed: .fill_(-1) below would corrupt the returned value.
                     self._accepted_tokens_per_request.clone()
-                    if self.num_speculative_tokens > 0
+                    if self.num_speculative_tokens > 0 and num_decode_requests > 0
                     else None
                 ),
                 "log_probs": log_probs,

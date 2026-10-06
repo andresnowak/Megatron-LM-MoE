@@ -212,7 +212,7 @@ def test_prefilled_decode_admission_uses_imported_kv_without_prompt_tokens():
         active_token_count=0,
         max_tokens=8,
         request_metadata_types=metadata_types,
-        request_metadata={label: torch.empty(2, dtype=dtype) for label, dtype, _ in metadata_types},
+        request_metadata={label: torch.empty(2, dtype=dtype) for label, dtype in metadata_types},
         request_to_kv_block_ids=torch.full((2, 4), -1, dtype=torch.int32),
         request_ids=torch.full((2,), -1, dtype=torch.int64),
         request_kv_length_offsets=torch.zeros(2, dtype=torch.int32),

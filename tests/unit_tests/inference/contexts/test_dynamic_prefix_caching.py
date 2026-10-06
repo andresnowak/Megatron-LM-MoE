@@ -2411,7 +2411,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                     "mamba": "mamba_restores",
                 }.get(case["feature"])
                 feature_before = evidence[feature_key] if feature_key is not None else None
-                mtp_before = int(engine._spec_tokens_proposed)
+                mtp_before = sum(engine._spec_tokens_proposed_per_pos)
                 result = engine.step_modern()
                 step_count += 1
                 newly_cached_ids = {
@@ -2440,7 +2440,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
                 # witness belongs to a later decode step rather than the hit step.
                 # A cached request whose generated length grows in a step that
                 # records proposals necessarily contributed to the MTP counter.
-                mtp_after = int(engine._spec_tokens_proposed)
+                mtp_after = sum(engine._spec_tokens_proposed_per_pos)
                 if case["feature"] == "mtp" and mtp_after > mtp_before:
                     mtp_seen_for_cached_decode |= any(
                         request.request_id in cached_request_ids
@@ -2510,7 +2510,7 @@ class TestPrefixCacheRealEngineMatrix(DynamicInferenceEngineTestBase):
 
         return finished, {
             "saw_chunk": saw_chunk,
-            "mtp_tokens_proposed": int(engine._spec_tokens_proposed),
+            "mtp_tokens_proposed": sum(engine._spec_tokens_proposed_per_pos),
             "min_pool_avail": min_pool_avail,
             "max_mamba_matched_blocks": max_mamba_matched_blocks,
             "feature_seen_for_cached_request": feature_seen_for_cached_request,
