@@ -116,6 +116,7 @@ class MambaMetadata:
         self._intermediate_abs_positions_buffer = torch.full(
             (self.max_intermediate_count,), d_conv, dtype=torch.int32, device=self.device
         )
+        self._intermediate_real_count_buffer = torch.zeros(1, dtype=torch.int32, device=self.device)
         # Constant gather offsets for conv state extraction: [-d_conv, ..., -1]
         if d_conv > 0:
             self.conv_gather_offsets = torch.arange(
@@ -157,10 +158,7 @@ class MambaMetadata:
 
         self.reset_varlen_metadata()
 
-        # Re-initialize the free slot pool
-        self.mamba_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device='cpu'
-        )
+        torch.arange(self.max_requests, out=self.mamba_state_free_slots)
         self.mamba_state_free_slot_count = self.max_requests
 
     def reset_varlen_metadata(self) -> None:
@@ -186,6 +184,7 @@ class MambaMetadata:
         self.intermediate_chunk_indices = None
         self.intermediate_abs_positions = None
         self.intermediate_count = 0
+        self.intermediate_real_count = None
         self.per_request_intermediate_counts = []
 
     def update(
@@ -432,16 +431,12 @@ class MambaMetadata:
                 intermediate_counts_gpu = intermediate_counts_gpu.to(self.device, non_blocking=True)
 
             if total > 0:
-                # Compute cumulative chunk counts from cu_seqlens (already on GPU)
+                # Reuse the actual chunk layout. Context-aligned prefills can
+                # have a partial first chunk, so ceil(seq_len / chunk_size)
+                # undercounts chunks and shifts snapshots of later requests.
                 cu = cu_seqlens_gpu[: real_prefill_count + 1]
-                seq_lens = (cu[1 : real_prefill_count + 1] - cu[:real_prefill_count]).to(
-                    torch.int64
-                )
-                num_chunks = torch.clamp((seq_lens + chunk_size - 1) // chunk_size, min=1)
-                cum_chunks = torch.zeros(
-                    real_prefill_count + 1, dtype=torch.int64, device=self.device
-                )
-                torch.cumsum(num_chunks, dim=0, out=cum_chunks[1:])
+                cum_chunks = torch.zeros(real_prefill_count, dtype=torch.int64, device=self.device)
+                cum_chunks[1:] = self.last_chunk_indices[: real_prefill_count - 1] + 1
 
                 seq_starts = cu[:real_prefill_count].to(torch.int64)
                 offsets = intermediate_offsets_gpu.to(torch.int64)
@@ -497,9 +492,13 @@ class MambaMetadata:
                 self.intermediate_count = 0
                 self.per_request_intermediate_counts = counts_list
 
+            self._intermediate_real_count_buffer.fill_(self.intermediate_count)
+            self.intermediate_real_count = self._intermediate_real_count_buffer
             self.intermediate_chunk_indices = self._intermediate_chunk_indices_buffer[:max_count]
             self.intermediate_abs_positions = self._intermediate_abs_positions_buffer[:max_count]
         else:
+            self._intermediate_real_count_buffer.fill_(0)
+            self.intermediate_real_count = self._intermediate_real_count_buffer
             # No extraction: fill with safe defaults for CUDA graph warmup
             # abs_positions=d_conv may exceed a short warmup sequence; the
             # mixer clamps unused padding gathers into range.
@@ -743,7 +742,26 @@ class MambaMetadata:
         self.mamba_state_free_slot_count -= 1
         mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
 
+        return int(mamba_idx)
+
+    def detach_state_slot(self, request_idx: int) -> int:
+        """Detach and return a request's live state slot without freeing it."""
+
+        mamba_idx = int(self.request_to_mamba_state_idx[request_idx].item())
+        if mamba_idx < 0:
+            raise RuntimeError(f"Request index {request_idx} has no live Mamba state slot")
+        self.request_to_mamba_state_idx[request_idx] = -1
         return mamba_idx
+
+    def free_slot(self, mamba_idx: int) -> None:
+        """Return one unbound slot to the live Mamba state pool."""
+
+        if not 0 <= mamba_idx < self.max_requests:
+            raise ValueError(f"Mamba state slot {mamba_idx} is outside the live state pool")
+        if self.mamba_state_free_slot_count >= self.max_requests:
+            raise RuntimeError("Cannot free a Mamba state slot when the pool is already full")
+        self.mamba_state_free_slots[self.mamba_state_free_slot_count] = mamba_idx
+        self.mamba_state_free_slot_count += 1
 
     def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
         """
@@ -762,7 +780,19 @@ class MambaMetadata:
             self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
         ]
 
-        return mamba_idx
+        return mamba_idx.clone()
+
+    def _return_slots(self, mamba_indices: torch.Tensor) -> None:
+        """Return live state slots to the free-slot stack."""
+
+        if mamba_indices.numel() == 0:
+            return
+        start = self.mamba_state_free_slot_count
+        end = start + mamba_indices.numel()
+        if end > self.max_requests:
+            raise RuntimeError("Mamba state free-slot pool overflow")
+        self.mamba_state_free_slots[start:end] = mamba_indices.to(torch.int32)
+        self.mamba_state_free_slot_count = end
 
     def free_slots(self, request_indices: torch.Tensor) -> None:
         """
@@ -776,14 +806,7 @@ class MambaMetadata:
 
         # Filter out any invalid indices (e.g., -1)
         mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
-        num_to_free = len(mamba_indices_to_free)
-
-        if num_to_free > 0:
-            # Add the freed indices back to the free slot pool
-            start_idx = self.mamba_state_free_slot_count
-            end_idx = start_idx + num_to_free
-            self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
-            self.mamba_state_free_slot_count = end_idx
+        self._return_slots(mamba_indices_to_free)
 
         # Invalidate the Mamba state index for the finished requests
         self.request_to_mamba_state_idx[request_indices] = -1

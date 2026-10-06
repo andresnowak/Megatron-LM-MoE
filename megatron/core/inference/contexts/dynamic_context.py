@@ -43,7 +43,7 @@ from megatron.core.transformer.moe.token_dispatcher_inference import (
 )
 from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
-from megatron.core.utils import get_pg_size, internal_api
+from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
 from .attention_context.mamba_metadata import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
@@ -475,7 +475,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.layer_map = kda_inference_state_config.attention_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
-            self.num_attention_layers = model_config.num_layers // pp_size
+            # Match TransformerBlock's uneven/embedding/loss-aware PP layer count.
+            from megatron.core.transformer.transformer_block import get_num_layers_to_build
+
+            pp_rank = get_pg_rank(pg_collection.pp) if pg_collection is not None else None
+            self.num_attention_layers = get_num_layers_to_build(
+                model_config, vp_stage=None, pp_rank=pp_rank
+            )
             self.num_mamba_layers = 0
             self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
@@ -889,17 +895,14 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and prefix_caching_mamba_gb is not None
                 and prefix_caching_mamba_gb > 0
             ):
+                assert self.mamba_slot_allocator is not None
                 prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
-                # Mirror the split done in _allocate_mamba_cache so this preview
-                # matches what is actually allocated: the "scratch" buffers
-                # (intermediate_ssm_out/intermediate_conv_out) are reserved from the
-                # budget first, then the rest sizes the "durable" cache
-                # (ssm_states/conv_states). mamba_bytes_per_req is the shared
-                # per-slot footprint of both.
+                # The allocator contains the PP-synchronized durable capacity.
+                # Scratch remains stage-local because it is temporary forward
+                # storage and does not participate in prefix-cache matching.
                 scratch_slots = self.max_mamba_intermediate_states_per_step
                 scratch_bytes = scratch_slots * mamba_bytes_per_req
-                durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
-                durable_slots = max(durable_slots, 0)
+                durable_slots = self.mamba_slot_allocator.max_slots
                 log_lines += [
                     f"  Mamba prefix cache:",
                     f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
@@ -1842,7 +1845,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         scratch_slots = self.max_mamba_intermediate_states_per_step
         scratch_bytes = scratch_slots * per_slot_bytes
         max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
+        local_max_slots = max_slots
+
+        # Prefix-cache state is replicated across pipeline stages. Use the
+        # smallest stage-local capacity so identical cache operations produce
+        # identical block-to-slot mappings on every stage. A recurrent prefix
+        # is executable only when all stages retain its state, so additional
+        # slots on an individual stage would not increase usable cache capacity.
+        if get_pg_size(self.pipeline_parallel_group) > 1:
+            max_slots_tensor = torch.tensor(
+                max_slots, dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(
+                max_slots_tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.pipeline_parallel_group,
+            )
+            max_slots = int(max_slots_tensor.item())
+
         if max_slots < 1:
+            if local_max_slots >= 1:
+                raise ValueError(
+                    f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
+                    f"has room for {local_max_slots} durable slots on this pipeline stage, but "
+                    f"another stage has room for fewer than one. Cache capacity is mirrored to "
+                    f"the minimum across stages; increase prefix_caching_mamba_gb, reduce "
+                    f"max_tokens, or rebalance the Mamba layers."
+                )
             raise ValueError(
                 f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
                 f"is too small. The CUDA-graph extraction scratch reserves "
@@ -3029,9 +3058,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             prefix_skip_tokens = 0
 
-        # Hybrid models with Mamba caching: skip based on Mamba match count.
-        # Only applies to the first chunk (finished == 0); continuation chunks
-        # already had Mamba state restored during the first chunk.
+        # Hybrid models can skip tokens only when the first chunk restores a
+        # matching Mamba state. Continuation chunks carry live state from the
+        # previous chunk and must compute every subsequent recurrent transition,
+        # even when their attention KV blocks are already cached.
         if self.is_hybrid_model and self.mamba_slot_allocator is not None and finished == 0:
             num_mamba_matched = self._find_mamba_match_count(
                 req=req,
@@ -3055,7 +3085,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     prefix_skip_tokens = raw_skip
             else:
                 prefix_skip_tokens = 0
-        elif self.is_hybrid_model and finished == 0:
+        elif self.is_hybrid_model:
             if record_mamba_match:
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0
@@ -3113,10 +3143,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request
+        # because we allocate a single set of Mamba state tensors for each request.
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
+        # A handoff is the exception: it keeps its live recurrent-state slot after
+        # its request row is removed, so both capacities must be checked independently.
+        if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
+            request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
 
         matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)

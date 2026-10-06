@@ -173,6 +173,7 @@ class _AsyncScheduleRequestResult:
     newly_paused_request_ids: Optional[Tensor] = None
     evict_request_ids: Optional[Tensor] = None
     finished_handoff_block_ids: Dict[int, List[int]] = field(default_factory=dict)
+    finished_handoff_ssm_slots: Dict[int, int] = field(default_factory=dict)
     finished_handoff_decode_tokens: Dict[int, List[int]] = field(default_factory=dict)
 
 
@@ -1883,15 +1884,16 @@ class TextGenerationController:
         finished_idxs: Tensor,
         sampled_tokens_cpu: Tensor,
         sampled_mtp_tokens_cpu: Optional[Tensor],
-    ) -> Tuple[Dict[int, List[int]], Dict[int, List[int]]]:
-        """Retain completed prompt blocks and capture tokens needed to resume decode."""
+    ) -> Tuple[Dict[int, List[int]], Dict[int, int], Dict[int, List[int]]]:
+        """Preserve completed prompt state and capture tokens needed to resume decode."""
 
         context = self.inference_wrapped_model.inference_context
         allocator = context.kv_block_allocator
         finished_block_ids: Dict[int, List[int]] = {}
+        finished_ssm_slots: Dict[int, int] = {}
         decode_tokens_by_request: Dict[int, List[int]] = {}
         if not allocator.enable_handoff_pinning or finished_idxs.numel() == 0:
-            return finished_block_ids, decode_tokens_by_request
+            return finished_block_ids, finished_ssm_slots, decode_tokens_by_request
 
         for finished_idx in finished_idxs.tolist():
             request_id = int(context.request_ids[finished_idx].item())
@@ -1902,6 +1904,13 @@ class TextGenerationController:
                 # Retain across context cleanup. For an exclusively owned block:
                 # active=1, retain=2, request cleanup=1, coordinator RELEASE_KV=0.
                 allocator.retain_memory_blocks(valid_blocks)
+                if context.is_hybrid_model:
+                    # Transfer ownership out of the finished request before normal
+                    # cleanup; the slot stays absent from the free-slot stack until
+                    # the prefill engine receives RELEASE_KV.
+                    finished_ssm_slots[request_id] = context.mamba_metadata.detach_state_slot(
+                        finished_idx
+                    )
 
             active_idx = finished_idx - context.paused_request_count
             decode_tokens = [int(sampled_tokens_cpu[active_idx].item())]
@@ -1911,7 +1920,7 @@ class TextGenerationController:
                 )
             decode_tokens_by_request[request_id] = decode_tokens
 
-        return finished_block_ids, decode_tokens_by_request
+        return finished_block_ids, finished_ssm_slots, decode_tokens_by_request
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
@@ -1986,7 +1995,7 @@ class TextGenerationController:
 
         # Retain finished prefill blocks before request cleanup releases them;
         # the handoff path owns this reference until the decode transfer completes.
-        finished_handoff_block_ids, finished_handoff_decode_tokens = (
+        finished_handoff_block_ids, finished_handoff_ssm_slots, finished_handoff_decode_tokens = (
             self._collect_finished_handoff_state(
                 finished_idxs, sampled_tokens_cpu, sampled_mtp_tokens_cpu
             )
@@ -2010,6 +2019,7 @@ class TextGenerationController:
             "sample": sampled_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
             "finished_handoff_block_ids": finished_handoff_block_ids,
+            "finished_handoff_ssm_slots": finished_handoff_ssm_slots,
             "finished_handoff_decode_tokens": finished_handoff_decode_tokens,
             **(update_result or {}),
         }
@@ -2719,7 +2729,7 @@ class TextGenerationController:
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
-        finished_handoff_block_ids, finished_handoff_decode_tokens = (
+        finished_handoff_block_ids, finished_handoff_ssm_slots, finished_handoff_decode_tokens = (
             self._collect_finished_handoff_state(
                 finished_idxs, sampled_tokens_cpu, sample_result.sampled_mtp_tokens_cpu_view
             )
@@ -2743,6 +2753,7 @@ class TextGenerationController:
             finished_request_ids=finished_request_ids,
             survivor_idxs=survivor_idxs,
             finished_handoff_block_ids=finished_handoff_block_ids,
+            finished_handoff_ssm_slots=finished_handoff_ssm_slots,
             finished_handoff_decode_tokens=finished_handoff_decode_tokens,
         )
 
@@ -2774,7 +2785,7 @@ class TextGenerationController:
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
-        finished_handoff_block_ids, finished_handoff_decode_tokens = (
+        finished_handoff_block_ids, finished_handoff_ssm_slots, finished_handoff_decode_tokens = (
             self._collect_finished_handoff_state(
                 finished_idxs, sampled_tokens_cpu, sample_result.sampled_mtp_tokens_cpu_view
             )
@@ -2802,6 +2813,7 @@ class TextGenerationController:
             newly_paused_request_ids=update_result.get("newly_paused_request_ids"),
             evict_request_ids=update_result.get("evict_request_ids"),
             finished_handoff_block_ids=finished_handoff_block_ids,
+            finished_handoff_ssm_slots=finished_handoff_ssm_slots,
             finished_handoff_decode_tokens=finished_handoff_decode_tokens,
         )
 
@@ -2845,6 +2857,7 @@ class TextGenerationController:
                 "sample": request_result.sampled_tokens_cpu,
                 "finished_routing_block_ids": {},
                 "finished_handoff_block_ids": request_result.finished_handoff_block_ids,
+                "finished_handoff_ssm_slots": request_result.finished_handoff_ssm_slots,
                 "finished_handoff_decode_tokens": request_result.finished_handoff_decode_tokens,
                 "newly_paused_request_ids": request_result.newly_paused_request_ids,
                 "evict_request_ids": request_result.evict_request_ids,
