@@ -120,6 +120,30 @@ async def test_inference_client_lifecycle():
     fake_context.term.assert_called_once_with()
 
 
+async def test_add_request_accepts_text_only_multimodal_default():
+    client, _, fake_socket = _make_client()
+    future = client.add_request("hello", SamplingParams(), multi_modal_data=None)
+    assert isinstance(future, asyncio.Future)
+    assert client.next_request_id == 1
+    frames = fake_socket.send_multipart.call_args.args[0]
+    assert len(frames) == 4
+    assert msgpack.unpackb(frames[3], raw=False) is None
+    client.stop()
+    assert future.cancelled()
+
+
+@pytest.mark.parametrize("payload", [{}, {"images": [b"image"]}, {"videos": [b"video"]}])
+async def test_add_request_rejects_multimodal_data_before_submission(payload):
+    client, _, fake_socket = _make_client()
+    with pytest.raises(NotImplementedError, match="multi_modal_data"):
+        client.add_request("hello", SamplingParams(), multi_modal_data=payload)
+    assert client.next_request_id == 0
+    assert client.completion_futures == {}
+    assert client.request_submission_times == {}
+    fake_socket.send_multipart.assert_not_called()
+    client.stop()
+
+
 async def test_inference_client_connect_handshake_rejects_unexpected_reply():
     """If the coordinator replies with anything other than CONNECT_ACK during
     the handshake, the client raises AssertionError synchronously — this is a
@@ -211,7 +235,7 @@ async def test_configured_client_hashes_a_text_prompt():
 
 async def test_text_only_client_does_not_expose_media_submission():
     client, fake_socket = _configured_client()
-    with pytest.raises(TypeError, match="multi_modal_data"):
+    with pytest.raises(NotImplementedError, match="multi_modal_data"):
         client.add_request([1, 2], SamplingParams(), multi_modal_data={"image": b"jpeg"})
     fake_socket.send_multipart.assert_not_called()
     assert not client.completion_futures

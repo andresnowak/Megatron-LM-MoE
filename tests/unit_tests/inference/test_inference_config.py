@@ -3,11 +3,20 @@
 import dataclasses
 from argparse import ArgumentParser
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 import torch
 
-from megatron.core.inference.config import AsyncScheduleMode, InferenceConfig
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    ImageProcessingConfig,
+    InferenceConfig,
+    VideoProcessingConfig,
+)
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -17,6 +26,61 @@ from megatron.training.config.inference_config import InferenceSetupConfig
 
 
 class TestInferenceConfig:
+
+    @pytest.mark.parametrize("cache_bytes", [None, 0])
+    def test_text_only_media_defaults(self, cache_bytes):
+        config = InferenceConfig(
+            image_preprocessing_config=None,
+            video_preprocessing_config=None,
+            vision_embedding_cache_max_bytes=cache_bytes,
+            allow_stale_multimodal_embeddings=False,
+        )
+        assert config.image_preprocessing_config is None
+        assert config.video_preprocessing_config is None
+        assert config.vision_embedding_cache_max_bytes == cache_bytes
+        assert config.allow_stale_multimodal_embeddings is False
+        assert dataclasses.replace(config) == config
+        assert dataclasses.asdict(config)["image_preprocessing_config"] is None
+        assert GPTInferenceWrapper.multimodal_prompt_config is None
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("image_preprocessing_config", {}),
+            ("video_preprocessing_config", {}),
+            ("vision_embedding_cache_max_bytes", 1),
+            ("vision_embedding_cache_max_bytes", -1),
+            ("allow_stale_multimodal_embeddings", True),
+        ],
+    )
+    def test_media_settings_fail_explicitly(self, field, value):
+        with pytest.raises(NotImplementedError, match=field):
+            InferenceConfig(**{field: value})
+
+    def test_image_config_rejects_nemo_constructor(self):
+        with pytest.raises(NotImplementedError, match="Image preprocessing"):
+            ImageProcessingConfig(
+                patch_dim=16,
+                dynamic_resolution=True,
+                use_tiling=False,
+                pixel_shuffle=True,
+                spatial_merge_size=2,
+                dynamic_resolution_min_patches=1,
+                dynamic_resolution_max_patches=128,
+                vision_model_type="radio",
+                pixel_mean=[0.5, 0.5, 0.5],
+                pixel_std=[0.5, 0.5, 0.5],
+            )
+
+    def test_video_config_rejects_nemo_constructor(self):
+        with pytest.raises(NotImplementedError, match="Video preprocessing"):
+            VideoProcessingConfig(
+                image_config=cast(ImageProcessingConfig, None),
+                num_frames=8,
+                temporal_patch_size=2,
+                frame_manifest_magic=b"frames",
+                video_maintain_aspect_ratio=False,
+            )
 
     @pytest.mark.parametrize(
         ("grouped_gemm_backend", "expected_backend"),

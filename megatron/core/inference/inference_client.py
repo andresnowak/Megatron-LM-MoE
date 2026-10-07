@@ -139,7 +139,11 @@ class InferenceClient:
         )
 
     def add_request(
-        self, prompt: Union[str, List[int]], sampling_params: SamplingParams
+        self,
+        prompt: Union[str, List[int]],
+        sampling_params: SamplingParams,
+        *,
+        multi_modal_data: Optional[dict] = None,
     ) -> asyncio.Future:
         """
         Submits a new inference request to the coordinator.
@@ -153,12 +157,15 @@ class InferenceClient:
             sampling_params: An object containing the sampling parameters for
                 text generation (e.g., temperature, top_p). It must have a
                 `serialize()` method.
+            multi_modal_data: NeMo compatibility argument; only None is supported.
 
         Returns:
             asyncio.Future: A future that will be resolved with a
             `DynamicInferenceRequest` object (if deserialize=True) or a raw
             serialized dict (if deserialize=False) containing the completed result.
         """
+        if multi_modal_data is not None:
+            raise NotImplementedError("multi_modal_data is unsupported; use text-only inference.")
         return self.add_request_with_id(prompt, sampling_params)[1]
 
     def add_request_with_id(

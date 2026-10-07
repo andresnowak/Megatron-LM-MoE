@@ -232,6 +232,39 @@ class AsyncScheduleMode(str, Enum):
 
 
 @dataclass
+class ImageProcessingConfig:
+    """Import compatibility for NeMo; image preprocessing is not supported here."""
+
+    patch_dim: int
+    dynamic_resolution: bool = False
+    use_tiling: bool = False
+    pixel_shuffle: bool = False
+    spatial_merge_size: int = 1
+    dynamic_resolution_min_patches: int = 1
+    dynamic_resolution_max_patches: int = 128
+    vision_model_type: str = "radio"
+    pixel_mean: Optional[List[float]] = None
+    pixel_std: Optional[List[float]] = None
+
+    def __post_init__(self):
+        raise NotImplementedError("Image preprocessing is unsupported; use text-only inference.")
+
+
+@dataclass
+class VideoProcessingConfig:
+    """Import compatibility for NeMo; video preprocessing is not supported here."""
+
+    image_config: ImageProcessingConfig
+    num_frames: int = 8
+    temporal_patch_size: int = 1
+    frame_manifest_magic: Optional[bytes] = None
+    video_maintain_aspect_ratio: bool = True
+
+    def __post_init__(self):
+        raise NotImplementedError("Video preprocessing is unsupported; use text-only inference.")
+
+
+@dataclass
 class InferenceConfig:
     """
     Config for inference.
@@ -381,6 +414,21 @@ class InferenceConfig:
     """
 
     # =================================
+    # Text-only media compatibility
+    # =================================
+    image_preprocessing_config: Optional[ImageProcessingConfig] = None
+    """NeMo text-only compatibility; non-None image preprocessing is unsupported."""
+
+    video_preprocessing_config: Optional[VideoProcessingConfig] = None
+    """NeMo text-only compatibility; non-None video preprocessing is unsupported."""
+
+    vision_embedding_cache_max_bytes: Optional[int] = None
+    """Only None or zero (disabled) is supported; there is no vision embedding cache."""
+
+    allow_stale_multimodal_embeddings: bool = False
+    """Must remain disabled for text-only inference."""
+
+    # =================================
     # Engine config
     # =================================
     enable_chunked_prefill: bool = False
@@ -525,6 +573,18 @@ class InferenceConfig:
     This is an InitVar and is not stored as a field on the config."""
 
     def __post_init__(self, verbose: bool):
+        if self.image_preprocessing_config is not None:
+            raise NotImplementedError(
+                "image_preprocessing_config requires unsupported image inference."
+            )
+        if self.video_preprocessing_config is not None:
+            raise NotImplementedError(
+                "video_preprocessing_config requires unsupported video inference."
+            )
+        if self.vision_embedding_cache_max_bytes not in (None, 0):
+            raise NotImplementedError("vision_embedding_cache_max_bytes must be None or zero.")
+        if self.allow_stale_multimodal_embeddings is not False:
+            raise NotImplementedError("allow_stale_multimodal_embeddings must be False.")
         self._verbose = verbose
         self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
         if self.nixl_backend not in ("UCX", "UCCL"):
