@@ -66,6 +66,7 @@ class KVBlockAllocator:
 
         # Initialize block pool as a "stack" data structure (CPU for bookkeeping).
         self.block_bag = torch.arange(self.pool_size, dtype=torch.int32, device='cpu')
+        self.block_ref_counts = torch.zeros((self.pool_size,), dtype=torch.int32, device='cpu')
 
         if self.enable_prefix_caching:
             # Block hash tracking for prefix caching: -1 = uncomputed, positive = valid hash
@@ -73,9 +74,6 @@ class KVBlockAllocator:
 
             # Hash-to-block mapping for O(1) prefix lookup
             self.kv_hash_to_block_id: Dict[int, int] = {}
-
-            # Reference count per block: 0 = cached (evictable), >0 = actively used
-            self.block_ref_counts = torch.zeros((self.pool_size,), dtype=torch.int32, device='cpu')
 
             # LRU timestamps for eviction ordering (higher = more recently used)
             # Only needed in LRU mode; RZ mode evicts immediately on ref_count==0
@@ -204,9 +202,8 @@ class KVBlockAllocator:
         block_ids = self.block_bag[self.pool_avail : (self.pool_avail + num_blocks)]
         assert num_blocks == block_ids.numel()
 
+        self.block_ref_counts[block_ids] = 1
         if self.enable_prefix_caching:
-            # Initialize ref counts for newly allocated blocks
-            self.block_ref_counts[block_ids] = 1
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
                 self.update_timestamps(block_ids)
 
@@ -230,16 +227,22 @@ class KVBlockAllocator:
         """
         if blocks.numel() == 0:
             return
+        if not self.enable_prefix_caching and not self.enable_handoff_pinning:
+            self.block_ref_counts[blocks] = 0
+            num_blocks = blocks.numel()
+            self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = blocks
+            self.pool_avail += num_blocks
+            return
 
+        unique_blocks, release_counts = torch.unique(blocks, return_counts=True)
+        remaining_ref_counts = self.block_ref_counts[unique_blocks] - release_counts.to(
+            dtype=self.block_ref_counts.dtype
+        )
+        assert torch.all(
+            remaining_ref_counts >= 0
+        ), "released more KV block references than the allocator owns"
+        self.block_ref_counts[unique_blocks] = remaining_ref_counts
         if self.enable_prefix_caching:
-            unique_blocks, release_counts = torch.unique(blocks, return_counts=True)
-            remaining_ref_counts = self.block_ref_counts[unique_blocks] - release_counts.to(
-                dtype=self.block_ref_counts.dtype
-            )
-            assert torch.all(
-                remaining_ref_counts >= 0
-            ), "released more KV block references than the allocator owns"
-            self.block_ref_counts[unique_blocks] = remaining_ref_counts
             if self.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.REF_ZERO:
                 zero_mask = remaining_ref_counts == 0
                 if zero_mask.any():
@@ -256,24 +259,35 @@ class KVBlockAllocator:
                     self.block_bag[self.pool_avail : self.pool_avail + num_unreg] = unreg_blocks
                     self.pool_avail += num_unreg
         else:
-            num_blocks = blocks.numel()
-            self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = blocks
+            free_blocks = unique_blocks[remaining_ref_counts == 0]
+            num_blocks = free_blocks.numel()
+            self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = free_blocks
             self.pool_avail += num_blocks
 
     def retain_memory_blocks(self, block_ids: list[int]) -> None:
-        """Add one prefix-cache reference to each block.
+        """Add one ownership reference to each block.
 
         Args:
             block_ids: Blocks retained by a new owner.
         """
-        assert self.enable_prefix_caching, "retaining KV blocks requires prefix caching"
+        assert (
+            self.enable_prefix_caching or self.enable_handoff_pinning
+        ), "retaining KV blocks requires prefix caching or handoff pinning"
         if block_ids:
             blocks = torch.tensor(block_ids, dtype=torch.int32, device='cpu')
+            assert torch.all(
+                (blocks >= 0) & (blocks < self.dummy_block_idx)
+            ), "cannot retain invalid or dummy KV blocks"
             unique_blocks, retain_counts = torch.unique(blocks, return_counts=True)
+            if not self.enable_prefix_caching:
+                assert torch.all(
+                    self.block_ref_counts[unique_blocks] > 0
+                ), "cannot retain unowned KV blocks"
             self.block_ref_counts[unique_blocks] += retain_counts.to(
                 dtype=self.block_ref_counts.dtype
             )
-            self.update_timestamps(unique_blocks)
+            if self.enable_prefix_caching:
+                self.update_timestamps(unique_blocks)
 
     def reset(self) -> None:
         """Reset the allocator to initial state.
@@ -295,6 +309,7 @@ class KVBlockAllocator:
         torch.arange(self.pool_size, out=self.block_bag)
 
         self.pool_avail = self.pool_size - 1
+        self.block_ref_counts.zero_()
 
         if self.enable_prefix_caching:
             # Reset all block hashes

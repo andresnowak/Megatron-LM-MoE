@@ -25,7 +25,12 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
     PendingKvImport,
     PendingSSMImport,
 )
-from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, SSMStateDims
+from megatron.core.inference.disaggregation.ssm_reshard import (
+    KDAShardLayout,
+    KDAStateDims,
+    SSMShardLayout,
+    SSMStateDims,
+)
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     construct_kv_transfer_backend_class,
 )
@@ -221,11 +226,15 @@ class InferenceStateHandoffMixin:
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
-        if getattr(self.context, "has_kda", False) or (
+        has_kda = getattr(self.context, "has_kda", False)
+        if (
             not self.context.is_hybrid_model
+            and not has_kda
             and getattr(self.context, "recurrent_metadata", None) is not None
         ):
-            raise RuntimeError("KDA and non-Mamba recurrent-state handoff are not supported")
+            raise RuntimeError("Unsupported recurrent-state handoff model")
+        if has_kda and self.context.config.enable_prefix_caching:
+            raise RuntimeError("KDA handoff does not support prefix reuse")
         if self.context.is_hybrid_model:
             if role == "decode" and self.context.mamba_slot_allocator is not None:
                 raise RuntimeError(
@@ -247,7 +256,7 @@ class InferenceStateHandoffMixin:
         # handoff, so pinning their completed blocks would retain cache state
         # without a downstream release acknowledgement.
         allocator = self.context.kv_block_allocator
-        assert allocator.enable_prefix_caching, (
+        assert allocator.enable_prefix_caching or has_kda, (
             "KV handoff requires prefix caching on both prefill and decode "
             "engines (--inference-dynamic-batching-prefix-caching)."
         )
@@ -303,10 +312,34 @@ class InferenceStateHandoffMixin:
 
         # Both roles transfer directly between live recurrent-state slots. Prefill
         # detaches its source slot until decode acknowledges transfer completion.
-        if self.context.is_hybrid_model:
+        if has_kda:
+            if pp_size > 1:
+                capacities = [None] * pp_size
+                torch.distributed.all_gather_object(
+                    capacities, self.context.max_requests, group=self.pg_collection.pp
+                )
+                if any(capacity != self.context.max_requests for capacity in capacities):
+                    raise ValueError(
+                        "Recurrent handoff requires equal request capacities across PP ranks"
+                    )
+            conv_states = self.context.kda_conv_states
+            recurrent_states = self.context.kda_recurrent_states
+            ssm_layout = KDAShardLayout(
+                global_rank=rank,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                kda_layer_map=self.context.kda_layer_map,
+                dims=KDAStateDims(
+                    num_key_heads=model_config.linear_num_key_heads,
+                    num_value_heads=model_config.linear_num_value_heads,
+                    key_head_dim=model_config.linear_key_head_dim,
+                    value_head_dim=model_config.linear_value_head_dim,
+                    conv_kernel_dim=model_config.linear_conv_kernel_dim,
+                ),
+            )
+        elif self.context.is_hybrid_model:
             conv_states = self.context.mamba_conv_states
             recurrent_states = self.context.mamba_ssm_states
-            state_slot_count = self.context.max_requests
 
             conv_shape = conv_states.shape
             ssm_shape = recurrent_states.shape
@@ -338,6 +371,7 @@ class InferenceStateHandoffMixin:
                     "SSM conv state shape does not match the model TP layout: "
                     f"{conv_shape[-2]} vs {ssm_layout.conv_dim_local}"
                 )
+        if has_kda or self.context.is_hybrid_model:
             state_specs = {
                 "conv": (conv_states, conv_states.shape[-2], conv_states.shape[-1]),
                 "recurrent": (
@@ -351,7 +385,7 @@ class InferenceStateHandoffMixin:
                     self._kv_transfer_agent.new_registered_buffer(
                         agent_name=f"{role}-ssm-{state_kind}-rank{rank}",
                         memory_buffer=memory_buffer,
-                        expected_num_blocks=state_slot_count,
+                        expected_num_blocks=self.context.max_requests,
                         heads_per_partition=width,
                         head_dim=state_dim,
                         tokens_per_block=1,
@@ -673,7 +707,12 @@ class InferenceStateHandoffMixin:
         """Release a prefill live-state slot after its handoff ownership ends."""
 
         if ssm_slot is not None:
-            self.context.mamba_metadata.free_slot(ssm_slot)
+            metadata = (
+                self.context.kda_metadata
+                if getattr(self.context, "has_kda", False)
+                else self.context.mamba_metadata
+            )
+            metadata.free_slot(ssm_slot)
 
     def add_request_with_kv_handoff(
         self,
@@ -689,7 +728,7 @@ class InferenceStateHandoffMixin:
         the read here, while a push backend posts the matching receive.
         """
         allocator = self.context.kv_block_allocator
-        if not allocator.enable_prefix_caching:
+        if not allocator.enable_prefix_caching and not getattr(self.context, "has_kda", False):
             raise RuntimeError(
                 "add_request_with_kv_handoff requires "
                 "--inference-dynamic-batching-prefix-caching on the decode engine; "
@@ -698,7 +737,10 @@ class InferenceStateHandoffMixin:
 
         ssm_meta = kv_meta.get("ssm") if isinstance(kv_meta, dict) else None
         local_has_ssm = bool(self._ssm_transfer_agents)
-        if self.context.is_hybrid_model and not local_has_ssm:
+        has_recurrent_state = self.context.is_hybrid_model or getattr(
+            self.context, "has_kda", False
+        )
+        if has_recurrent_state and not local_has_ssm:
             raise RuntimeError("Hybrid decode received a handoff before SSM transfer setup")
         if local_has_ssm and ssm_meta is None:
             raise RuntimeError(
@@ -713,7 +755,7 @@ class InferenceStateHandoffMixin:
                 raise RuntimeError(
                     f"SSM handoff metadata is missing state kinds {missing_state_kinds}"
                 )
-        if not self.context.is_hybrid_model and ssm_meta is not None:
+        if not has_recurrent_state and ssm_meta is not None:
             raise RuntimeError("Transformer decode received SSM metadata from a hybrid prefill")
         if self._kv_transfer_agent is None:
             raise RuntimeError("KV handoff received without a transfer backend")
@@ -807,10 +849,16 @@ class InferenceStateHandoffMixin:
             num_blocks_to_import + continuation_block_count, cached_blocks
         ):
             return False
-        if ssm_meta and self.context.mamba_metadata.mamba_state_free_slot_count < 1:
+        metadata = (
+            self.context.kda_metadata
+            if getattr(self.context, "has_kda", False)
+            else self.context.mamba_metadata if ssm_meta else None
+        )
+        if ssm_meta and metadata.mamba_state_free_slot_count < 1:
             return False
 
-        allocator.retain_memory_blocks(cached_blocks)
+        if cached_blocks:
+            allocator.retain_memory_blocks(cached_blocks)
         allocated_blocks_tensor = allocator.allocate_memory_blocks(
             num_blocks_to_import + continuation_block_count
         )
@@ -888,6 +936,8 @@ class InferenceStateHandoffMixin:
 
         allocator = self.context.kv_block_allocator
         cached_blocks = []
+        if not allocator.enable_prefix_caching:
+            return cached_blocks
         for block_hash in hashes[:num_blocks]:
             block_id = allocator.kv_hash_to_block_id.get(block_hash)
             if block_id is None:
@@ -954,7 +1004,7 @@ class InferenceStateHandoffMixin:
                 "Decode-only handoff is missing its sampled token or MTP proposals: "
                 f"expected {expected_tokens}, got {len(pending.resume_tokens)}"
             )
-        if self.context.is_hybrid_model:
+        if self.context.is_hybrid_model or getattr(self.context, "has_kda", False):
             if pending.ssm is None:
                 raise RuntimeError("Hybrid decode-only handoff is missing transferred SSM state")
 
@@ -970,7 +1020,7 @@ class InferenceStateHandoffMixin:
         registration_end = min(len(local_blocks), len(pending.hashes))
         num_hashes_to_register = registration_end - cached_prefix_block_count
 
-        if num_hashes_to_register > 0:
+        if allocator.enable_prefix_caching and num_hashes_to_register > 0:
             # The imported suffix extends any retained local prefix. Preserve
             # that predecessor link in the allocator's parent-aware LRU forest.
             parent_hashes = [
@@ -1108,7 +1158,12 @@ class InferenceStateHandoffMixin:
         pending.local_blocks = []
         pending.continuation_blocks = []
         if pending.ssm is not None:
-            self.context.mamba_metadata.free_slot(pending.ssm.live_slot)
+            metadata = (
+                self.context.kda_metadata
+                if getattr(self.context, "has_kda", False)
+                else self.context.mamba_metadata
+            )
+            metadata.free_slot(pending.ssm.live_slot)
             pending.ssm = None
 
     @staticmethod
@@ -1240,7 +1295,12 @@ class InferenceStateHandoffMixin:
                 "SSM transfer agents. Ensure KV transfer was initialized on a "
                 "hybrid decode engine."
             )
-        live_slot = self.context.mamba_metadata.allocate_slot()
+        metadata = (
+            self.context.kda_metadata
+            if getattr(self.context, "has_kda", False)
+            else self.context.mamba_metadata
+        )
+        live_slot = metadata.allocate_slot()
         if live_slot is None:
             raise RuntimeError("Live SSM slot capacity changed during handoff admission")
         return PendingSSMImport(handles=[], live_slot=int(live_slot))

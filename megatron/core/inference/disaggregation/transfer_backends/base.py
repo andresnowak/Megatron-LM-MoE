@@ -14,7 +14,7 @@ from typing import Any, Optional
 import torch
 
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout
-from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout
+from megatron.core.inference.disaggregation.ssm_reshard import KDAShardLayout, SSMShardLayout
 
 KVTransportBackend = Any
 
@@ -75,7 +75,7 @@ def compute_buffer_geometry(
     num_layers_global: Optional[int] = None,
     layer_start: Optional[int] = None,
     layer_end: Optional[int] = None,
-    ssm_layout: Optional[SSMShardLayout] = None,
+    ssm_layout: Optional[SSMShardLayout | KDAShardLayout] = None,
     ssm_state_kind: Optional[str] = None,
 ) -> BufferGeometry:
     """Locate the blocks axis, derive the slice strides, and validate the
@@ -88,6 +88,24 @@ def compute_buffer_geometry(
         raise ValueError("ssm_layout and ssm_state_kind must be provided together")
     if ssm_state_kind not in (None, "conv", "recurrent"):
         raise ValueError("ssm_state_kind must be 'conv' or 'recurrent'")
+    if isinstance(ssm_layout, KDAShardLayout):
+        if expected_num_blocks < 1 or not memory_buffer.is_contiguous():
+            raise ValueError("KDA state requires contiguous live-slot storage")
+        dims = ssm_layout.dims
+        tail = (
+            (ssm_layout.conv_dim_local, dims.conv_kernel_dim)
+            if ssm_state_kind == "conv"
+            else (ssm_layout.nheads_local, dims.key_head_dim, dims.value_head_dim)
+        )
+        if (
+            memory_buffer.shape[0] != ssm_layout.num_layers
+            or tuple(memory_buffer.shape[2:]) != tail
+        ):
+            raise ValueError("KDA state shape does not match its layout")
+        if memory_buffer.shape[1] not in (expected_num_blocks, expected_num_blocks + 1):
+            raise ValueError("KDA storage must contain live slots and at most one dummy slot")
+        if ssm_state_kind == "recurrent" and memory_buffer.dtype != torch.float32:
+            raise ValueError("KDA recurrent state must use FP32 storage")
 
     layout_capable = (
         None
@@ -111,7 +129,9 @@ def compute_buffer_geometry(
     shape = list(memory_buffer.shape)
     if ssm_layout is not None:
         blocks_axis = 1
-        if len(shape) <= blocks_axis or shape[blocks_axis] != expected_num_blocks:
+        if len(shape) <= blocks_axis or (
+            not isinstance(ssm_layout, KDAShardLayout) and shape[blocks_axis] != expected_num_blocks
+        ):
             raise RuntimeError(
                 f"{backend_name}: SSM state shape {shape} does not have "
                 f"expected_num_blocks={expected_num_blocks} on slot axis 1"
@@ -177,7 +197,7 @@ def compute_buffer_geometry(
         num_blocks=expected_num_blocks,
         num_outer=num_outer,
         bytes_per_slice=bytes_per_slice,
-        outer_stride_bytes=expected_num_blocks * bytes_per_slice,
+        outer_stride_bytes=shape[blocks_axis] * bytes_per_slice,
         heads_per_partition=heads_per_partition,
         head_dim=head_dim,
         tokens_per_block=tokens_per_block,
@@ -185,7 +205,9 @@ def compute_buffer_geometry(
     )
 
 
-def export_geometry_meta(geometry: BufferGeometry, ssm_layout=None) -> dict:
+def export_geometry_meta(
+    geometry: BufferGeometry, ssm_layout=None, state_kind=None, dtype=None
+) -> dict:
     """The wire schema shared by every backend's export_meta."""
     meta = {
         "base_addr": geometry.buf_ptr,
@@ -215,6 +237,13 @@ def export_geometry_meta(geometry: BufferGeometry, ssm_layout=None) -> dict:
                 "layer_end": layer_end,
             }
         )
-    if ssm_layout is not None:
+    if isinstance(ssm_layout, KDAShardLayout):
+        meta["kda_layout"] = asdict(ssm_layout)
+        meta["kda_layout"]["kda_layer_map"] = {
+            str(layer): index for layer, index in ssm_layout.layer_map.items()
+        }
+        meta["state_kind"] = state_kind
+        meta["state_dtype"] = str(dtype)
+    elif ssm_layout is not None:
         meta["ssm_layout"] = asdict(ssm_layout)
     return meta

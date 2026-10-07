@@ -212,6 +212,70 @@ def test_prefix_caching_allocate_and_hash_registration():
     assert small.is_memory_available(5) is False
 
 
+def test_uncached_handoff_references_prevent_block_reuse():
+    allocator = KVBlockAllocator(_make_context(), pool_size=4, paused_limit=0)
+    allocated = allocator.allocate_memory_blocks(1)
+    assert allocated is not None
+    block = allocated.clone()
+    block_id = int(block.item())
+    allocator.enable_handoff_pinning = True
+    allocator.retain_memory_blocks([block_id])
+    allocator.release_memory_blocks(block)
+    assert allocator.pool_avail == 2
+    assert allocator.block_ref_counts[block_id].item() == 1
+    other_blocks = allocator.allocate_memory_blocks(2)
+    assert other_blocks is not None
+    other_blocks = other_blocks.clone()
+    assert block_id not in other_blocks.tolist()
+    assert allocator.allocate_memory_blocks(1) is None
+    allocator.release_memory_blocks(block)
+    assert allocator.pool_avail == 1
+    reallocated = allocator.allocate_memory_blocks(1)
+    assert reallocated is not None
+    assert reallocated.tolist() == [block_id]
+
+
+def test_uncached_handoff_aggregates_owners_and_rejects_duplicate_release():
+    allocator = KVBlockAllocator(_make_context(), pool_size=4, paused_limit=0)
+    allocator.enable_handoff_pinning = True
+    allocated = allocator.allocate_memory_blocks(1)
+    assert allocated is not None
+    block = allocated.clone()
+    block_id = int(block.item())
+    allocator.retain_memory_blocks([block_id, block_id])
+    assert allocator.block_ref_counts[block_id].item() == 3
+    allocator.release_memory_blocks(block.repeat(2))
+    assert allocator.block_ref_counts[block_id].item() == 1
+    assert allocator.pool_avail == 2
+    allocator.release_memory_blocks(block)
+    assert allocator.pool_avail == 3
+    with pytest.raises(AssertionError, match="released more KV block references"):
+        allocator.release_memory_blocks(block)
+    assert allocator.pool_avail == 3
+    assert allocator.block_ref_counts[block_id].item() == 0
+    assert len(set(allocator.block_bag[: allocator.pool_avail].tolist())) == 3
+
+
+@pytest.mark.parametrize("block_id", [-1, 0, 3, 4])
+def test_uncached_handoff_rejects_unowned_or_invalid_blocks(block_id):
+    allocator = KVBlockAllocator(_make_context(), pool_size=4, paused_limit=0)
+    allocator.enable_handoff_pinning = True
+    with pytest.raises(AssertionError, match="cannot retain"):
+        allocator.retain_memory_blocks([block_id])
+    assert allocator.pool_avail == 3
+    assert allocator.block_ref_counts.count_nonzero().item() == 0
+
+
+def test_uncached_retain_requires_explicit_handoff_pinning():
+    allocator = KVBlockAllocator(_make_context(), pool_size=4, paused_limit=0)
+    allocated = allocator.allocate_memory_blocks(1)
+    assert allocated is not None
+    block = allocated.clone()
+    with pytest.raises(AssertionError, match="requires prefix caching or handoff pinning"):
+        allocator.retain_memory_blocks(block.tolist())
+    assert allocator.block_ref_counts[block].item() == 1
+
+
 def test_retain_memory_blocks_adds_one_reference_per_owner():
     allocator = KVBlockAllocator(
         _make_context(),

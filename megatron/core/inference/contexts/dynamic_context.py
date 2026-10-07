@@ -3149,8 +3149,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         # A handoff is the exception: it keeps its live recurrent-state slot after
         # its request row is removed, so both capacities must be checked independently.
-        if self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning:
-            request_can_be_added &= self.mamba_metadata.mamba_state_free_slot_count > 0
+        if self.has_kda or (
+            self.is_hybrid_model and self.kv_block_allocator.enable_handoff_pinning
+        ):
+            request_can_be_added &= self.recurrent_metadata.mamba_state_free_slot_count > 0
 
         matched_block_ids, num_blocks_from_pool, _, _, _, effective_prefill_chunk_length = (
             self._compute_prefix_match(req, req.remaining_prompt_length)

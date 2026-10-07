@@ -73,7 +73,7 @@ def admit_prefilled_decode(
     if request.get_metadata_types() != context.request_metadata_types:
         raise ValueError("Imported request metadata does not match the decode context")
 
-    if context.is_hybrid_model:
+    if context.is_hybrid_model or getattr(context, "has_kda", False):
         if ssm_state_idx is None:
             raise ValueError("A hybrid decode request requires an exact imported SSM state")
 
@@ -135,9 +135,12 @@ def admit_prefilled_decode(
         token_positions // context.block_size_tokens
     ]
 
-    if context.is_hybrid_model:
+    if context.is_hybrid_model or getattr(context, "has_kda", False):
         assert ssm_state_idx is not None
-        context.mamba_metadata.request_to_mamba_state_idx[current_id] = ssm_state_idx
+        metadata = (
+            context.kda_metadata if getattr(context, "has_kda", False) else context.mamba_metadata
+        )
+        metadata.request_to_mamba_state_idx[current_id] = ssm_state_idx
 
     context.active_token_count = token_end
     context.total_request_count += 1

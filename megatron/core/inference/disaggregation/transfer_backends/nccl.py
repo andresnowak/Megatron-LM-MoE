@@ -20,7 +20,12 @@ import torch
 import torch.distributed as dist
 
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout, plan_kv_reshard
-from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, plan_ssm_reshard
+from megatron.core.inference.disaggregation.ssm_reshard import (
+    KDAShardLayout,
+    SSMShardLayout,
+    plan_ssm_reshard,
+    state_layout_from_meta,
+)
 from megatron.core.inference.disaggregation.transfer_backends.base import (
     compute_buffer_geometry,
     export_geometry_meta,
@@ -121,7 +126,7 @@ class NcclTransferBackend:
         num_layers_global: Optional[int] = None,
         layer_start: Optional[int] = None,
         layer_end: Optional[int] = None,
-        ssm_layout: Optional[SSMShardLayout] = None,
+        ssm_layout: Optional[SSMShardLayout | KDAShardLayout] = None,
         ssm_state_kind: Optional[str] = None,
     ):
         if not (dist.is_available() and dist.is_initialized()):
@@ -169,7 +174,9 @@ class NcclTransferBackend:
 
     def export_meta(self) -> Dict[str, Any]:
         """The shared geometry schema plus this rank's NCCL address."""
-        meta = export_geometry_meta(self._geometry, self._ssm_layout)
+        meta = export_geometry_meta(
+            self._geometry, self._ssm_layout, self._ssm_state_kind, self._memory_buffer.dtype
+        )
         meta["transport"] = "nccl"
         meta["nccl_rank"] = dist.get_rank()
         return meta
@@ -205,10 +212,12 @@ class NcclTransferBackend:
         """Yield (peer_meta, lo, hi) band slices of this rank's SSM state,
         in deterministic plan order."""
         for meta, _ in peer_records:
-            raw_layout = meta.get("ssm_layout")
-            if not isinstance(raw_layout, dict):
-                raise ValueError("peer metadata is missing ssm_layout")
-            peer_layout = SSMShardLayout(**raw_layout)
+            peer_layout = state_layout_from_meta(meta)
+            if isinstance(self._ssm_layout, KDAShardLayout) and (
+                meta.get("state_kind") != self._ssm_state_kind
+                or meta.get("state_dtype") != str(self._memory_buffer.dtype)
+            ):
+                raise ValueError("Incompatible KDA state kind or dtype")
             if mine_is_src:
                 plan = plan_ssm_reshard([self._ssm_layout], [peer_layout])
             else:
@@ -242,6 +251,14 @@ class NcclTransferBackend:
         device = self._memory_buffer.device
         dtype = self._memory_buffer.dtype
 
+        if isinstance(self._ssm_layout, KDAShardLayout):
+            if any(not 0 <= slot < self._geometry.num_blocks for slot in dst_block_ids):
+                raise ValueError("KDA destination slot is outside the live pool")
+            for meta, slots in records:
+                if len(slots) != len(dst_block_ids) or any(
+                    not 0 <= slot < int(meta["num_blocks"]) for slot in slots
+                ):
+                    raise ValueError("KDA source slots do not match destination slots")
         if self._ssm_layout is not None:
             for meta, layer, lo, hi in self._ssm_transfers(records, mine_is_src=False):
                 for slot in dst_block_ids:
@@ -281,6 +298,9 @@ class NcclTransferBackend:
         ops: List[Any] = []
         keep: List[torch.Tensor] = []
 
+        if isinstance(self._ssm_layout, KDAShardLayout):
+            if any(not 0 <= slot < self._geometry.num_blocks for slot in src_block_ids):
+                raise ValueError("KDA source slot is outside the live pool")
         if self._ssm_layout is not None:
             for meta, layer, lo, hi in self._ssm_transfers(records, mine_is_src=True):
                 for slot in src_block_ids:

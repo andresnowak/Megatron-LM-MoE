@@ -96,6 +96,12 @@ class SSMShardLayout:
         sharing a key hold identical state (e.g. EP/DP replicas)."""
         return (self.tp_rank, self.layer_start)
 
+    conv_bands = _CONV_BANDS
+
+    @property
+    def layer_map(self) -> dict[int, int]:
+        return {self.layer_start + i: i for i in range(self.num_layers)}
+
     def layer_range(self) -> Tuple[int, int]:
         """Global SSM-layer range [lo, hi) owned by this rank."""
         return (self.layer_start, self.layer_start + self.num_layers)
@@ -125,6 +131,89 @@ class SSMShardLayout:
 
 
 @dataclass(frozen=True)
+class KDAStateDims:
+    num_key_heads: int
+    num_value_heads: int
+    key_head_dim: int
+    value_head_dim: int
+    conv_kernel_dim: int
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(value, int) or value <= 0 for value in vars(self).values()):
+            raise ValueError("KDA state dimensions must be positive integers")
+
+
+@dataclass(frozen=True)
+class KDAShardLayout:
+    global_rank: int
+    tp_size: int
+    tp_rank: int
+    kda_layer_map: dict[int, int]
+    dims: KDAStateDims
+
+    conv_bands = ("q", "k", "v")
+
+    def __post_init__(self) -> None:
+        if isinstance(self.dims, dict):
+            object.__setattr__(self, "dims", KDAStateDims(**self.dims))
+        if self.global_rank < 0 or self.tp_size < 1 or not 0 <= self.tp_rank < self.tp_size:
+            raise ValueError("Invalid KDA parallel rank or size")
+        if self.dims.num_key_heads % self.tp_size or self.dims.num_value_heads % self.tp_size:
+            raise ValueError("KDA head counts must be divisible by TP size")
+        mapping = {int(layer): index for layer, index in self.kda_layer_map.items()}
+        if len(mapping) != len(self.kda_layer_map) or any(layer < 0 for layer in mapping):
+            raise ValueError("KDA global layer indices must be unique and non-negative")
+        if sorted(mapping.values()) != list(range(len(mapping))):
+            raise ValueError("KDA local layer indices must be contiguous from zero")
+        object.__setattr__(self, "kda_layer_map", mapping)
+
+    @property
+    def layer_map(self) -> dict[int, int]:
+        return self.kda_layer_map
+
+    @property
+    def num_layers(self) -> int:
+        return len(self.kda_layer_map)
+
+    @property
+    def nheads_local(self) -> int:
+        return self.dims.num_value_heads // self.tp_size
+
+    @property
+    def conv_dim_local(self) -> int:
+        return (
+            2 * self.dims.num_key_heads * self.dims.key_head_dim
+            + self.dims.num_value_heads * self.dims.value_head_dim
+        ) // self.tp_size
+
+    def shard_key(self) -> tuple:
+        return self.tp_rank, tuple(sorted(self.kda_layer_map))
+
+    def band(self, name: str) -> Tuple[int, int, int]:
+        qk = self.dims.num_key_heads * self.dims.key_head_dim
+        value = self.dims.num_value_heads * self.dims.value_head_dim
+        if name == "q":
+            return qk, qk // self.tp_size, 0
+        if name == "k":
+            return qk, qk // self.tp_size, qk // self.tp_size
+        if name == "v":
+            return value, value // self.tp_size, 2 * qk // self.tp_size
+        if name == "recurrent":
+            return self.dims.num_value_heads, self.nheads_local, 0
+        raise KeyError(name)
+
+
+def state_layout_from_meta(meta: dict) -> SSMShardLayout | KDAShardLayout:
+    if "kda_layout" in meta:
+        if "ssm_layout" in meta:
+            raise ValueError("Ambiguous recurrent-state layout")
+        return KDAShardLayout(**meta["kda_layout"])
+    if "ssm_layout" not in meta:
+        raise ValueError("Peer metadata is missing its recurrent-state layout")
+    return SSMShardLayout(**meta["ssm_layout"])
+
+
+@dataclass(frozen=True)
 class SSMReshardTransfer:
     """One sub-block move of the snapshot reshard.
 
@@ -147,11 +236,12 @@ class SSMReshardTransfer:
     @property
     def is_conv(self) -> bool:
         """True if this transfer targets the conv state; False for recurrent."""
-        return self.band in _CONV_BANDS
+        return self.band != "recurrent"
 
 
 def plan_ssm_reshard(
-    src_layouts: List[SSMShardLayout], dst_layouts: List[SSMShardLayout]
+    src_layouts: List[SSMShardLayout | KDAShardLayout],
+    dst_layouts: List[SSMShardLayout | KDAShardLayout],
 ) -> List[SSMReshardTransfer]:
     """Plan the conv/recurrent sub-block moves from the prefill (src) layouts to
     the decode (dst) layouts: one transfer per (src rank, dst rank, global
@@ -173,12 +263,13 @@ def plan_ssm_reshard(
     for s in src_layouts:
         if s.global_rank not in source_ranks:
             continue
-        s_lr = s.layer_range()
         for d in dst_layouts:
-            layer_ov = intersect(s_lr, d.layer_range())
-            if layer_ov is None:
+            if type(s) is not type(d) or s.dims != d.dims:
+                raise ValueError("Incompatible recurrent-state layouts")
+            common_layers = sorted(set(s.layer_map).intersection(d.layer_map))
+            if not common_layers:
                 continue
-            for band in (*_CONV_BANDS, "recurrent"):
+            for band in (*s.conv_bands, "recurrent"):
                 _, s_size, s_off = s.band(band)
                 _, d_size, d_off = d.band(band)
                 s_glo = (s.tp_rank * s_size, s.tp_rank * s_size + s_size)
@@ -187,15 +278,15 @@ def plan_ssm_reshard(
                 if chan_ov is None:
                     continue
                 lo, hi = chan_ov
-                for g in range(layer_ov[0], layer_ov[1]):
+                for g in common_layers:
                     out.append(
                         SSMReshardTransfer(
                             src_rank=s.global_rank,
                             dst_rank=d.global_rank,
                             band=band,
                             global_layer=g,
-                            src_layer=g - s.layer_start,
-                            dst_layer=g - d.layer_start,
+                            src_layer=s.layer_map[g],
+                            dst_layer=d.layer_map[g],
                             src_lo=s_off + (lo - s_glo[0]),
                             src_hi=s_off + (hi - s_glo[0]),
                             dst_lo=d_off + (lo - d_glo[0]),

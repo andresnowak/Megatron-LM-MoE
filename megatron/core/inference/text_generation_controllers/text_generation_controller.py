@@ -1904,13 +1904,16 @@ class TextGenerationController:
                 # Retain across context cleanup. For an exclusively owned block:
                 # active=1, retain=2, request cleanup=1, coordinator RELEASE_KV=0.
                 allocator.retain_memory_blocks(valid_blocks)
-                if context.is_hybrid_model:
+                if context.is_hybrid_model or getattr(context, "has_kda", False):
                     # Transfer ownership out of the finished request before normal
                     # cleanup; the slot stays absent from the free-slot stack until
                     # the prefill engine receives RELEASE_KV.
-                    finished_ssm_slots[request_id] = context.mamba_metadata.detach_state_slot(
-                        finished_idx
+                    metadata = (
+                        context.kda_metadata
+                        if getattr(context, "has_kda", False)
+                        else context.mamba_metadata
                     )
+                    finished_ssm_slots[request_id] = metadata.detach_state_slot(finished_idx)
 
             active_idx = finished_idx - context.paused_request_count
             decode_tokens = [int(sampled_tokens_cpu[active_idx].item())]

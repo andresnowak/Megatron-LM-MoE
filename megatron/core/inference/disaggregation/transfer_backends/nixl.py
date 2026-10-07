@@ -22,8 +22,16 @@ from typing import Any, Dict, List, Optional
 import torch
 
 from megatron.core.inference.disaggregation.kv_reshard import KVShardLayout, plan_kv_reshard
-from megatron.core.inference.disaggregation.ssm_reshard import SSMShardLayout, plan_ssm_reshard
-from megatron.core.inference.disaggregation.transfer_backends.base import compute_buffer_geometry
+from megatron.core.inference.disaggregation.ssm_reshard import (
+    KDAShardLayout,
+    SSMShardLayout,
+    plan_ssm_reshard,
+    state_layout_from_meta,
+)
+from megatron.core.inference.disaggregation.transfer_backends.base import (
+    compute_buffer_geometry,
+    export_geometry_meta,
+)
 from megatron.core.inference.disaggregation.utils import transfer_peer_records
 
 logger = logging.getLogger(__name__)
@@ -235,7 +243,7 @@ class NixlTransferBackend:
         num_layers_global: Optional[int] = None,
         layer_start: Optional[int] = None,
         layer_end: Optional[int] = None,
-        ssm_layout: Optional[SSMShardLayout] = None,
+        ssm_layout: Optional[SSMShardLayout | KDAShardLayout] = None,
         ssm_state_kind: Optional[str] = None,
         _shared_context: Optional[_NixlAgentContext] = None,
         nixl_backend: Optional[str] = None,
@@ -366,7 +374,14 @@ class NixlTransferBackend:
                     "layer_end": layer_end,
                 }
             )
-        if self._ssm_layout is not None:
+        if isinstance(self._ssm_layout, KDAShardLayout):
+            state_meta = export_geometry_meta(
+                self._geometry, self._ssm_layout, self._ssm_state_kind, self._memory_buffer.dtype
+            )
+            meta.update(
+                {key: state_meta[key] for key in ("kda_layout", "state_kind", "state_dtype")}
+            )
+        elif self._ssm_layout is not None:
             meta["ssm_layout"] = asdict(self._ssm_layout)
         return meta
 
@@ -500,10 +515,12 @@ class NixlTransferBackend:
                 sources = []
                 peers_by_rank = {}
                 for meta, blocks in transfer_peer_records(peer_meta, src_block_ids):
-                    raw_layout = meta.get("ssm_layout")
-                    if not isinstance(raw_layout, dict):
-                        raise ValueError("peer metadata is missing ssm_layout")
-                    layout = SSMShardLayout(**raw_layout)
+                    layout = state_layout_from_meta(meta)
+                    if isinstance(self._ssm_layout, KDAShardLayout) and (
+                        meta.get("state_kind") != state_kind
+                        or meta.get("state_dtype") != str(self._memory_buffer.dtype)
+                    ):
+                        raise ValueError("Incompatible KDA state kind or dtype")
                     self._validate_peer(meta, blocks, dst_block_ids)
                     peer_width = (
                         layout.conv_dim_local if state_kind == "conv" else layout.nheads_local
