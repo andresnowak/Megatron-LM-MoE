@@ -860,7 +860,11 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     if (l_no + layer_offset) in extract_layer_indices:
                         intermediate_hidden_states.append(hidden_states)
                 if block_layout is not None:
-                    hidden_states = block_layout.finish(hidden_states)
+                    # The restored stream is a view; a pipeline stage's output must not be
+                    # one (schedules.deallocate_output_tensor).
+                    hidden_states = make_viewless_tensor(
+                        inp=block_layout.finish(hidden_states), requires_grad=True, keep_graph=True
+                    )
 
         # Final layer norm.
         if self.final_layernorm is not None:
