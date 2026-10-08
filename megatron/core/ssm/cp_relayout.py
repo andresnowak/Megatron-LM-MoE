@@ -93,3 +93,67 @@ class _Relayout(torch.autograd.Function):
 def relayout(x, plan, inverse=False):
     """Contiguous slice of the attention-layout tensor ``x`` (or back, with ``inverse``)."""
     return _Relayout.apply(x, plan, inverse)
+
+
+def _kcp_attention(layer):
+    """The layer's KCP attention module when it relayouts under CP, else None."""
+    attention = getattr(layer, "self_attention", None)
+    if getattr(attention, "_kcp", False) and getattr(attention, "cp_size", 1) > 1:
+        return attention
+    return None
+
+
+class BlockLayout:
+    """Keep a block's residual stream in the contiguous layout across runs of KCP layers.
+
+    A KCP layer relayouts its input to contiguous slices and its output back, two
+    all-to-alls of the hidden states per layer. Everything between two KCP layers (norms,
+    residual adds, MLP/MoE) is token-wise and does not care which rank holds which token,
+    so the residual stream can stay contiguous for a whole run of KCP layers and be
+    restored only before a layer that needs the attention layout (softmax attention) and
+    at the end of the block. The MoE routing ``padding_mask`` moves with the tokens.
+    """
+
+    def __init__(self, layers):
+        self.modules = [_kcp_attention(layer) for layer in layers]
+        self.plan = None
+        self.shape = None
+        self.zigzag_padding_mask = None
+
+    @staticmethod
+    def applies(layers, packed_seq_params):
+        """Only packed (THD, batch 1) inputs: the plan folds the batch into the sequence."""
+        return packed_seq_params is not None and any(_kcp_attention(l) for l in layers)
+
+    def before_layer(self, index, hidden_states, packed_seq_params, padding_mask):
+        """Hidden states and routing mask in the layout layer ``index`` wants."""
+        module = self.modules[index]
+        if module is not None:
+            module.kcp_external_layout = True
+            if self.plan is None:
+                seq_len, batch, hidden = hidden_states.shape
+                self.plan, _ = module._kcp_layout(hidden_states, packed_seq_params, seq_len, batch)
+                self.shape = hidden_states.shape
+                hidden_states = relayout(hidden_states.reshape(-1, 1, hidden), self.plan)
+                self.zigzag_padding_mask = padding_mask
+                if padding_mask is not None:
+                    # [b, s] bool -> [s * b, 1, 1] so the token permutation applies.
+                    moved = _relayout(
+                        padding_mask.transpose(0, 1).reshape(-1, 1, 1).to(torch.uint8),
+                        self.plan,
+                        inverse=False,
+                    )
+                    padding_mask = moved.reshape(1, -1).bool()
+                self.contiguous_padding_mask = padding_mask
+            return hidden_states, self.contiguous_padding_mask
+        if self.plan is not None:
+            hidden_states = self.finish(hidden_states)
+        return hidden_states, padding_mask
+
+    def finish(self, hidden_states):
+        """Restore the attention layout if the stream is contiguous."""
+        if self.plan is None:
+            return hidden_states
+        hidden_states = relayout(hidden_states, self.plan, inverse=True).view(self.shape)
+        self.plan = None
+        return hidden_states

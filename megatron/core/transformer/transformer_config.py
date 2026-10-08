@@ -565,6 +565,12 @@ class TransformerConfig(ModelParallelConfig):
     divide the CP size. 'kcp' (KDA only) keeps tokens sharded and merges the per-rank recurrent
     states through fla.ops.cp, with no head-count constraint."""
 
+    linear_attention_cp_block_layout: bool = False
+    """With linear_attention_cp_impl='kcp', keep the transformer block's residual stream in the
+    contiguous KCP layout across consecutive KDA layers (and the token-wise MLP/MoE between
+    them), relayouting only before softmax-attention layers and at the end of the block, instead
+    of twice inside every KDA layer. Packed (THD) inputs only."""
+
     linear_attention_full_rank_output_gate: bool = False
     """If True, the KDA output gate is a full-rank projection (hidden -> v_dim) fused into in_proj
     and sharded on value heads, instead of the reference low-rank bottleneck (hidden ->

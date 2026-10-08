@@ -532,6 +532,8 @@ class KimiDeltaAttention(GatedDeltaNet):
         # KCP shards tokens and keeps every head local; the a2a scheme splits heads over CP.
         self.cp_shard = 1 if self._kcp else self.cp_size
         self._kcp_unpacked = None
+        # Set by TransformerBlock when it keeps a run of KCP layers in the contiguous layout.
+        self.kcp_external_layout = False
         if self._safe_gate and self._use_fused_decay_gate and not _KDA_SUPPORTS_SAFE_GATE_IN_KERNEL:
             logger.warning(
                 "linear_attention_safe_output_gate is on but the installed "
@@ -1130,7 +1132,13 @@ class KimiDeltaAttention(GatedDeltaNet):
             # in; the kernels then run on the local slice and FLA merges the per-rank
             # recurrent states.
             plan, cp_context = self._kcp_layout(hidden_states, packed_seq_params, seq_len, batch)
-            hidden_states = relayout(hidden_states.reshape(-1, 1, input_shape[-1]), plan)
+            external_layout, self.kcp_external_layout = self.kcp_external_layout, False
+            if external_layout:
+                # The transformer block already holds the residual stream in the contiguous
+                # layout (cp_relayout.BlockLayout), so this layer neither relayouts nor restores.
+                plan = None
+            else:
+                hidden_states = relayout(hidden_states.reshape(-1, 1, input_shape[-1]), plan)
             seq_len, batch = hidden_states.shape[:2]
             cu_seqlens = cp_context.cu_seqlens
         seq_len = seq_len * self.sp_size * self.cp_shard
