@@ -24,6 +24,7 @@ import torch
 from gpt_builders import gpt_builder
 from megatron.core import parallel_state
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.doc_aware_cp import get_doc_aware_batch_on_this_cp_rank
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
@@ -132,6 +133,20 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         cu_seqlens = cu_seqlens[0]
         assert max_seqlen.dim() == 1
         cp_size = parallel_state.get_context_parallel_world_size()
+        if args.cp_doc_aware and cp_size > 1:
+            # Short documents whole on one CP rank, long ones split (megatron/core/doc_aware_cp.py).
+            batch, packed_seq_params = get_doc_aware_batch_on_this_cp_rank(
+                batch,
+                cu_seqlens,
+                cp_size,
+                parallel_state.get_context_parallel_rank(),
+                sp_size=args.tensor_model_parallel_size if args.sequence_parallel else 1,
+                local_multiple=16 if args.fp8 else 1,
+                max_local_len=args.cp_doc_aware_max_local_len,
+                max_padding=args.cp_doc_aware_max_padding,
+            )
+            padding_mask = batch.pop('padding_mask', None)
+            return (*batch.values(), padding_mask, packed_seq_params)
         if args.dataloader_inter_document_masking and cp_size > 1:
             batch, cu_seqlens, max_seqlen = pad_thd_batch_for_cp(
                 batch,

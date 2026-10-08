@@ -785,6 +785,16 @@ class KimiDeltaAttention(GatedDeltaNet):
 
     def _kcp_layout(self, hidden_states, packed_seq_params, seq_len, batch):
         """Relayout plan and FLA CP context for this batch, built on the host once per batch."""
+        layout = getattr(packed_seq_params, "doc_aware", None)
+        if layout is not None:
+            # Document-aware CP: the plan and context live on the micro-batch's layout.
+            cp_group, tp_group = self.pg_collection.cp, self.pg_collection.tp
+            group = self.pg_collection.tp_cp if self.sp_size > 1 else cp_group
+            assert group.rank() == cp_group.rank() * self.sp_size + (
+                tp_group.rank() if self.sp_size > 1 else 0
+            )
+            plan, cp_context, _ = layout.kcp(group, self.sp_size, cp_group, self.conv_kernel_dim)
+            return plan, cp_context
         device = hidden_states.device
         total = seq_len * self.sp_size * self.cp_size
         if packed_seq_params is None:
@@ -1125,6 +1135,11 @@ class KimiDeltaAttention(GatedDeltaNet):
         input_shape = hidden_states.shape
         seq_len, batch, _ = input_shape
         plan = cp_context = None
+        doc_aware = getattr(packed_seq_params, "doc_aware", None)
+        if doc_aware is not None and not (self._kcp and self.cp_size > 1):
+            raise NotImplementedError(
+                "Document-aware CP needs linear_attention_cp_impl='kcp' for KDA layers."
+            )
         if self._kcp and self.cp_size > 1:
             if self.initial_state_param is not None or self._carry_enabled:
                 raise NotImplementedError("KCP does not support a recurrent initial state.")
@@ -1140,9 +1155,16 @@ class KimiDeltaAttention(GatedDeltaNet):
             else:
                 hidden_states = relayout(hidden_states.reshape(-1, 1, input_shape[-1]), plan)
             seq_len, batch = hidden_states.shape[:2]
-            cu_seqlens = cp_context.cu_seqlens
+            if cp_context is not None:
+                cu_seqlens = cp_context.cu_seqlens
+            else:
+                # Document-aware CP and no document crosses a CP slice: every rank runs
+                # KDA on its own slice, without the state exchange.
+                cu_seqlens, cu_seqlens_cpu = doc_aware.kcp_state[2]
+                if not any(src is cu_seqlens for src, _ in self._cu_seqlens_cpu_cache):
+                    self._cu_seqlens_cpu_cache.append((cu_seqlens, cu_seqlens_cpu))
         seq_len = seq_len * self.sp_size * self.cp_shard
-        if cp_context is None:
+        if cp_context is None and doc_aware is None:
             # Cross-document masking. The conv and chunk_kda both run on the full
             # sequence (SP undone by in_proj's all-gather, CP by the cp2hp all-to-all),
             # so the dataloader's global cu_seqlens is what both kernels want.

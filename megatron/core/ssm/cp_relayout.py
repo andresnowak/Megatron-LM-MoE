@@ -40,14 +40,34 @@ class RelayoutPlan:
     receive_back: torch.Tensor
     input_splits: list
     output_splits: list
+    # Every rank already holds its contiguous slice in order: relayouts are no-ops.
+    identity: bool = False
 
 
 def build_relayout_plan(cu_seqlens_cpu, cp_size, sp_size, batch, group, device):
     """Plan the all-to-all for ``group.rank()``; ranks are ordered ``cp_rank * sp_size + sp_rank``."""
     world = cp_size * sp_size
-    rank = group.rank()
     slice_len = int(cu_seqlens_cpu[-1]) // world
     layouts = [_layout_indices(cu_seqlens_cpu, cp_size, sp_size, batch, r) for r in range(world)]
+    return _plan_from_layouts(layouts, slice_len, group, device)
+
+
+def build_layout_relayout_plan(virtual_pos, seq_len, sp_size, group, device, moves=True):
+    """Plan for an arbitrary layout: ``virtual_pos[cp_rank]`` gives, for each of the CP rank's
+    ``seq_len`` tokens in order, its position in the contiguous (KCP) buffer. Sequence
+    parallelism splits each CP rank's tokens into ``sp_size`` contiguous pieces."""
+    if not moves:
+        return RelayoutPlan(group, None, None, None, None, None, None, identity=True)
+    slice_len = seq_len // sp_size
+    pos = torch.as_tensor(virtual_pos).reshape(-1, sp_size, slice_len)
+    layouts = [pos[r // sp_size, r % sp_size] for r in range(pos.shape[0] * sp_size)]
+    return _plan_from_layouts(layouts, slice_len, group, device)
+
+
+def _plan_from_layouts(layouts, slice_len, group, device):
+    """``layouts[r]``: destination-buffer positions of rank r's tokens, in its local order."""
+    world = len(layouts)
+    rank = group.rank()
     destinations = layouts[rank] // slice_len
     send_order = torch.argsort(destinations, stable=True)
     received = [ids[ids // slice_len == rank] for ids in layouts]
@@ -64,6 +84,8 @@ def build_relayout_plan(cu_seqlens_cpu, cp_size, sp_size, batch, group, device):
 
 
 def _relayout(x, plan, inverse):
+    if plan.identity:
+        return x
     if inverse:
         send = x.index_select(0, plan.send_back)
         received = torch.empty_like(send)
@@ -92,6 +114,8 @@ class _Relayout(torch.autograd.Function):
 
 def relayout(x, plan, inverse=False):
     """Contiguous slice of the attention-layout tensor ``x`` (or back, with ``inverse``)."""
+    if plan.identity:
+        return x
     return _Relayout.apply(x, plan, inverse)
 
 
