@@ -9,7 +9,11 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KDAInferenceStateConfig,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -2314,6 +2318,100 @@ class TestDynamicContext:
             DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         self._restore_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    @pytest.mark.parametrize("num_speculative_tokens", [0, 3])
+    def test_ep_dummy_initializes_nonempty_attention_state(
+        self, is_hybrid_model, num_speculative_tokens
+    ):
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=64,
+            max_requests=16,
+            is_hybrid_model=is_hybrid_model,
+            num_cuda_graphs=None,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+        tokens = num_speculative_tokens + 1
+        for _ in range(3):
+            ctx.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
+            assert ctx.total_request_count == 1
+            assert ctx.active_token_count == tokens
+            assert ctx.num_decode_requests == 1
+            assert ctx.num_prefill_requests == 0
+            assert ctx.request_query_lengths[0].item() == tokens
+            assert ctx.padded_active_token_count >= tokens
+            input_ids, position_ids = ctx.current_input_and_position_ids()
+            assert input_ids.shape == position_ids.shape == (1, ctx.padded_active_token_count)
+            assert input_ids.numel() > 0
+            assert ctx.active_attn_metadata is not None
+            assert not ctx.using_cuda_graph_this_step()
+            assert torch.all(
+                ctx.token_to_block_idx[:tokens] == ctx.kv_block_allocator.dummy_block_idx
+            )
+            if is_hybrid_model:
+                assert ctx.mamba_metadata.mamba_state_free_slot_count == ctx.max_requests - 1
+                assert ctx.mamba_metadata.request_to_mamba_state_idx[0].item() >= 0
+            ctx.reset(preserve_prefix_cache=True, preserve_counters=True)
+            assert ctx.total_request_count == ctx.active_token_count == 0
+            if is_hybrid_model:
+                assert ctx.mamba_metadata.mamba_state_free_slot_count == ctx.max_requests
+
+    @pytest.mark.internal
+    def test_ep_dummy_initializes_and_releases_kda_state(self):
+        model_config = TransformerConfig(
+            params_dtype=torch.bfloat16, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=32,
+            block_size_tokens=8,
+            buffer_size_gb=0.01,
+            paused_buffer_size_gb=0.002,
+            max_tokens=64,
+            max_requests=8,
+            num_cuda_graphs=None,
+            num_speculative_tokens=0,
+            use_cuda_graphs_for_non_decode_steps=True,
+            use_flashinfer_fused_rope=None,
+            unified_memory_level=0,
+            kda_inference_state_config=KDAInferenceStateConfig(
+                kda_layer_map={0: 0},
+                attention_layer_map={1: 0},
+                conv_states_shape=(12, 4),
+                recurrent_states_shape=(2, 4, 4),
+                conv_states_dtype=torch.bfloat16,
+                recurrent_states_dtype=torch.float32,
+            ),
+        )
+        ctx = DynamicInferenceContext(model_config, inference_config)
+        conv_ptr = ctx.kda_conv_states.data_ptr()
+        recurrent_ptr = ctx.kda_recurrent_states.data_ptr()
+        for _ in range(3):
+            ctx.kda_conv_states[:, : ctx.max_requests].fill_(42)
+            ctx.kda_recurrent_states[:, : ctx.max_requests].fill_(42)
+            ctx.initialize_attention_state(is_expert_parallel_dummy_cuda_graph_step=True)
+            assert ctx.active_token_count == 1
+            assert ctx.kda_metadata.mamba_state_free_slot_count == ctx.max_requests - 1
+            slot = ctx.kda_metadata.request_to_mamba_state_idx[0].item()
+            assert 0 <= slot < ctx.max_requests
+            assert torch.count_nonzero(ctx.kda_conv_states[:, slot]) == 0
+            assert torch.count_nonzero(ctx.kda_recurrent_states[:, slot]) == 0
+            assert not ctx._pending_kda_zeros
+            assert ctx.kda_recurrent_states.dtype == torch.float32
+            assert ctx.kda_dummy_state_idx == ctx.max_requests
+            assert torch.count_nonzero(ctx.kda_conv_states[:, ctx.kda_dummy_state_idx]) == 0
+            assert torch.count_nonzero(ctx.kda_recurrent_states[:, ctx.kda_dummy_state_idx]) == 0
+            assert ctx.kda_conv_states.data_ptr() == conv_ptr
+            assert ctx.kda_recurrent_states.data_ptr() == recurrent_ptr
+            ctx.reset(preserve_prefix_cache=True, preserve_counters=True)
+            assert ctx.kda_metadata.mamba_state_free_slot_count == ctx.max_requests
 
     @pytest.mark.internal
     @rounder_override(64)

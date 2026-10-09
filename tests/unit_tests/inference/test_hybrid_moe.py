@@ -27,6 +27,12 @@ from megatron.core.inference.config import InferenceConfig, MambaInferenceStateC
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.communication.torch_symm_triton import is_device_nvls_capable
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+    GPTInferenceWrapper,
+)
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
@@ -188,6 +194,7 @@ class _TestDynamicInferenceBase:
     def _assert_dynamic_inference_shape(self, model, ctx, rank, state_label):
         """Run model and assert the logits shape matches padded_batch_dimensions.token_count."""
         padded = ctx.padded_batch_dimensions
+        assert padded.token_count > 0, f"Rank {rank} ({state_label}): empty forward input"
         input_ids = torch.randint(0, self.VOCAB_SIZE, (1, padded.token_count), device="cuda")
         out = model(
             input_ids=input_ids,
@@ -304,10 +311,70 @@ class TestDynamicInferenceNVLS(_TestDynamicInferenceBase):
 
 @pytest.mark.internal
 class TestDynamicInferenceNCCL(_TestDynamicInferenceBase):
-    """NCCL dispatcher: dummy-rank bail-out and eager-fallback tests."""
+    """NCCL dispatcher: nonempty dummy forwards and eager-fallback tests."""
+
+    @pytest.mark.parametrize("peer_state", [PREFILL, DECODE])
+    @pytest.mark.parametrize("num_cuda_graphs", [None, 16])
+    @torch.inference_mode()
+    def test_controller_dummy_forward_with_active_ep_peers(self, peer_state, num_cuda_graphs):
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+        is_dummy = ep_rank % 2 == 0
+        model = self._build_model(inference_moe_token_dispatcher_type='nccl')
+        ctx = self._build_context(
+            model,
+            num_cuda_graphs=num_cuda_graphs,
+            use_cuda_graphs_for_non_decode_steps=False,
+            max_requests=8,
+            max_tokens=128,
+            cuda_graph_max_tokens=64,
+        )
+        controller = TextGenerationController(GPTInferenceWrapper(model, ctx), tokenizer=None)
+        observed_shapes = []
+
+        def record_input(_module, args, kwargs):
+            input_ids = kwargs.get("input_ids", args[0] if args else None)
+            assert input_ids is not None and input_ids.numel() > 0
+            assert tuple(input_ids.shape) == (1, ctx.padded_active_token_count)
+            assert ctx.batch_dimensions.decode_req_count == (
+                1 if is_dummy else _STATE_DIMS[peer_state].decode_req_count
+            )
+            observed_shapes.append(tuple(input_ids.shape))
+
+        hook = model.register_forward_pre_hook(record_input, with_kwargs=True)
+        try:
+            for _ in range(2):
+                calls_before = len(observed_shapes)
+                if is_dummy:
+                    controller.dummy_forward()
+                    assert ctx.total_request_count == ctx.active_token_count == 0
+                    assert ctx.mamba_metadata.mamba_state_free_slot_count == ctx.max_requests
+                else:
+                    ctx.add_dummy_requests_for_cudagraph_capture(_STATE_DIMS[peer_state])
+                    controller._dynamic_step_context_init()
+                    input_ids, position_ids = ctx.current_input_and_position_ids()
+                    controller._dynamic_step_forward_logits(input_ids, position_ids)
+                    assert ctx.using_cuda_graph_this_step() == (
+                        num_cuda_graphs is not None and peer_state == DECODE
+                    )
+                    ctx.reset(preserve_prefix_cache=True, preserve_counters=True)
+                # Warmup/capture enter forward; graph replay bypasses Python hooks.
+                if num_cuda_graphs is not None and peer_state == DECODE:
+                    self._assert_cuda_graphs_were_replayed(True, ep_rank, "controller step")
+                else:
+                    assert len(observed_shapes) > calls_before
+                torch.cuda.synchronize()
+                torch.distributed.barrier()
+            assert all(shape[0] == 1 and shape[1] > 0 for shape in observed_shapes)
+            self._assert_cuda_graphs_were_replayed(
+                num_cuda_graphs is not None and peer_state == DECODE,
+                ep_rank,
+                "controller dummy forward",
+            )
+        finally:
+            hook.remove()
 
     # ------------------------------------------------------------------
-    # Cuda-graph bail-out tests for the NCCLAllGatherDispatcher
+    # Eager-fallback tests for the NCCLAllGatherDispatcher
     # ------------------------------------------------------------------
 
     @pytest.mark.parametrize(
@@ -316,13 +383,12 @@ class TestDynamicInferenceNCCL(_TestDynamicInferenceBase):
     @pytest.mark.internal
     @torch.inference_mode()
     def test_nccl_dummy_bailout_with_prefill_peer(self, peer_state):
-        """Verify the dummy-rank bail-out path with the NCCL dispatcher.
+        """Verify a nonempty dummy forward with prefill work on NCCL peers.
 
         With the NCCL dispatcher (match_ep_token_counts=True), when any EP
         rank has prefill requests, adjust_batch_dims_for_expert_parallelism
-        returns None (forcing eager mode) for ALL ranks. A dummy rank then
-        bails out of initialize_attention_state early (padded_batch_dimensions
-        is not set).
+        returns None (forcing eager mode) for ALL ranks. The dummy rank must
+        still prepare a valid padded batch and participate in the model forward.
 
         This test verifies that:
           - The dummy rank correctly falls back to model.forward (the real
@@ -386,7 +452,7 @@ class TestDynamicInferenceNCCL(_TestDynamicInferenceBase):
         can accommodate it, match_graph_config returns None for all ranks,
         forcing eager mode globally. This test verifies that:
           - No rank matches a CUDA graph (eager mode is forced).
-          - Dummy ranks bail out and produce correct shapes via the
+          - Dummy ranks prepare nonempty inputs and participate through the
             eager dummy_forward path.
           - Non-dummy ranks produce correct shapes via the eager
             padded_batch_dimensions fallback.

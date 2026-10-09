@@ -2247,8 +2247,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def add_dummy_requests_for_expert_parallel_step(
         self, graph_dimensions: InferenceBatchDimensions
     ) -> None:
-        """Minimal context setup so an EP rank with no real requests can replay
-        an already-captured cuda graph without crashing or corrupting memory.
+        """Prepare a nonempty dummy batch for an idle EP rank's forward pass.
 
         This is the fast alternative to add_dummy_requests_for_cudagraph_capture
         (which goes through the heavyweight add_dummy_requests_parallel path).
@@ -2256,7 +2255,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         We setup minimal state such that initialize_attention_state and the forward
         pass can run without error.
 
-        Called AFTER the EP sync so graph_dimensions reflects the agreed-upon graph.
+        Called BEFORE graph matching so eager and CUDA-graph steps both have
+        valid request, KV, and recurrent state. Graph padding is prepared later.
         """
         N_decode = graph_dimensions.decode_req_count
         N_prefill = graph_dimensions.prefill_req_count
@@ -2356,23 +2356,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.is_creating_cuda_graphs and is_expert_parallel_dummy_cuda_graph_step
         ), "Dummy expert model parallel steps should not be creating cuda graphs."
 
-        # If in CUDA graph creation mode, add dummy requests for CUDA graph capture.
-        # EP dummy requests are added AFTER the EP sync below.
+        # Prepare dummy state before matching, including when no graph can run.
         if self.is_creating_cuda_graphs:
             self.add_dummy_requests_for_cudagraph_capture(construct_graph_dimensions)
+        elif is_expert_parallel_dummy_cuda_graph_step:
+            self.add_dummy_requests_for_expert_parallel_step(
+                InferenceBatchDimensions(
+                    token_count=self.num_speculative_tokens + 1,
+                    prefill_req_count=0,
+                    decode_req_count=1,
+                )
+            )
 
-        if is_expert_parallel_dummy_cuda_graph_step:
-            # No real requests on this EP rank. Pass empty dimensions so the EP
-            # all-reduce in match_graph_config picks up the real ranks' values.
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=0, prefill_req_count=0, decode_req_count=0
-            )
-        else:
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=self.active_token_count,
-                prefill_req_count=self.num_prefill_requests,
-                decode_req_count=self.num_decode_requests,
-            )
+        batch_dimensions = InferenceBatchDimensions(
+            token_count=self.active_token_count,
+            prefill_req_count=self.num_prefill_requests,
+            decode_req_count=self.num_decode_requests,
+        )
 
         self.batch_dimensions = batch_dimensions
 
@@ -2391,23 +2391,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if construct_graph_dimensions is not None:
             assert self._using_cuda_graph_this_step
-
-        if is_expert_parallel_dummy_cuda_graph_step and not self.using_cuda_graph_this_step():
-            # If we are here, this means that CUDAGraphBatchDimensionBuilder.match_graph_config
-            # could not find a compatible cuda graph for the dummy forward step.
-            # Now, we need not do the remaining setup. The controller
-            # will directly call the model forward pass with a single token.
-            return
-
-        # Add dummy requests AFTER the EP sync so they match the resolved graph.
-        if is_expert_parallel_dummy_cuda_graph_step:
-            self.add_dummy_requests_for_expert_parallel_step(best_graph)
-            batch_dimensions = InferenceBatchDimensions(
-                token_count=self.active_token_count,
-                prefill_req_count=self.num_prefill_requests,
-                decode_req_count=self.num_decode_requests,
-            )
-            self.batch_dimensions = batch_dimensions
 
         if self.using_cuda_graph_this_step():
             self.padded_batch_dimensions = best_graph
