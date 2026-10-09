@@ -2967,6 +2967,14 @@ def _add_training_args(parser):
                        help='Absolute LR for matrix (2D non-embedding/output) params under '
                        '--optimizer md_decoupling or muon/dist_muon (the Muon-managed matrices; '
                        'the scalar Adam/Lion group stays on --lr). Overrides muon_lr_factor * lr.')
+    group.add_argument('--router-lr', type=float, default=None,
+                       help='Absolute LR for MoE router weights under md_decoupling, on either '
+                       'the Muon or the Adam branch. When unset, Muon-branch routers use '
+                       '--matrix-lr and Adam-branch routers use the base --lr.')
+    group.add_argument('--router-weight-decay', type=float, default=None,
+                       help='Decoupled weight decay for MoE router weights under md_decoupling, '
+                       'independent of --weight-decay. Requires --hypersphere-router-mode none '
+                       '(the hypersphere projection would undo it).')
     group.add_argument('--embedding-lr-multiplier', type=float, default=None,
                        help='LR multiplier for embedding (and tied LM-head) params under '
                        'md_decoupling. Final max_lr = embedding_lr_multiplier * lr. When unset, '

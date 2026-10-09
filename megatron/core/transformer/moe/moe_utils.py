@@ -24,6 +24,7 @@ from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.jit import jit_fuser
 from megatron.core.utils import (
     deprecated,
     get_attr_wrapped_model,
@@ -238,6 +239,72 @@ def qb_dual_update(
     alpha = topk_result.values[:, -1:]
     beta_local = (scores - alpha).topk(col_target + 1, dim=0).values[-1].contiguous()
     return indices, beta_local
+
+
+def marin_qb_histogram_update(
+    logits: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    topk: int,
+    num_bins: int = 10000,
+    *,
+    group: Optional[torch.distributed.ProcessGroup] = None,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Marin's live-range upper-quantile estimator, in subtractive-beta convention.
+
+    Reference: marin-community/marin@12d8b6f,
+    experiments/grug/moe_hero_ep/model.py::_qb_beta_hist.
+    Pool raw-logit margins over a single forward's TP+DP+CP token shards. The
+    caller holds beta fixed through accumulation and token-weights these estimates.
+    No margins survive this call. A None group is the single-process CPU path.
+    """
+    assert logits.ndim == 2 and alpha.shape == logits.shape[:1]
+    assert beta.shape == logits.shape[1:] and 0 < topk < logits.shape[1]
+    assert num_bins > 0
+    assert padding_mask is None or padding_mask.shape == alpha.shape
+    with torch.no_grad():
+        margins = logits.detach().float() - alpha.detach().float().unsqueeze(1)
+        valid = (
+            torch.ones_like(alpha, dtype=torch.bool)
+            if padding_mask is None else ~padding_mask.bool()
+        )
+        # Empty shards still join collectives. numel() checks metadata, not device data.
+        if margins.numel() == 0:
+            lo, hi = margins.new_tensor(float('inf')), margins.new_tensor(-float('inf'))
+        elif padding_mask is None:
+            lo, hi = margins.amin(), margins.amax()
+        else:
+            lo = margins.masked_fill(~valid[:, None], float('inf')).amin()
+            hi = margins.masked_fill(~valid[:, None], -float('inf')).amax()
+        if group is not None:
+            torch.distributed.all_reduce(lo, op=torch.distributed.ReduceOp.MIN, group=group)
+            torch.distributed.all_reduce(hi, op=torch.distributed.ReduceOp.MAX, group=group)
+        # All-padding forwards preserve beta. Keep the grid finite without a CPU sync.
+        lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
+        hi = torch.where(torch.isfinite(hi), hi, lo)
+        span = (hi - lo).clamp_min(1e-6)
+        width = span / num_bins
+        safe_margins = torch.where(valid[:, None], margins, lo)
+        bins = ((safe_margins - lo) / width).long().clamp_(0, num_bins - 1)
+        experts = torch.arange(logits.shape[1], device=logits.device) * num_bins
+        indices = (bins + experts).flatten()
+        counts = torch.zeros(logits.shape[1] * num_bins, dtype=torch.int64, device=logits.device)
+        weights = valid[:, None].expand_as(bins).reshape(-1).to(torch.int64)
+        counts.scatter_add_(0, indices, weights)
+        counts = counts.reshape(logits.shape[1], num_bins)
+        if group is not None:
+            torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM, group=group)
+        token_count = counts[0].sum()
+        target = token_count.to(torch.float32) * topk / logits.shape[1]
+        cumulative = counts.flip(-1).cumsum(-1).flip(-1)
+        crossing = ((cumulative >= target).sum(-1) - 1).clamp(0, num_bins - 1)
+        above = cumulative.gather(-1, crossing[:, None]).squeeze(-1)
+        in_bin = counts.gather(-1, crossing[:, None]).squeeze(-1)
+        estimate = lo + width * (
+            crossing + (above - target) / in_bin.clamp_min(1)
+        )
+        return torch.where(token_count > 0, estimate, beta), token_count
 
 
 def compute_qb_histogram(
@@ -1099,6 +1166,8 @@ def apply_router_token_dropping(
     capacity_factor: float,
     drop_policy: str = "probs",
     pad_to_capacity: bool = False,
+    drop_priority: Optional[torch.Tensor] = None,
+    padding_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply token dropping to top-k expert selection.
 
@@ -1115,6 +1184,12 @@ def apply_router_token_dropping(
         drop_policy (str, optional): Policy to drop tokens - "probs" or "position".
                                      Defaults to "probs".
         pad_to_capacity (bool, optional): Whether to pad to capacity. Defaults to False.
+        drop_priority (torch.Tensor, optional): [num_tokens, num_experts] scores that replace
+            routing_probs as the ranking of the "probs" policy, non-negative for selected
+            entries. Quantile balancing passes its selection margin here. Defaults to None.
+        padding_mask (torch.Tensor, optional): [num_tokens] bool mask, True for padding
+            tokens. Padding tokens are ranked below every valid token, so they only take
+            capacity that valid tokens leave unused. Defaults to None.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -1135,16 +1210,25 @@ def apply_router_token_dropping(
         # No need to drop tokens if capacity exceeds the number of tokens
         capacity_mask = torch.ones_like(routing_probs).bool()
     else:
+        padded_selection = None
+        if padding_mask is not None:
+            padded_selection = routing_map & padding_mask.unsqueeze(-1)
         if drop_policy == "probs":
-            _, capacity_indices = torch.topk(routing_probs, k=expert_capacity, dim=0, sorted=False)
-            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+            priority = routing_probs if drop_priority is None else drop_priority
+            if drop_priority is not None or padded_selection is not None:
+                # Selected valid entries are >= 0, padded ones -1, unselected ones -inf.
+                priority = priority.masked_fill(~routing_map, float("-inf"))
+                if padded_selection is not None:
+                    priority = priority.masked_fill(padded_selection, -1.0)
         elif drop_policy == "position":
-            _, capacity_indices = torch.topk(
-                routing_map.int(), k=expert_capacity, dim=0, sorted=False
-            )
-            capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
+            # topk keeps the earliest rows among equal values.
+            priority = routing_map.int()
+            if padded_selection is not None:
+                priority = priority + (routing_map & ~padded_selection).int()
         else:
             raise ValueError(f"Invalid drop_policy: {drop_policy}")
+        _, capacity_indices = torch.topk(priority, k=expert_capacity, dim=0, sorted=False)
+        capacity_mask = torch.zeros_like(routing_probs).scatter(0, capacity_indices, 1).bool()
 
     # Apply capacity constraints
     if pad_to_capacity:
@@ -1156,6 +1240,33 @@ def apply_router_token_dropping(
         final_probs = routing_probs * final_map
 
     return final_probs, final_map
+
+
+@jit_fuser
+def dropped_token_fraction(
+    routing_map: torch.Tensor,
+    dropped_routing_map: torch.Tensor,
+    padding_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fraction of token-expert assignments removed by the capacity limit.
+
+    Args:
+        routing_map (torch.Tensor): [num_tokens, num_experts] bool selection before dropping.
+        dropped_routing_map (torch.Tensor): The selection after apply_router_token_dropping.
+        padding_mask (torch.Tensor, optional): [num_tokens] bool mask, True for padding tokens.
+            Padding tokens are excluded from both the numerator and the denominator.
+
+    Returns:
+        torch.Tensor: 0-dim float32 tensor on the routing_map device. Fused, static shape and
+            no host sync, so it is cheap on every MoE layer and CUDA-graph safe.
+    """
+    dropped = routing_map & ~dropped_routing_map
+    if padding_mask is not None:
+        valid = ~padding_mask.unsqueeze(-1)
+        routing_map = routing_map & valid
+        dropped = dropped & valid
+    num_assigned = routing_map.sum(dtype=torch.float32)
+    return dropped.sum(dtype=torch.float32) / num_assigned.clamp(min=1.0)
 
 
 def expert_load_entropy(tokens_per_expert: torch.Tensor) -> torch.Tensor:

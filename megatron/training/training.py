@@ -148,6 +148,12 @@ from megatron.core.optimizer.muon_logging import (
     collect_md_gain_stats,
     collect_muon_stats,
 )
+from megatron.core.transformer.moe import router_input_logging
+from megatron.core.optimizer.router_update_logging import (
+    collect_router_update_stats,
+    pop_router_update_stats,
+    snapshot_router_weights,
+)
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -2099,9 +2105,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     grad_norm = None
     while rerun_state_machine.should_run_forward_backward(data_iterator):
-        from megatron.training.nan_debug import nan_debug_new_step
-        # Reset diagnostics for every attempt, including reruns of the same step.
-        nan_debug_new_step(iteration + 1, model)
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2184,9 +2187,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # and the optimizer consume the grads. To get mask-and-continue behavior,
         # pair NAN_DEBUG_SANITIZE=1 with CHECK_NAN=0 (the param_and_grad_buffer
         # NaN check is fatal and fires DURING backward, before this runs).
-        from megatron.training.nan_debug import nan_debug_check_grads, nan_debug_sanitize_grads
-        # Inspect before sanitization removes the evidence of non-finite gradients.
-        nan_debug_check_grads(model, iteration + 1)
+        from megatron.training.nan_debug import nan_debug_sanitize_grads
         nan_debug_sanitize_grads(model)
 
         if args.optimizer == 'md_decoupling' and args.check_grad_norm:
@@ -2244,11 +2245,24 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     skip_reduce_check = args.skip_reduce_check and \
         (args.optimizer == 'md_decoupling' and isinstance(optimizer, LayerWiseDistributedOptimizer))
 
+    # Router relative-update logging: snapshot router rows before the step, compare after.
+    # `iteration` is the pre-increment count, so the logged step is iteration + 1.
+    log_router_update = (
+        args.router_update_log_interval
+        and iteration is not None
+        and (iteration + 1) % args.router_update_log_interval == 0
+    )
+    if log_router_update:
+        snapshot_router_weights(optimizer)
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    if log_router_update:
+        collect_router_update_stats(args.num_layers + (args.mtp_num_layers or 0))
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -2536,8 +2550,6 @@ def training_log(
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
-        if os.environ.get("MOE_VALIDATE_ROUTING", "0") == "1":
-            track_names.append("routing_oob_tokens")
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
         if "seq_aux_loss" in args.moe_router_load_balancing_type:
@@ -2546,6 +2558,8 @@ def training_log(
             track_names.append("global_load_balancing_loss")
         if args.moe_z_loss_coeff not in (None, 0.0) or args.moe_router_log_z_loss:
             track_names.append("z_loss")
+        if args.moe_expert_capacity_factor is not None:
+            track_names.append("dropped_token_fraction")
         if "mbs" in args.moe_router_violation_metrics:
             track_names.append("expert_max_violation")
             track_names.append("expert_min_violation")
@@ -2787,6 +2801,55 @@ def training_log(
         timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
 
     return report_memory_flag
+
+
+# Per-group learning rates for logging, beside the canonical 'learning-rate' (the base --lr
+# schedule). Each group is classified by the parameters it holds.
+_GROUP_LR_CATEGORIES = ("router", "matrix", "embedding", "output")
+
+
+def _param_group_category(group):
+    for param in group["params"]:
+        if getattr(param, "is_router", False):
+            return "router"
+        if getattr(param, "is_md_output_parameter", False):
+            return "output"
+        if getattr(param, "is_md_embedding_parameter", False) or getattr(
+            param, "is_embedding_or_output_parameter", False
+        ):
+            return "embedding"
+        if group.get("use_orthogonal_updates", False):
+            return "matrix"
+    return None
+
+
+@torch.no_grad()
+def _per_group_learning_rates(optimizer):
+    """Return {'learning-rate/<category>': lr}. Collective: call on every rank.
+
+    Under the layer-wise optimizer a rank only holds the groups' parameters it owns, so the
+    logging rank may hold no router or matrix parameter; each rank reports the lr of the groups
+    it can classify and a MAX all-reduce (absent = -1) merges them.
+    """
+    local = torch.full(
+        (len(_GROUP_LR_CATEGORIES),), -1.0, dtype=torch.float64,
+        device=torch.cuda.current_device() if torch.cuda.is_available() else "cpu",
+    )
+    if optimizer is not None:
+        for group in optimizer.param_groups:
+            category = _param_group_category(group)
+            lr = group.get("lr")
+            if category is None or lr is None:
+                continue
+            index = _GROUP_LR_CATEGORIES.index(category)
+            local[index] = max(float(local[index]), float(lr))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.MAX)
+    return {
+        f"learning-rate/{name}": float(value)
+        for name, value in zip(_GROUP_LR_CATEGORIES, local.tolist())
+        if value >= 0
+    }
 
 
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
@@ -3542,6 +3605,12 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
+            # Router-input diagnostics: record during this step's forwards; collected below.
+            log_router_input = bool(
+                args.router_input_log_interval
+                and (iteration + 1) % args.router_input_log_interval == 0
+            )
+            router_input_logging.set_active(log_router_input, args.router_diag_layers)
             (
                 loss_dict,
                 skipped_iter,
@@ -3671,6 +3740,21 @@ def train(
                     log_sparsity=args.log_muon_sparsity,
                     log_param_rms=args.log_muon_param_rms,
                 )
+        router_update_stats = pop_router_update_stats()
+        if router_update_stats:
+            md_gain_stats = {**(md_gain_stats or {}), **router_update_stats}
+        if router_input_logging.is_active():
+            router_input_stats = router_input_logging.collect(
+                model,
+                args.num_layers + (args.mtp_num_layers or 0),
+                zero_centered_gamma=getattr(config, "layernorm_zero_centered_gamma", False),
+            )
+            if router_input_stats:
+                md_gain_stats = {**(md_gain_stats or {}), **router_input_stats}
+        if args.tensorboard_log_interval and iteration % args.tensorboard_log_interval == 0:
+            group_lrs = _per_group_learning_rates(optimizer)
+            if group_lrs:
+                md_gain_stats = {**(md_gain_stats or {}), **group_lrs}
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:

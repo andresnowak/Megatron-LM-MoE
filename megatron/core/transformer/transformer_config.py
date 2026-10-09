@@ -1052,7 +1052,7 @@ class TransformerConfig(ModelParallelConfig):
     decisions. This is useful when fine-tuning a pretrained policy with a frozen router."""
 
     moe_router_quantile_balancing_method: Literal[
-        'average', 'legacy_average', 'histogram'
+        'average', 'legacy_average', 'histogram', 'marin_histogram'
     ] = 'histogram'
     """Quantile estimator used by quantile balancing. "average" averages independently computed
     microbatch/rank quantiles in sigmoid/softmax score space. "legacy_average" preserves the
@@ -1062,6 +1062,14 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_router_quantile_balancing_num_bins: int = 1000
     """Number of uniform bins per expert used by histogram quantile balancing."""
+
+    moe_router_quantile_balancing_marin_num_bins: int = 10000
+    """Bins for marin_histogram: raw-logit margins with a live global min/max grid.
+    Each forward pools a histogram over TP+DP+CP. With gradient accumulation,
+    token-weighted microbatch quantiles are averaged at the optimizer-step boundary;
+    this is not the quantile of the entire accumulated batch. Expert combination
+    weights still use moe_router_score_function. Adds three forward collectives.
+    """
 
     moe_router_force_load_balancing: bool = False
     """[Experimental] Force load balancing with random logits for MoE router, supports naive topk
@@ -1215,7 +1223,8 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_expert_capacity_factor: Optional[float] = None
     """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
-    will be dropped. The default is None."""
+    will be dropped. The default is None. When set, the fraction of valid token-expert
+    assignments dropped per layer is logged as ``dropped_token_fraction``."""
 
     moe_pad_expert_input_to_capacity: bool = False
     """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match
@@ -1230,8 +1239,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_token_drop_policy: Literal['probs', 'position'] = "probs"
     """The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with
-    the lowest probabilities will be dropped. If "position", tokens at the end of each batch will
-    be dropped.
+    the lowest probabilities will be dropped; under quantile balancing, the tokens with the lowest
+    QB selection margin (biased score minus the token's Top-(k+1) biased score). If "position",
+    tokens at the end of each batch will be dropped. Padding tokens are always dropped first.
     """
 
     moe_layer_recompute: bool = False
@@ -2049,14 +2059,16 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
         if "quantile_balancing" in self.moe_router_load_balancing_type:
-            valid_qb_methods = {'average', 'legacy_average', 'histogram'}
+            valid_qb_methods = {'average', 'legacy_average', 'histogram', 'marin_histogram'}
             if self.moe_router_quantile_balancing_method not in valid_qb_methods:
                 raise ValueError(
                     "moe_router_quantile_balancing_method must be 'average', "
-                    "'legacy_average', or 'histogram'"
+                    "'legacy_average', 'histogram', or 'marin_histogram'"
                 )
             if self.moe_router_quantile_balancing_num_bins <= 0:
                 raise ValueError("moe_router_quantile_balancing_num_bins must be positive")
+            if self.moe_router_quantile_balancing_marin_num_bins <= 0:
+                raise ValueError("moe_router_quantile_balancing_marin_num_bins must be positive")
             if (
                 self.num_moe_experts is not None
                 and self.moe_router_topk >= self.num_moe_experts
@@ -2079,21 +2091,23 @@ class TransformerConfig(ModelParallelConfig):
                         "aux_loss",
                         "seq_aux_loss",
                         "global_aux_loss",
+                        "quantile_balancing",
                         "none",
                     ]:
                         raise ValueError(
-                            "moe_expert_capacity_factor only works with aux_loss, "
-                            "seq_aux_loss, global_aux_loss or none load balancing"
+                            "moe_expert_capacity_factor only works with aux_loss, seq_aux_loss, "
+                            "global_aux_loss, quantile_balancing or none load balancing"
                         )
             elif self.moe_router_load_balancing_type not in [
                 "aux_loss",
                 "seq_aux_loss",
                 "global_aux_loss",
+                "quantile_balancing",
                 "none",
             ]:
                 raise ValueError(
-                    "moe_expert_capacity_factor only works with aux_loss, "
-                    "seq_aux_loss, global_aux_loss or none load balancing"
+                    "moe_expert_capacity_factor only works with aux_loss, seq_aux_loss, "
+                    "global_aux_loss, quantile_balancing or none load balancing"
                 )
 
         if self.moe_pad_expert_input_to_capacity:
