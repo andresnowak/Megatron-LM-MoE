@@ -171,10 +171,7 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import save_router_state, restore_router_state
-from megatron.core.transformer.moe.experts_offloading_fp8_util import (
-    FP8ExpertsParameterManager,
-    OffloadingFP8Config,
-)
+from megatron.core.transformer.moe.experts_offloading_fp8_util import FP8ExpertsParameterManager
 from megatron.core.transformer.moe.experts_fp8_util import (
     FP8GPUExpertsParameterManager,
 )
@@ -2145,7 +2142,6 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             and args.moe_use_inplace_fp8_param
             and not config.moe_offloading_experts_debug_mode
         ):
-            FP8ExpertsParameterManager.create_instance(OffloadingFP8Config.from_transformer_config(config))
             FP8ExpertsParameterManager.mark_first_microbatch()
 
         if (
@@ -2941,7 +2937,13 @@ def save_checkpoint_and_time(
     for model_chunk in model:
         if hasattr(model_chunk, 'free_overlap_buffers'):
             model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
+    # Only async saves need the headroom. A synchronous save copies shards from this
+    # process, and empty_cache() unmaps segments NCCL registered for pipeline-parallel
+    # P2P (see the note in load_checkpoint's caller) and forces the whole cache to be
+    # re-mapped on the first step after the save, which is where the tightest stage
+    # ran out of memory.
+    if args.async_save:
+        torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
