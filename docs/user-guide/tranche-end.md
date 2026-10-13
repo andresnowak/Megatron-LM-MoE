@@ -29,10 +29,12 @@ length and packing configuration unchanged. The checkpoint
 consumed-sample counter determines the remaining batches. Replaying a rejected
 step does not consume another batch.
 
-At completion, rank zero atomically writes `tranche_end.json` in the save
+At completion, rank zero atomically writes `tranche_end.txt` in the save
 directory, after the final checkpoint (including any asynchronous save) is
 finished. It records the tranche identity, its start/end global consumed-sample
 counters, and the final checkpoint iteration.
+The `.txt` file contains JSON-formatted metadata, including the tranche identity
+needed to distinguish a resume from a new tranche.
 
 When switching to a new tranche, point `DATA_ROOT` at its shards and keep:
 

@@ -8,7 +8,7 @@ import tempfile
 from typing import Optional, Sequence
 
 
-MARKER_NAME = "tranche_end.json"
+MARKER_NAME = "tranche_end.txt"
 
 
 def tranche_identity(prefixes: Sequence[str], split: Optional[str]) -> str:

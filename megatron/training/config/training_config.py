@@ -66,7 +66,7 @@ class TrainingConfig:
 
     tranche_start_samples: int | None = None
     """Global consumed-sample counter at the start of this tranche. Requires exit_on_tranche_end.
-    When omitted, read tranche_end.json from the checkpoint directory; fall back to the
+    When omitted, read tranche_end.txt from the checkpoint directory; fall back to the
     existing phase-transition offset, or zero for the first tranche."""
 
     exit_duration_in_mins: int | None = None

@@ -3782,7 +3782,7 @@ def train(
         torch.distributed.broadcast_object_list(marker_status, src=0)
         if marker_status[0] is not None:
             raise RuntimeError(f'Failed to write tranche completion marker: {marker_status[0]}')
-        print_rank_0(f'[TRANCHE-END] completion marker: {args.save}/tranche_end.json')
+        print_rank_0(f'[TRANCHE-END] completion marker: {args.save}/tranche_end.txt')
 
     if args.log_energy:
         energy_monitor.lap()
