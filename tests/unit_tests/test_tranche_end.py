@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 import sys
+import json
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -34,6 +36,7 @@ def arguments(**changes):
         train_iters=125, eval_iters=0, eval_interval=100, full_validation=False,
         perform_rl_step=False, skip_train=False, multiple_validation_sets=False,
         save="checkpoints", save_interval=1, save_iters=None,
+        load=None, split="100,0,0",
         non_persistent_save_interval=1, exit_signal_handler=False,
         exit_duration_in_mins=None, exit_interval=None,
     )
@@ -55,6 +58,46 @@ class FiniteDataset:
 
 
 class TestTrancheEnd(unittest.TestCase):
+    def test_marker_resume_and_next_tranche(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = tranche.tranche_identity(["/data/tranche_00/a"], "100,0,0")
+            second = tranche.tranche_identity(["/data/tranche_01/a"], "100,0,0")
+            tranche.write_tranche_end(directory, first, 0, 24, 3)
+            record = json.loads((Path(directory) / tranche.MARKER_NAME).read_text())
+            self.assertEqual(record["end_consumed_samples"], 24)
+            # Same dataset remains finished; it must not start over at sample zero.
+            self.assertEqual(tranche.resolve_tranche_start(directory, first, 24), 0)
+            self.assertEqual(tranche.resolve_tranche_start(directory, second, 24), 24)
+            # Mid-tranche crash resumes from the same original start.
+            self.assertEqual(tranche.resolve_tranche_start(directory, second, 32), 24)
+            tranche.write_tranche_end(directory, second, 24, 48, 6)
+            self.assertEqual(tranche.resolve_tranche_start(directory, second, 48), 24)
+            self.assertEqual(list(Path(directory).glob(".tranche_end-*")), [])
+
+    def test_marker_missing_override_and_older_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(tranche.resolve_tranche_start(directory, "a", 80, fallback_start=40), 40)
+            tranche.write_tranche_end(directory, "a", 0, 24, 3)
+            with self.assertRaises(ValueError):
+                tranche.resolve_tranche_start(directory, "b", 16)
+            self.assertEqual(tranche.resolve_tranche_start(directory, "b", 16, explicit_start=8), 8)
+            # An older checkpoint from the SAME tranche is safe to replay.
+            self.assertEqual(tranche.resolve_tranche_start(directory, "a", 16), 0)
+
+    def test_bad_marker_is_not_silently_ignored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / tranche.MARKER_NAME
+            path.write_text('{"version": 1, "start_consumed_samples": 24, "end_consumed_samples": 8}')
+            with self.assertRaises(ValueError):
+                tranche.resolve_tranche_start(directory, "a", 24)
+
+    def test_marker_published_after_checkpoint_finalization(self):
+        tree = ast.parse((ROOT / "megatron/training/training.py").read_text(encoding="utf-8"))
+        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "train")
+        calls = {n.func.id: n.lineno for n in ast.walk(fn)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        self.assertLess(calls["maybe_finalize_async_save"], calls["write_tranche_end"])
+
     def test_command_line_flags(self):
         # Use the real dataclass-to-argparse factory, without package imports.
         modules = []
@@ -121,6 +164,9 @@ class TestTrancheEnd(unittest.TestCase):
             build_train_valid_test_datasets=lambda p: (FiniteDataset(size), None, None),
             build_pretraining_data_loader=loader,
             tranche_end_samples=tranche.tranche_end_samples,
+            get_blend_and_blend_per_split=lambda a: ((["/test/tranche_00/shard"], None), None),
+            tranche_identity=tranche.tranche_identity,
+            resolve_tranche_start=tranche.resolve_tranche_start,
         )
         fn = production_function("build_train_valid_test_data_loaders", namespace)
         fn(lambda _: None)
@@ -136,6 +182,14 @@ class TestTrancheEnd(unittest.TestCase):
         self.assertEqual(self.build_loaders(args), [0])
         self.assertEqual(args.tranche_end_consumed_samples, 1024)
         self.assertEqual(args.consumed_train_samples, 1000)
+
+    def test_loader_reads_marker_without_manual_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tranche.write_tranche_end(directory, "previous-tranche", 0, 1000, 125)
+            args = arguments(consumed_train_samples=1000, iteration=125, load=directory)
+            self.assertEqual(self.build_loaders(args), [0])
+            self.assertEqual(args.tranche_start_samples, 1000)
+            self.assertEqual(args.tranche_end_consumed_samples, 1024)
 
     def test_phase_transition_offset(self):
         args = arguments(consumed_train_samples=88, iteration=11, phase_transition_iterations=[10])

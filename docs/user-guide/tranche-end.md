@@ -25,21 +25,37 @@ also discard the usual incomplete sequence tails. Startup logs report
 ## Resume and move to another tranche
 
 For a crash/time-limit resume of the same tranche, keep the data paths, sequence
-length, packing configuration and tranche-start offset unchanged. The checkpoint
+length and packing configuration unchanged. The checkpoint
 consumed-sample counter determines the remaining batches. Replaying a rejected
 step does not consume another batch.
 
-When switching to a new tranche, point `DATA_ROOT` at its shards and set:
+At completion, rank zero atomically writes `tranche_end.json` in the save
+directory, after the final checkpoint (including any asynchronous save) is
+finished. It records the tranche identity, its start/end global consumed-sample
+counters, and the final checkpoint iteration.
+
+When switching to a new tranche, point `DATA_ROOT` at its shards and keep:
 
 ```bash
 --exit-on-tranche-end
---tranche-start-samples <consumed_train_samples_from_boundary_checkpoint>
 ```
 
-This restarts the tranche-local data cursor at zero while keeping the global
-consumed-sample counter, optimizer state and LR schedule. When the explicit offset
-is omitted, existing `--phase-transition-iterations` determine the local cursor;
-without either setting, the tranche starts at global sample zero.
+The loader reads the marker from `--load` (or `--save` when load is unset).
+Different resolved shard prefixes identify a new tranche: its start offset is
+the previous tranche's end counter. The same prefixes identify the same tranche:
+its original start offset is retained, so a completed tranche cannot silently
+restart. Job-specific data-list filenames do not affect the identity.
+
+This restarts only the new tranche's local data cursor while keeping the global
+counter, optimizer state and LR schedule. Resuming a partially consumed next
+tranche continues from the original offset in the previous completion marker.
+Switch data paths only after completing the current tranche.
+
+For the first tranche or checkpoints predating this feature, no marker exists.
+The fallback is the existing phase-transition offset, or zero. An explicit
+`--tranche-start-samples <counter>` still overrides automatic selection. Loading
+a checkpoint older than the automatically selected start offset is rejected
+instead of silently skipping samples.
 
 Enabling this feature requests single-pass dataset indices. Enable it
 from the start of a tranche: switching an existing multi-epoch run midway may

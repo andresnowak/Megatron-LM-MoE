@@ -56,7 +56,11 @@ import torch.distributed
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from .log_handler import CustomHandler
-from .tranche import tranche_end_samples, tranche_finished
+from .tranche import (
+    resolve_tranche_start, tranche_end_samples, tranche_finished,
+    tranche_identity, write_tranche_end,
+)
+from .utils import get_blend_and_blend_per_split
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -2943,6 +2947,7 @@ def checkpoint_and_decide_exit(
             f'[TRANCHE-END] checkpointed iteration {iteration}; exiting at '
             f'{args.consumed_train_samples} consumed samples'
         )
+        args.tranche_completed = True
         return True
 
     # Exit based on signal handler.
@@ -3762,6 +3767,23 @@ def train(
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
+    if getattr(args, 'tranche_completed', False):
+        # Publish only after async checkpoint finalization. Propagate filesystem
+        # failures to every rank rather than leaving a partially successful exit.
+        marker_status = [None]
+        if torch.distributed.get_rank() == 0:
+            try:
+                write_tranche_end(
+                    args.save, args.tranche_id, args.tranche_start_samples,
+                    args.consumed_train_samples, iteration,
+                )
+            except Exception as error:
+                marker_status[0] = str(error)
+        torch.distributed.broadcast_object_list(marker_status, src=0)
+        if marker_status[0] is not None:
+            raise RuntimeError(f'Failed to write tranche completion marker: {marker_status[0]}')
+        print_rank_0(f'[TRANCHE-END] completion marker: {args.save}/tranche_end.json')
+
     if args.log_energy:
         energy_monitor.lap()
         total_energy = energy_monitor.get_total()
@@ -4125,7 +4147,15 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     else:
         consumed_train_samples_in_current_phase = args.consumed_train_samples
 
-    if args.exit_on_tranche_end and args.tranche_start_samples is not None:
+    if args.exit_on_tranche_end:
+        blend, blend_per_split = get_blend_and_blend_per_split(args)
+        train_blend = blend if blend is not None else blend_per_split[0]
+        args.tranche_id = tranche_identity(train_blend[0], args.split if blend is not None else None)
+        args.tranche_start_samples = resolve_tranche_start(
+            args.load or args.save, args.tranche_id, args.consumed_train_samples,
+            explicit_start=args.tranche_start_samples,
+            fallback_start=args.consumed_train_samples - consumed_train_samples_in_current_phase,
+        )
         consumed_train_samples_in_current_phase = (
             args.consumed_train_samples - args.tranche_start_samples
         )
