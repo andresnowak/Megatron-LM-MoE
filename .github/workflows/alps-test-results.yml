@@ -1,0 +1,116 @@
+name: Alps test results
+run-name: Alps ${{ fromJSON(inputs.report).suite }} · ${{ fromJSON(inputs.report).sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      report:
+        description: Compact JSON report from tests/publish_results.sh
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  statuses: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Summarize Alps results and publish commit status
+        id: summary
+        uses: actions/github-script@v8
+        env:
+          ALPS_REPORT: ${{ inputs.report }}
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(process.env.ALPS_REPORT);
+            if (
+              report.version !== 1 ||
+              !['unit', 'functional'].includes(report.suite) ||
+              !/^[a-f0-9]{40}$/i.test(report.sha) ||
+              !Array.isArray(report.selections) ||
+              report.selections.length === 0 ||
+              report.selections.length > 256
+            ) {
+              throw new Error('Invalid Alps report');
+            }
+            const escape = value => String(value).replace(/[|<>`\r\n]/g, ' ');
+            let state = 'success';
+            const rows = [];
+            const failingTests = [];
+            for (const selection of report.selections) {
+              if (
+                !/^[A-Za-z0-9_.-]+$/.test(selection.name) ||
+                !selection.junit ||
+                !Array.isArray(selection.junit.failing_tests)
+              ) {
+                throw new Error('Invalid selection');
+              }
+              const junit = selection.junit;
+              if (['FAILED', 'TIMED_OUT'].includes(selection.outcome) || junit.has_failures) {
+                state = 'failure';
+              } else if (
+                state !== 'failure' && (
+                  selection.outcome !== 'COMPLETED' ||
+                  !selection.expected_reporting_ranks ||
+                  junit.reporting_ranks !== selection.expected_reporting_ranks ||
+                  !/^[1-9]/.test(String(junit.tests_per_rank))
+                )
+              ) {
+                state = 'error';
+              }
+              rows.push(`| ${escape(selection.name)} | ${escape(selection.outcome)} | ` +
+                        `${escape(junit.tests_per_rank)} | ${escape(junit.failures_errors_per_rank)} | ` +
+                        `${escape(junit.skipped_per_rank)} | ${escape(junit.reporting_ranks)} |`);
+              for (const test of junit.failing_tests.slice(0, 5)) {
+                failingTests.push(`- ${escape(test).slice(0, 240)}`);
+              }
+            }
+            const lines = [
+              `# Alps ${report.suite} results`, '',
+              `Tested commit: ${report.sha}`, '',
+              'These are native runner outcomes, not an independent numerical audit.',
+              'Record-mode candidates, blocked cases and unattempted cases are not green.',
+              'Counts are test invocations per reporting rank, not summed across GPUs.',
+              'Fail-fast and missing rank reports can leave partial coverage.',
+              'Uncommitted source/launcher changes are not represented by the commit SHA alone.',
+              'Raw logs, credentials and checkpoints remain on Alps.', '',
+              '| Selection | Outcome | Tests/rank | Failures+errors/rank | Skips/rank | Reporting ranks |',
+              '| --- | --- | ---: | ---: | ---: | ---: |', ...rows,
+            ];
+            if (failingTests.length) {
+              lines.push('', '## Observed failing test IDs', '', ...failingTests);
+            }
+            const markdown = lines.join('\n') + '\n';
+            fs.writeFileSync('alps-results.json', JSON.stringify(report, null, 2));
+            fs.writeFileSync('alps-results.md', markdown);
+            await core.summary.addRaw(markdown).write();
+            core.setOutput('state', state);
+            await github.rest.repos.createCommitStatus({
+              ...context.repo,
+              sha: report.sha,
+              state,
+              context: `alps/${report.suite}/${context.runId}`,
+              description: `${report.selections.length} selections; see Actions summary. Candidates are not numeric passes.`,
+              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+            });
+
+      - name: Save report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alps-test-report
+          path: |
+            alps-results.json
+            alps-results.md
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Reflect test outcome
+        if: steps.summary.outputs.state != 'success'
+        run: |
+          echo 'The report contains failures, unvalidated candidates, blockers or incomplete coverage.'
+          exit 1
