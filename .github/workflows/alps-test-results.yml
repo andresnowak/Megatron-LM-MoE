@@ -64,7 +64,8 @@ jobs:
               }
               rows.push(`| ${escape(selection.name)} | ${escape(selection.outcome)} | ` +
                         `${escape(junit.tests_per_rank)} | ${escape(junit.failures_errors_per_rank)} | ` +
-                        `${escape(junit.skipped_per_rank)} | ${escape(junit.reporting_ranks)} |`);
+                        `${escape(junit.skipped_per_rank)} | ` +
+                        `${escape(junit.reporting_ranks)}/${escape(selection.expected_reporting_ranks ?? '?')} |`);
               for (const test of junit.failing_tests.slice(0, 5)) {
                 failingTests.push(`- ${escape(test).slice(0, 240)}`);
               }
@@ -72,17 +73,11 @@ jobs:
             const lines = [
               `# Alps ${report.suite} results`, '',
               `Tested commit: ${report.sha}`, '',
-              'These are native runner outcomes, not an independent numerical audit.',
-              'Record-mode candidates, blocked cases and unattempted cases are not green.',
-              'Counts are test invocations per reporting rank, not summed across GPUs.',
-              'Fail-fast and missing rank reports can leave partial coverage.',
-              'Uncommitted source/launcher changes are not represented by the commit SHA alone.',
-              'Raw logs, credentials and checkpoints remain on Alps.', '',
-              '| Selection | Outcome | Tests/rank | Failures+errors/rank | Skips/rank | Reporting ranks |',
+              '| Selection | Result | Tests/rank | Failures+errors/rank | Skips/rank | Ranks |',
               '| --- | --- | ---: | ---: | ---: | ---: |', ...rows,
             ];
             if (failingTests.length) {
-              lines.push('', '## Observed failing test IDs', '', ...failingTests);
+              lines.push('', '## Failing tests', '', ...failingTests);
             }
             const markdown = lines.join('\n') + '\n';
             fs.writeFileSync('alps-results.json', JSON.stringify(report, null, 2));
@@ -94,7 +89,7 @@ jobs:
               sha: report.sha,
               state,
               context: `alps/${report.suite}/${context.runId}`,
-              description: `${report.selections.length} selections; see Actions summary. Candidates are not numeric passes.`,
+              description: `${report.selections.length} selections; see results.`,
               target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
             });
 
@@ -112,5 +107,5 @@ jobs:
       - name: Reflect test outcome
         if: steps.summary.outputs.state != 'success'
         run: |
-          echo 'The report contains failures, unvalidated candidates, blockers or incomplete coverage.'
+          echo 'Tests failed or coverage is incomplete.'
           exit 1
