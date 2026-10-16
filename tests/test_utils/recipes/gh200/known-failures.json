@@ -1,0 +1,276 @@
+{
+  "version": 1,
+  "environments": [
+    "gh200:jfrog.svc.cscs.ch#docker-group-csstaff/alps-images/apertus-2-cuda:alps7-dev-3802febe0fec326b69512641b32deb1e"
+  ],
+  "required_selections": {
+    "unit": {
+      "model-configs": 4,
+      "fp8-parameters": 8,
+      "pipeline": 8,
+      "pipeline-multimodule": 8,
+      "pipeline-two-ranks": 2,
+      "models": 8,
+      "data": 8,
+      "checkpoint-optimizer": 8,
+      "checkpointing": 8,
+      "checkpoint-models": 8,
+      "checkpoint-moe": 8,
+      "transformer": 8,
+      "inference": 8,
+      "rl": 8,
+      "post-training": 8,
+      "resharding": 8,
+      "ssm": 8,
+      "moe": 8,
+      "fsdp": 8,
+      "a2a-overlap": 8,
+      "general": 8
+    },
+    "functional": {
+      "gpt3_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather": 1,
+      "gpt3_mcore_tp1_pp2": 1,
+      "gpt3_mcore_tp1_pp2_resume_torch_dist": 1,
+      "gpt3_mcore_tp1_pp4": 1,
+      "gpt3_mcore_tp1_pp4_resume_torch_dist": 1,
+      "gpt3_mcore_tp4_pp1_resume_torch": 1,
+      "gpt3_mcore_tp4_pp1_resume_torch_dist": 1,
+      "gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files": 1,
+      "gpt3_mcore_te_tp1_pp1_dist_optimizer_fim_dataset": 1,
+      "gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer": 1,
+      "gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute": 1,
+      "gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings": 1,
+      "gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings_interleaved_no_fusion": 1,
+      "gpt3_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear": 1,
+      "gpt3_mcore_te_tp1_pp4_resume_torch_dist_persistent_disable_bias_linear": 1,
+      "gpt3_mcore_te_tp1_pp4_resume_torch_dist_swiglu": 1,
+      "gpt3_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_decoupled_lr": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_untied": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_tunable_overlap": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_tunable_overlap": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_uneven_pipeline": 1,
+      "gpt3_mcore_te_tp1_pp4_vp2_account_for_embedding_loss_in_pipeline_split": 1,
+      "gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic": 1,
+      "gpt3_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_etp4_dp_last": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_dp_last": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_nondeterministic": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_etp4_nondeterministic_dp_last": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_calculate_per_token_loss_nondeterministic": 1,
+      "gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_nondeterministic_dp_last": 1,
+      "gpt3_mcore_te_tp2_pp2_cross_entropy_loss_fusion": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion": 1,
+      "gpt3_mcore_te_tp2_pp1_gdn": 1,
+      "gpt3_mcore_te_tp2_pp2_mla": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_ddp_average_in_collective": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_defer_embedding_wgrad_compute": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_no_create_attention_mask_in_dataloader": 1,
+      "gpt3_mcore_te_tp2_pp2_resume_torch_dist_reshard_1x4xNone": 1,
+      "gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce": 1,
+      "gpt3_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode": 1,
+      "gpt3_mcore_tp2_pp2_uninstall_te": 1,
+      "gpt3_7b_tp1_pp4_memory_speed": 1,
+      "gpt3_7b_tp4_pp1_memory_speed": 1,
+      "gpt3_mcore_te_tp2_zp_z3_resume_fsdp_dtensor": 1,
+      "gpt3_mcore_te_tp2_pp1_modelopt_distill_resume": 1,
+      "gpt3_mcore_reruns_persistent_1": 1,
+      "gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer": 1,
+      "gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather": 1,
+      "gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather": 1,
+      "gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone": 1,
+      "gpt3_weekly_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap": 1,
+      "gpt3_weekly_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap": 1
+    }
+  },
+  "scopes": [
+    {
+      "suite": "unit",
+      "environment": "gh200:jfrog.svc.cscs.ch#docker-group-csstaff/alps-images/apertus-2-cuda:alps7-dev-3802febe0fec326b69512641b32deb1e",
+      "source_sha": "41370f3657360d676b8331fac38e00c8ea3c1f61",
+      "source_job": "3675428",
+      "failures": [
+        {
+          "selection": "a2a-overlap",
+          "test_id": "tests.unit_tests.a2a_overlap.test_schedule_chunk_1f1b.TestA2AOverlap::test_1f1b_schedule_model_chunk[layers0-fp8_flag0-alltoall-1]",
+          "reason": "Existing all-to-all return-value unpacking mismatch.",
+          "blocking": false,
+          "error_signatures": [
+            "ValueError: too many values to unpack (expected 5)"
+          ]
+        },
+        {
+          "selection": "checkpoint-models",
+          "test_id": "tests.unit_tests.dist_checkpointing.models.test_bert_model.TestBERTModelReconfiguration::test_parallel_reconfiguration_e2e[False-src_tp_pp3-dest_tp_pp3-src_layer_spec3-dst_layer_spec3]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "OSError: [Errno 116] Stale file handle: '.metadata'"
+          ]
+        },
+        {
+          "selection": "checkpoint-moe",
+          "test_id": "tests.unit_tests.dist_checkpointing.models.test_moe_experts.TestExpertLayerReconfiguration::test_parallel_reconfiguration_e2e[True-tp-ep-dp-pp-tp-ep-dp-pp-sequential-False-src_tp_pp_ep_etp0-dest_tp_pp_ep_etp0-False]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "OSError: [Errno 116] Stale file handle: '.metadata'"
+          ]
+        },
+        {
+          "selection": "checkpoint-optimizer",
+          "test_id": "tests.unit_tests.dist_checkpointing.test_optimizer.TestOptimizer::test_optimizer_custom_state_sharding",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?"
+          ]
+        },
+        {
+          "selection": "checkpoint-optimizer",
+          "test_id": "tests.unit_tests.dist_checkpointing.test_optimizer.TestOptimizer::test_optimizer_params",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: Gloo connectFullMesh failed with [/opt/pytorch/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:547] Connection closed by peer [<peer>]"
+          ]
+        },
+        {
+          "selection": "checkpointing",
+          "test_id": "tests.unit_tests.dist_checkpointing.test_async_save.TestAsyncSave::test_async_is_equivalent_to_sync[False-False]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "OSError: [Errno 116] Stale file handle: '.metadata'"
+          ]
+        },
+        {
+          "selection": "data",
+          "test_id": "tests.unit_tests.data.test_builder::test_fast_builder[0.005-131072-True-True-True-True-False]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "OSError: [Errno 116] Stale file handle: 'dataset'"
+          ]
+        },
+        {
+          "selection": "fsdp",
+          "test_id": "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_dcp_checkpoint_save_and_load[mesh_dim_config0-cnn-no_shard-optim_grads_params]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "AssertionError: metadata is None"
+          ]
+        },
+        {
+          "selection": "general",
+          "test_id": "tests.unit_tests.fusions.test_gxpr_glu_fusion::test_fused_matches_reference[shape0-False-dtype1]",
+          "reason": "Existing fused-GLU float32 versus bfloat16 dtype assertion.",
+          "blocking": false,
+          "error_signatures": [
+            "AssertionError: assert torch.float32 == torch.bfloat16"
+          ]
+        },
+        {
+          "selection": "inference",
+          "test_id": "tests.unit_tests.inference.engines.test_dynamic_engine.TestDynamicInferenceEngine::test_simple[cuda_graph_scope0-None-mamba]",
+          "reason": "Optional Mamba backend is absent from the pinned image.",
+          "blocking": false,
+          "error_signatures": [
+            "ModuleNotFoundError: No module named 'mamba_ssm'"
+          ]
+        },
+        {
+          "selection": "models",
+          "test_id": "tests.unit_tests.models.test_mamba_model.TestMambaModel::test_constructor",
+          "reason": "Optional Mamba backend is absent from the pinned image.",
+          "blocking": false,
+          "error_signatures": [
+            "ImportError: MambaSSM is not installed. Please install it with `pip install mamba-ssm`. when instantiating MambaMixer when instantiating MambaLayer when instantiating MambaStack"
+          ]
+        },
+        {
+          "selection": "moe",
+          "test_id": "::tests.unit_tests.transformer.moe.test_activation_offload",
+          "reason": "Existing test imports the removed ActivationOffloadHandle API.",
+          "blocking": false,
+          "error_signatures": [
+            "ImportError: cannot import name 'ActivationOffloadHandle' from 'megatron.core.transformer.moe.moe_offload' (<path>)"
+          ]
+        },
+        {
+          "selection": "pipeline",
+          "test_id": "tests.unit_tests.pipeline_parallel.test_pipeline_layout::test_forward_vpp[tp_pp_vpp2-pp_layout2-False-False]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "OSError: [Errno 116] Stale file handle: '.metadata'"
+          ]
+        },
+        {
+          "selection": "pipeline",
+          "test_id": "tests.unit_tests.pipeline_parallel.test_pipeline_layout::test_forward_vpp[tp_pp_vpp3-pp_layout3-True-False]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "torch.distributed.DistBackendError: [2] is setting up NCCL communicator and retrieving ncclUniqueId from [0] via c10d key-value store by key '0', but store->get('0') got error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?",
+            "torch.distributed.DistBackendError: [3] is setting up NCCL communicator and retrieving ncclUniqueId from [0] via c10d key-value store by key '0', but store->get('0') got error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?"
+          ]
+        },
+        {
+          "selection": "post-training",
+          "test_id": "tests.unit_tests.post_training.test_modelopt_module_spec.TestModelOptGPTModel::test_inference",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?"
+          ]
+        },
+        {
+          "selection": "post-training",
+          "test_id": "tests.unit_tests.post_training.test_modelopt_module_spec.TestModelOptGPTModel::test_sharded_state_dict_restore",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "OSError: [Errno 116] Stale file handle: '.metadata'"
+          ]
+        },
+        {
+          "selection": "ssm",
+          "test_id": "tests.unit_tests.ssm.test_mamba_block.TestMambaBlock::test_gpu_forward",
+          "reason": "Optional Mamba backend is absent from the pinned image.",
+          "blocking": false,
+          "error_signatures": [
+            "ImportError: MambaSSM is not installed. Please install it with `pip install mamba-ssm`. when instantiating MambaMixer when instantiating MambaLayer"
+          ]
+        },
+        {
+          "selection": "transformer",
+          "test_id": "tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_dsa.TestDSAIndexer::test_dsa_indexer_constructor[16]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "RuntimeError: Gloo connectFullMesh failed with [/opt/pytorch/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:547] Connection closed by peer [<peer>]"
+          ]
+        },
+        {
+          "selection": "transformer",
+          "test_id": "tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_dsa.TestDSAIndexer::test_dsa_indexer_constructor[64]",
+          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
+          "blocking": true,
+          "error_signatures": [
+            "torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?"
+          ]
+        }
+      ]
+    }
+  ]
+}

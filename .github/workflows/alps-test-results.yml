@@ -1,9 +1,22 @@
 name: Alps test results
-run-name: Alps ${{ fromJSON(inputs.report).suite }} · ${{ fromJSON(inputs.report).sha }}
+run-name: >-
+  Alps ${{ inputs.suite }}
+  · ${{ inputs.tested_sha }}
 
 on:
   workflow_dispatch:
     inputs:
+      suite:
+        description: Test suite
+        required: true
+        type: choice
+        options:
+          - unit
+          - functional
+      tested_sha:
+        description: Full commit SHA from the test run
+        required: true
+        type: string
       report:
         description: Compact JSON report from tests/publish_results.sh
         required: true
@@ -23,75 +36,103 @@ jobs:
         uses: actions/github-script@v8
         env:
           ALPS_REPORT: ${{ inputs.report }}
+          ALPS_SUITE: ${{ inputs.suite }}
+          ALPS_TESTED_SHA: ${{ inputs.tested_sha }}
+          POLICY_SHA: ${{ github.workflow_sha }}
         with:
           script: |
             const fs = require('fs');
-            const report = JSON.parse(process.env.ALPS_REPORT);
+            const path = require('path');
+            const suite = process.env.ALPS_SUITE;
+            const testedSha = process.env.ALPS_TESTED_SHA;
+
             if (
-              report.version !== 1 ||
-              !['unit', 'functional'].includes(report.suite) ||
-              !/^[a-f0-9]{40}$/i.test(report.sha) ||
-              !Array.isArray(report.selections) ||
-              report.selections.length === 0 ||
-              report.selections.length > 256
+              !['unit', 'functional'].includes(suite) ||
+              !/^[a-f0-9]{40}$/i.test(testedSha)
             ) {
-              throw new Error('Invalid Alps report');
+              throw new Error('Invalid suite or tested commit');
             }
-            const escape = value => String(value).replace(/[|<>`\r\n]/g, ' ');
-            let state = 'success';
-            const rows = [];
-            const failingTests = [];
-            for (const selection of report.selections) {
+
+            const target = [
+              context.serverUrl,
+              context.repo.owner,
+              context.repo.repo,
+              'actions/runs',
+              context.runId,
+            ].join('/');
+            const stableContext = `alps/${suite}/regressions`;
+            const status = (state, description, name = stableContext) => {
+              return github.rest.repos.createCommitStatus({
+                ...context.repo,
+                sha: testedSha,
+                state,
+                description,
+                context: name,
+                target_url: target,
+              });
+            };
+
+            try {
+              await status('pending', 'Checking regressions and coverage.');
+              const report = JSON.parse(process.env.ALPS_REPORT);
+
               if (
-                !/^[A-Za-z0-9_.-]+$/.test(selection.name) ||
-                !selection.junit ||
-                !Array.isArray(selection.junit.failing_tests)
+                report.suite !== suite ||
+                report.sha !== testedSha ||
+                report.version !== 2 ||
+                report.policy_sha !== process.env.POLICY_SHA ||
+                !Array.isArray(report.selections) ||
+                !report.selections.length ||
+                report.selections.length > 256
               ) {
-                throw new Error('Invalid selection');
+                throw new Error('Invalid report or stale policy revision');
               }
-              const junit = selection.junit;
-              if (['FAILED', 'TIMED_OUT'].includes(selection.outcome) || junit.has_failures) {
-                state = 'failure';
-              } else if (
-                state !== 'failure' && (
-                  selection.outcome !== 'COMPLETED' ||
-                  !selection.expected_reporting_ranks ||
-                  junit.reporting_ranks !== selection.expected_reporting_ranks ||
-                  !/^[1-9]/.test(String(junit.tests_per_rank))
-                )
-              ) {
-                state = 'error';
+
+              const trustedFile = async file => {
+                const {data} = await github.rest.repos.getContent({
+                  ...context.repo,
+                  path: file,
+                  ref: process.env.POLICY_SHA,
+                });
+                return Buffer.from(data.content, 'base64').toString('utf8');
+              };
+              const policyFile = 'tests/test_utils/recipes/gh200/known-failures.json';
+              const moduleFile = '.github/workflows/alps-regression-policy.cjs';
+              const policy = JSON.parse(await trustedFile(policyFile));
+              const modulePath = path.resolve('alps-regression-policy.cjs');
+
+              fs.writeFileSync(modulePath, await trustedFile(moduleFile));
+              const {evaluateReport, renderReport} = require(modulePath);
+              const gate = evaluateReport(report, policy);
+              const markdown = renderReport(report, gate);
+
+              for (const test of gate.unexpected.slice(0, 20)) {
+                const detail = test.errors.join('; ').slice(0, 500);
+                core.error(`${test.test_id}: ${detail}`, {
+                  title: 'New or changed test failure',
+                });
               }
-              rows.push(`| ${escape(selection.name)} | ${escape(selection.outcome)} | ` +
-                        `${escape(junit.tests_per_rank)} | ${escape(junit.failures_errors_per_rank)} | ` +
-                        `${escape(junit.skipped_per_rank)} | ` +
-                        `${escape(junit.reporting_ranks)}/${escape(selection.expected_reporting_ranks ?? '?')} |`);
-              for (const test of junit.failing_tests.slice(0, 5)) {
-                failingTests.push(`- ${escape(test).slice(0, 240)}`);
-              }
+
+              const artifact = {...report, regression_gate: gate};
+              fs.writeFileSync('alps-results.json', JSON.stringify(artifact, null, 2));
+              fs.writeFileSync('alps-results.md', markdown);
+              await core.summary.addRaw(markdown).write();
+              core.setOutput('state', gate.state);
+
+              const counts = [
+                `${gate.unexpected.length} new`,
+                `${gate.known.length} known`,
+                `${gate.fixed.length} fixed`,
+              ].join(', ');
+              const coverage = gate.incomplete.length ? '; coverage incomplete.' : '.';
+              const description = counts + coverage;
+
+              await status(gate.state, description);
+              await status(gate.state, description, `alps/${suite}/${context.runId}`);
+            } catch (error) {
+              await status('error', 'Report could not be validated.');
+              throw error;
             }
-            const lines = [
-              `# Alps ${report.suite} results`, '',
-              `Tested commit: ${report.sha}`, '',
-              '| Selection | Result | Tests/rank | Failures+errors/rank | Skips/rank | Ranks |',
-              '| --- | --- | ---: | ---: | ---: | ---: |', ...rows,
-            ];
-            if (failingTests.length) {
-              lines.push('', '## Failing tests', '', ...failingTests);
-            }
-            const markdown = lines.join('\n') + '\n';
-            fs.writeFileSync('alps-results.json', JSON.stringify(report, null, 2));
-            fs.writeFileSync('alps-results.md', markdown);
-            await core.summary.addRaw(markdown).write();
-            core.setOutput('state', state);
-            await github.rest.repos.createCommitStatus({
-              ...context.repo,
-              sha: report.sha,
-              state,
-              context: `alps/${report.suite}/${context.runId}`,
-              description: `${report.selections.length} selections; see results.`,
-              target_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-            });
 
       - name: Save report artifacts
         if: always()
@@ -104,8 +145,8 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      - name: Reflect test outcome
+      - name: Enforce regression gate
         if: steps.summary.outputs.state != 'success'
         run: |
-          echo 'Tests failed or coverage is incomplete.'
+          echo 'New failures or incomplete test coverage.'
           exit 1

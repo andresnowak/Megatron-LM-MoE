@@ -5,11 +5,69 @@ import csv
 import json
 import re
 import subprocess
+import tomllib
 from collections import Counter, defaultdict
 from pathlib import Path
 from xml.etree import ElementTree
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+POLICY_PATH = "tests/test_utils/recipes/gh200/known-failures.json"
+
+
+def load_policy(ref):
+    revision = subprocess.run(
+        ["git", "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=15,
+    )
+    sha = revision.stdout.strip()
+    contents = subprocess.run(
+        ["git", "show", f"{sha}:{POLICY_PATH}"],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=15,
+    )
+    return sha, json.loads(contents.stdout)
+
+
+def result_environment(directory):
+    paths = (directory / "environment.toml", directory.parent / "environment.toml")
+    for path in paths:
+        if not path.is_file():
+            continue
+        image = tomllib.loads(path.read_text()).get("image")
+        if image:
+            return f"gh200:{image}"
+    return "unknown"
+
+
+def error_signature(element):
+    text = element.get("message", "") + "\n" + (element.text or "")
+    exceptions = []
+    for line in text.splitlines():
+        match = re.match(r"^\s*(?:E\s+)?([\w.]*(?:Error|Exception|Failure):.*)$", line)
+        if match:
+            exceptions.append(match.group(1).strip())
+
+    if exceptions:
+        signature = exceptions[-1]
+    else:
+        message = element.get("message") or "Unclassified failure"
+        signature = message.splitlines()[0]
+
+    signature = re.sub(r"(?<= at )0x[0-9a-fA-F]+", "<address>", signature)
+    signature = re.sub(r"\(/[^)\n]+\)", "(<path>)", signature)
+    signature = re.sub(r"\[(?:\d{1,3}\.){3}\d{1,3}\]:\d+", "[<peer>]", signature)
+    return re.sub(
+        r"(['\"])(/[^'\"\n]+)\1",
+        lambda match: f"{match[1]}<path>/{Path(match[2]).name}{match[1]}",
+        signature,
+    )
 
 
 def gh_json(*arguments):
@@ -34,52 +92,142 @@ def tested_sha(directory, override):
     return sha
 
 
-def junit_summary(directory):
+def count_range(values):
+    if not values:
+        return "—"
+    minimum, maximum = min(values), max(values)
+    if minimum == maximum:
+        return str(minimum)
+    return f"{minimum}–{maximum}"
+
+
+def encode_observations(observations, selected_ids):
+    evidence = []
+    for test_id in sorted(selected_ids):
+        records = observations[test_id]
+        signatures = sorted({error for record in records.values() for error in record["errors"]})
+        ranks = {}
+        for rank, record in records.items():
+            ranks[rank] = {
+                "statuses": sorted(record["statuses"]),
+                "failures": record["failures"],
+                "error_indexes": [signatures.index(error) for error in sorted(record["errors"])],
+            }
+        evidence.append({"test_id": test_id, "signatures": signatures, "ranks": ranks})
+    return evidence
+
+
+def coverage_complete(directory, observations, rank_ids):
+    path = directory / "expected-tests.json"
+    if not path.is_file():
+        return False
+
+    plan = json.loads(path.read_text())
+    expected = Counter(plan["test_ids"])
+    if not expected or not rank_ids or plan.get("collection_complete") is not True:
+        return False
+
+    for rank in rank_ids:
+        executed = Counter()
+        for test_id, ranks in observations.items():
+            if rank in ranks:
+                executed[test_id] = ranks[rank]["executions"]
+        if executed != expected:
+            return False
+    return True
+
+
+def junit_results(directory, known_ids=()):
     counts = defaultdict(Counter)
-    failures = set()
-    for path in directory.rglob("*.xml"):
-        root = ElementTree.parse(path).getroot()
+    observations = defaultdict(dict)
+    problems = []
+    for path in sorted(directory.rglob("*.xml")):
+        try:
+            root = ElementTree.parse(path).getroot()
+        except ElementTree.ParseError:
+            problems.append(f"Malformed JUnit: {path.name}")
+            continue
+
         match = re.search(r"\.rank-(\d+)\.xml$", path.name)
         rank = match.group(1) if match else "0"
         for suite in root.iter("testsuite"):
+            if suite.find("testsuite") is not None:
+                continue
             counts[rank]["tests"] += int(suite.get("tests", 0))
             counts[rank]["failed"] += int(suite.get("failures", 0))
             counts[rank]["failed"] += int(suite.get("errors", 0))
             counts[rank]["skipped"] += int(suite.get("skipped", 0))
+
         for case in root.iter("testcase"):
-            if case.find("failure") is not None or case.find("error") is not None:
-                failures.add(f'{case.get("classname", "")}::{case.get("name", "")}')
-    columns = []
-    for field in ("tests", "failed", "skipped"):
-        values = [count[field] for count in counts.values()]
-        if not values:
-            columns.append("—")
-        elif min(values) == max(values):
-            columns.append(str(values[0]))
-        else:
-            columns.append(f"{min(values)}–{max(values)}")
+            test_id = f'{case.get("classname", "")}::{case.get("name", "")}'
+            record = observations[test_id].setdefault(
+                rank, {"statuses": set(), "executions": 0, "failures": 0, "errors": set()}
+            )
+            record["executions"] += 1
+            errors = case.findall("failure") + case.findall("error")
+            if errors:
+                status = "failed"
+            elif case.find("skipped") is not None:
+                status = "skipped"
+            else:
+                status = "passed"
+            record["statuses"].add(status)
+            record["failures"] += len(errors)
+            record["errors"].update(error_signature(error) for error in errors)
+
+    failing_ids = {
+        test_id
+        for test_id, ranks in observations.items()
+        if any(record["failures"] for record in ranks.values())
+    }
+    selected_ids = failing_ids | (set(known_ids) & observations.keys())
+    for known_id in known_ids:
+        if not known_id.startswith("::"):
+            continue
+        module = known_id[2:]
+        for rank in counts:
+            for test_id, records in observations.items():
+                in_module = test_id.startswith(module + ".") or test_id.startswith(module + "::")
+                record = records.get(rank)
+                if in_module and record and record["statuses"] == {"passed"}:
+                    selected_ids.add(test_id)
+                    break
     return {
-        "tests_per_rank": columns[0],
-        "failures_errors_per_rank": columns[1],
-        "skipped_per_rank": columns[2],
+        "tests_per_rank": count_range([count["tests"] for count in counts.values()]),
+        "failures_errors_per_rank": count_range([count["failed"] for count in counts.values()]),
+        "skipped_per_rank": count_range([count["skipped"] for count in counts.values()]),
         "reporting_ranks": len(counts),
-        "failing_tests": sorted(failures)[:5],
-        "has_failures": bool(failures),
+        "rank_ids": sorted(counts, key=int),
+        "failures_by_rank": {rank: count["failed"] for rank, count in counts.items()},
+        "failing_tests": sorted(failing_ids)[:5],
+        "has_failures": bool(failing_ids) or any(count["failed"] for count in counts.values()),
+        "observations": encode_observations(observations, selected_ids),
+        "coverage_confirmed": coverage_complete(directory, observations, counts.keys()),
+        "problems": problems,
     }
 
 
-def build_report(directory, results, suite, sha):
-    selections = []
+def build_report(directory, results, suite, sha, policy=None, policy_sha=None, environment=None):
+    policy = policy or {"scopes": []}
+    known_ids = defaultdict(set)
+    for scope in policy["scopes"]:
+        if scope["suite"] == suite:
+            for failure in scope["failures"]:
+                known_ids[failure["selection"]].add(failure["test_id"])
+
     with results.open() as stream:
         rows = list(csv.DictReader(stream, delimiter="\t"))
     if not rows:
         raise ValueError("Results ledger is empty")
+
+    selections = []
     for row in rows:
         name = row.get("group") or row.get("selection") or row.get("case")
         if not name or "result" not in row:
             raise ValueError("Expected group/selection/case and result columns")
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
             raise ValueError(f"Unsupported selection name: {name}")
+
         group_dir = directory / name
         if not group_dir.is_dir():
             group_dir = directory / "run" / suite / name
@@ -94,15 +242,23 @@ def build_report(directory, results, suite, sha):
         expected_ranks = int(ranks) if ranks else None
         if suite == "functional":
             expected_ranks = 1
+
         selections.append(
             {
                 "name": name,
                 "outcome": row["result"],
                 "expected_reporting_ranks": expected_ranks,
-                "junit": junit_summary(group_dir),
+                "junit": junit_results(group_dir, known_ids[name]),
             }
         )
-    return {"version": 1, "suite": suite, "sha": sha, "selections": selections}
+    return {
+        "version": 2,
+        "suite": suite,
+        "sha": sha,
+        "environment": environment or result_environment(directory),
+        "policy_sha": policy_sha,
+        "selections": selections,
+    }
 
 
 def main():
@@ -119,15 +275,27 @@ def main():
     parser.add_argument(
         "--ref", help="Branch containing the workflow; defaults to the default branch"
     )
+    parser.add_argument(
+        "--policy-ref",
+        default="HEAD",
+        help="Trusted publisher revision containing the policy, not the tested PR revision",
+    )
+    parser.add_argument(
+        "--environment", help="Environment identity; otherwise read from environment.toml"
+    )
     parser.add_argument("--publish", action="store_true", help="Dispatch the report-only workflow")
     args = parser.parse_args()
     directory = args.directory.resolve()
     sha = tested_sha(directory, args.sha)
-    report = build_report(directory, directory / args.results, args.suite, sha)
+    policy_sha, policy = load_policy(args.policy_ref)
+    report = build_report(
+        directory, directory / args.results, args.suite, sha, policy, policy_sha, args.environment
+    )
     if not args.publish:
         print(json.dumps(report, indent=2))
         print("Preview only. No GitHub writes; use --publish to dispatch the reporting workflow.")
         return
+
     repo_info = gh_json(
         "repo",
         "view",
@@ -137,7 +305,13 @@ def main():
     )
     repo = repo_info["nameWithOwner"]
     report["sha"] = gh_json("api", f"repos/{repo}/commits/{sha}")["sha"]
-    payload = json.dumps({"report": json.dumps(report, separators=(",", ":"))})
+    payload = json.dumps(
+        {
+            "suite": report["suite"],
+            "tested_sha": report["sha"],
+            "report": json.dumps(report, separators=(",", ":")),
+        }
+    )
     if len(payload.encode()) > 60000:
         raise ValueError("Report exceeds workflow input size; publish smaller selections")
     subprocess.run(
