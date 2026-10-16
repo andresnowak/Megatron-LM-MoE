@@ -1,0 +1,314 @@
+{
+  "version": 1,
+  "suite": "unit",
+  "sha": "41370f3657360d676b8331fac38e00c8ea3c1f61",
+  "selections": [
+    {
+      "name": "models",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "86",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "8",
+        "reporting_ranks": 8,
+        "failing_tests": [
+          "tests.unit_tests.models.test_mamba_model.TestMambaModel::test_constructor"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "rl",
+      "outcome": "COMPLETED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "78",
+        "failures_errors_per_rank": "0",
+        "skipped_per_rank": "0",
+        "reporting_ranks": 8,
+        "failing_tests": [],
+        "has_failures": false
+      }
+    },
+    {
+      "name": "model-configs",
+      "outcome": "COMPLETED",
+      "expected_reporting_ranks": 4,
+      "junit": {
+        "tests_per_rank": "684",
+        "failures_errors_per_rank": "0",
+        "skipped_per_rank": "99",
+        "reporting_ranks": 4,
+        "failing_tests": [],
+        "has_failures": false
+      }
+    },
+    {
+      "name": "fp8-parameters",
+      "outcome": "COMPLETED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "15",
+        "failures_errors_per_rank": "0",
+        "skipped_per_rank": "6",
+        "reporting_ranks": 8,
+        "failing_tests": [],
+        "has_failures": false
+      }
+    },
+    {
+      "name": "pipeline",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "36\u201337",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "0",
+        "reporting_ranks": 5,
+        "failing_tests": [
+          "tests.unit_tests.pipeline_parallel.test_pipeline_layout::test_forward_vpp[tp_pp_vpp2-pp_layout2-False-False]",
+          "tests.unit_tests.pipeline_parallel.test_pipeline_layout::test_forward_vpp[tp_pp_vpp3-pp_layout3-True-False]"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "pipeline-multimodule",
+      "outcome": "COMPLETED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "4",
+        "failures_errors_per_rank": "0",
+        "skipped_per_rank": "2",
+        "reporting_ranks": 8,
+        "failing_tests": [],
+        "has_failures": false
+      }
+    },
+    {
+      "name": "pipeline-two-ranks",
+      "outcome": "COMPLETED",
+      "expected_reporting_ranks": 2,
+      "junit": {
+        "tests_per_rank": "4",
+        "failures_errors_per_rank": "0",
+        "skipped_per_rank": "2",
+        "reporting_ranks": 2,
+        "failing_tests": [],
+        "has_failures": false
+      }
+    },
+    {
+      "name": "data",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "3",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "1",
+        "reporting_ranks": 1,
+        "failing_tests": [
+          "tests.unit_tests.data.test_builder::test_fast_builder[0.005-131072-True-True-True-True-False]"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "checkpoint-optimizer",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "1\u20132",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "0",
+        "reporting_ranks": 6,
+        "failing_tests": [
+          "tests.unit_tests.dist_checkpointing.test_optimizer.TestOptimizer::test_optimizer_custom_state_sharding",
+          "tests.unit_tests.dist_checkpointing.test_optimizer.TestOptimizer::test_optimizer_params"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "checkpointing",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "4",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "0",
+        "reporting_ranks": 1,
+        "failing_tests": [
+          "tests.unit_tests.dist_checkpointing.test_async_save.TestAsyncSave::test_async_is_equivalent_to_sync[False-False]"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "checkpoint-models",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "8",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "0",
+        "reporting_ranks": 1,
+        "failing_tests": [
+          "tests.unit_tests.dist_checkpointing.models.test_bert_model.TestBERTModelReconfiguration::test_parallel_reconfiguration_e2e[False-src_tp_pp3-dest_tp_pp3-src_layer_spec3-dst_layer_spec3]"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "checkpoint-moe",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "1",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "0",
+        "reporting_ranks": 1,
+        "failing_tests": [
+          "tests.unit_tests.dist_checkpointing.models.test_moe_experts.TestExpertLayerReconfiguration::test_parallel_reconfiguration_e2e[True-tp-ep-dp-pp-tp-ep-dp-pp-sequential-False-src_tp_pp_ep_etp0-dest_tp_pp_ep_etp0-False]"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "transformer",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "36\u201337",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "1",
+        "reporting_ranks": 5,
+        "failing_tests": [
+          "tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_dsa.TestDSAIndexer::test_dsa_indexer_constructor[16]",
+          "tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_dsa.TestDSAIndexer::test_dsa_indexer_constructor[64]"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "inference",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "113",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "0",
+        "reporting_ranks": 8,
+        "failing_tests": [
+          "tests.unit_tests.inference.engines.test_dynamic_engine.TestDynamicInferenceEngine::test_simple[cuda_graph_scope0-None-mamba]"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "post-training",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "2\u20133",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "0",
+        "reporting_ranks": 5,
+        "failing_tests": [
+          "tests.unit_tests.post_training.test_modelopt_module_spec.TestModelOptGPTModel::test_inference",
+          "tests.unit_tests.post_training.test_modelopt_module_spec.TestModelOptGPTModel::test_sharded_state_dict_restore"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "resharding",
+      "outcome": "COMPLETED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "139",
+        "failures_errors_per_rank": "0",
+        "skipped_per_rank": "23",
+        "reporting_ranks": 8,
+        "failing_tests": [],
+        "has_failures": false
+      }
+    },
+    {
+      "name": "ssm",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "120",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "7",
+        "reporting_ranks": 8,
+        "failing_tests": [
+          "tests.unit_tests.ssm.test_mamba_block.TestMambaBlock::test_gpu_forward"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "moe",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "1",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "0",
+        "reporting_ranks": 8,
+        "failing_tests": [
+          "::tests.unit_tests.transformer.moe.test_activation_offload"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "fsdp",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "217",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "72",
+        "reporting_ranks": 8,
+        "failing_tests": [
+          "tests.unit_tests.distributed.megatron_fsdp.test_mfsdp_fully_shard.TestMegatronFsdpFullyShard::test_dcp_checkpoint_save_and_load[mesh_dim_config0-cnn-no_shard-optim_grads_params]"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "a2a-overlap",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "2",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "0",
+        "reporting_ranks": 8,
+        "failing_tests": [
+          "tests.unit_tests.a2a_overlap.test_schedule_chunk_1f1b.TestA2AOverlap::test_1f1b_schedule_model_chunk[layers0-fp8_flag0-alltoall-1]"
+        ],
+        "has_failures": true
+      }
+    },
+    {
+      "name": "general",
+      "outcome": "FAILED",
+      "expected_reporting_ranks": 8,
+      "junit": {
+        "tests_per_rank": "167",
+        "failures_errors_per_rank": "1",
+        "skipped_per_rank": "14",
+        "reporting_ranks": 8,
+        "failing_tests": [
+          "tests.unit_tests.fusions.test_gxpr_glu_fusion::test_fused_matches_reference[shape0-False-dtype1]"
+        ],
+        "has_failures": true
+      }
+    }
+  ]
+}
