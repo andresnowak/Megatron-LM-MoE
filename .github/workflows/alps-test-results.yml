@@ -1,12 +1,7 @@
 name: Alps test results
-run-name: Alps ${{ github.event_name == 'push' && 'unit report smoke test' || fromJSON(inputs.report).suite }} · ${{ github.event_name == 'push' && github.sha || fromJSON(inputs.report).sha }}
+run-name: Alps ${{ fromJSON(inputs.report).suite }} · ${{ fromJSON(inputs.report).sha }}
 
 on:
-  push:
-    branches: [alps-unit-results-reporting]
-    paths:
-      - .github/workflows/alps-test-results.yml
-      - tests/test_utils/fixtures/alps-unit-report-smoke.json
   workflow_dispatch:
     inputs:
       report:
@@ -31,16 +26,7 @@ jobs:
         with:
           script: |
             const fs = require('fs');
-            let reportText = process.env.ALPS_REPORT;
-            if (context.eventName === 'push') {
-              const {data} = await github.rest.repos.getContent({
-                ...context.repo,
-                path: 'tests/test_utils/fixtures/alps-unit-report-smoke.json',
-                ref: context.sha,
-              });
-              reportText = Buffer.from(data.content, 'base64').toString('utf8');
-            }
-            const report = JSON.parse(reportText);
+            const report = JSON.parse(process.env.ALPS_REPORT);
             if (
               report.version !== 1 ||
               !['unit', 'functional'].includes(report.suite) ||
