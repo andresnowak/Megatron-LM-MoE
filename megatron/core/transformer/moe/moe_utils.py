@@ -924,6 +924,7 @@ def topk_routing_with_score_function(
     router_replay: Optional['RouterReplay'] = None,
     dense_output: bool = False,
     precomputed_indices: Optional[torch.Tensor] = None,
+    sigmoid_normalization_epsilon: float = 1e-20,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -952,6 +953,9 @@ def topk_routing_with_score_function(
                                        selected by the caller. When given, the score function's
                                        own top-k is bypassed and probs are computed at these
                                        indices. Defaults to None.
+
+        sigmoid_normalization_epsilon (float, optional): Denominator epsilon for selected
+            sigmoid scores. Defaults to 1e-20; Marin histogram routing uses 1e-9.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -1075,7 +1079,10 @@ def topk_routing_with_score_function(
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        probs = (
+            scores / (scores.sum(dim=-1, keepdim=True) + sigmoid_normalization_epsilon)
+            if topk > 1 else scores
+        )
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 

@@ -34,6 +34,12 @@ This is the histogram path associated with their large-model recipe, rather than
 the local-quantile Grug baseline.
 
 Selection uses `topk(logits - beta)` (Marin uses additive `bias = -beta`).
+For top-k sigmoid combination with k > 1, training and inference use
+`scale * sigmoid(selected_logits) / (sum(sigmoid(selected_logits)) + 1e-9)`,
+matching Marin's denominator epsilon. Other routing methods retain `1e-20`.
+This reduces the total combine weight when all selected sigmoid scores are tiny;
+it does not change expert selection. Existing Marin checkpoints can resume without
+converting weights or optimizer state, but their tiny-score behavior changes.
 The top-(k+1) cutoff defines raw-logit margins. Two scalar all-reduces find their
 current global extrema; an integer histogram reduction pools counts. The upper
 quantile is interpolated within the crossing bin. Padding contributes neither

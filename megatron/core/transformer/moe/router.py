@@ -511,6 +511,10 @@ class TopKRouter(Router):
             score_function=self.score_function,
             fused=False,
             precomputed_indices=indices,
+            sigmoid_normalization_epsilon=(
+                1e-9 if self.config.moe_router_quantile_balancing_method == 'marin_histogram'
+                else 1e-20
+            ),
         )
         return probs, routing_map, drop_priority
 
@@ -1218,6 +1222,7 @@ class InferenceTopKRouter(TopKRouter):
         router_replay,
         dense_output,
         precomputed_indices,
+        sigmoid_normalization_epsilon=1e-20,
     ):
         return topk_routing_with_score_function(
             logits,
@@ -1232,6 +1237,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=router_replay,
             dense_output=dense_output,
             precomputed_indices=precomputed_indices,
+            sigmoid_normalization_epsilon=sigmoid_normalization_epsilon,
         )
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -1266,6 +1272,11 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
             dense_output=True,
             precomputed_indices=precomputed_indices,
+            sigmoid_normalization_epsilon=(
+                1e-9 if self.qb_beta is not None
+                and self.config.moe_router_quantile_balancing_method == 'marin_histogram'
+                else 1e-20
+            ),
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 
