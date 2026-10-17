@@ -271,6 +271,13 @@ function evaluateReport(report, policy) {
 }
 
 function renderReport(report, gate) {
+  const statusLabels = {
+    PASS: '🟢 **PASS**',
+    'NEW FAILURE': '🔴 **NEW FAILURE**',
+    'KNOWN FAILURES': '🟠 **KNOWN FAILURES**',
+    INCOMPLETE: '🟡 **INCOMPLETE**',
+    FIXED: '🟢 **FIXED**',
+  };
   const escape = value => String(value).replace(/[|<>`\r\n]/g, ' ');
   let heading = 'No new regressions';
   if (gate.unexpected.length) {
@@ -293,7 +300,7 @@ function renderReport(report, gate) {
     const junit = selection.junit;
     const row = [
       escape(selection.name),
-      result.result,
+      statusLabels[result.result],
       escape(junit.tests_per_rank),
       result.unexpected,
       result.known,
