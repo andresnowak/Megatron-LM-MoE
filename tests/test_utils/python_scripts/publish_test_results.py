@@ -198,6 +198,8 @@ def junit_results(directory, known_ids=()):
         "skipped_per_rank": count_range([count["skipped"] for count in counts.values()]),
         "reporting_ranks": len(counts),
         "rank_ids": sorted(counts, key=int),
+        "tests_by_rank": {rank: count["tests"] for rank, count in counts.items()},
+        "skips_by_rank": {rank: count["skipped"] for rank, count in counts.items()},
         "failures_by_rank": {rank: count["failed"] for rank, count in counts.items()},
         "failing_tests": sorted(failing_ids)[:5],
         "has_failures": bool(failing_ids) or any(count["failed"] for count in counts.values()),

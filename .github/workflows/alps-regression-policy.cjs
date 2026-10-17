@@ -150,6 +150,20 @@ function evaluateSelection(selection, policy, environment, suite) {
   }
 
   for (const rank of junit.rank_ids) {
+    const tests = junit.tests_by_rank[rank];
+    const skipped = junit.skips_by_rank[rank];
+    if (
+      !Number.isInteger(tests) ||
+      !Number.isInteger(skipped) ||
+      tests < 0 ||
+      skipped < 0 ||
+      skipped > tests
+    ) {
+      throw new Error('Invalid per-rank test counts');
+    }
+    if (tests === skipped) {
+      problems.push(`No executed tests on rank ${rank}`);
+    }
     if ((failureCounts[rank] || 0) !== junit.failures_by_rank[rank]) {
       problems.push(`Unattributed JUnit failures on rank ${rank}`);
     }
