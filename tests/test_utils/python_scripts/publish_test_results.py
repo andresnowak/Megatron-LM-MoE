@@ -1,7 +1,9 @@
 """Send existing Alps results to a report-only GitHub Actions workflow."""
 
 import argparse
+import base64
 import csv
+import gzip
 import json
 import re
 import subprocess
@@ -307,15 +309,20 @@ def main():
     )
     repo = repo_info["nameWithOwner"]
     report["sha"] = gh_json("api", f"repos/{repo}/commits/{sha}")["sha"]
-    payload = json.dumps(
-        {
-            "suite": report["suite"],
-            "tested_sha": report["sha"],
-            "report": json.dumps(report, separators=(",", ":")),
-        }
-    )
+    inputs = {
+        "suite": report["suite"],
+        "tested_sha": report["sha"],
+        "report": json.dumps(report, separators=(",", ":")),
+    }
+    if len(inputs["report"].encode()) > 5_000_000:
+        raise ValueError("Report exceeds the 5 MB uncompressed limit")
+    payload = json.dumps(inputs)
     if len(payload.encode()) > 60000:
-        raise ValueError("Report exceeds workflow input size; publish smaller selections")
+        compressed = gzip.compress(inputs["report"].encode(), mtime=0)
+        inputs["report"] = "gzip:" + base64.b64encode(compressed).decode()
+        payload = json.dumps(inputs)
+    if len(payload.encode()) > 60000:
+        raise ValueError("Compressed report exceeds workflow input size")
     subprocess.run(
         [
             "gh",

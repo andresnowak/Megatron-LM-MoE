@@ -74,7 +74,15 @@ jobs:
 
             try {
               await status('pending', 'Checking regressions and coverage.');
-              const report = JSON.parse(process.env.ALPS_REPORT);
+              let reportText = process.env.ALPS_REPORT;
+              if (reportText.startsWith('gzip:')) {
+                const zlib = require('zlib');
+                const compressed = Buffer.from(reportText.slice(5), 'base64');
+                reportText = zlib.gunzipSync(compressed, {
+                  maxOutputLength: 5_000_000,
+                }).toString('utf8');
+              }
+              const report = JSON.parse(reportText);
 
               if (
                 report.suite !== suite ||
@@ -102,7 +110,22 @@ jobs:
               const modulePath = path.resolve('alps-regression-policy.cjs');
 
               fs.writeFileSync(modulePath, await trustedFile(moduleFile));
-              const {evaluateReport, renderReport} = require(modulePath);
+              const {
+                evaluateReport,
+                renderReport,
+                functionalSelections,
+              } = require(modulePath);
+              if (suite === 'functional') {
+                const {data: tree} = await github.rest.git.getTree({
+                  ...context.repo,
+                  tree_sha: process.env.POLICY_SHA,
+                  recursive: 'true',
+                });
+                policy.required_selections.functional = {
+                  ...policy.required_selections.functional,
+                  ...functionalSelections(tree),
+                };
+              }
               const gate = evaluateReport(report, policy);
               const markdown = renderReport(report, gate);
 

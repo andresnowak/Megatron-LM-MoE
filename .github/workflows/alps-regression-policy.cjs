@@ -3,8 +3,7 @@ function hasOnlyStatus(result, status) {
 }
 
 function evaluateSelection(selection, policy, environment, suite) {
-  const name = selection.name;
-  const junit = selection.junit;
+  const {name, junit} = selection;
   if (!junit || !Array.isArray(junit.observations) || !Array.isArray(junit.rank_ids)) {
     throw new Error('Missing full JUnit evidence');
   }
@@ -19,7 +18,8 @@ function evaluateSelection(selection, policy, environment, suite) {
     problems.push('Unexpected selection or rank plan');
   }
   if (
-    JSON.stringify([...junit.rank_ids].sort()) !== JSON.stringify([...ranks].sort()) ||
+    junit.rank_ids.length !== ranks.length ||
+    ranks.some(rank => !junit.rank_ids.includes(rank)) ||
     junit.reporting_ranks !== ranks.length
   ) {
     problems.push('Missing or unexpected rank reports');
@@ -172,11 +172,11 @@ function evaluateSelection(selection, policy, environment, suite) {
     if (observed.has(id)) {
       continue;
     }
-    const module = id.startsWith('::') ? id.slice(2) : null;
-    const collectionFixed = module && ranks.length && ranks.every(rank => {
+    const moduleName = id.startsWith('::') ? id.slice(2) : null;
+    const collectionFixed = moduleName && ranks.length && ranks.every(rank => {
       return junit.observations.some(test => {
-        const inModule = test.test_id.startsWith(module + '.') ||
-          test.test_id.startsWith(module + '::');
+        const inModule = test.test_id.startsWith(moduleName + '.') ||
+          test.test_id.startsWith(moduleName + '::');
         return inModule && hasOnlyStatus(test.ranks[rank], 'passed');
       });
     });
@@ -338,4 +338,29 @@ function renderReport(report, gate) {
   return lines.join('\n') + '\n';
 }
 
-module.exports = {evaluateReport, renderReport};
+function functionalSelections(tree) {
+  if (tree.truncated || !Array.isArray(tree.tree)) {
+    throw new Error('Incomplete trusted functional inventory');
+  }
+  const required = Object.create(null);
+  for (const entry of tree.tree) {
+    const match = entry.path.match(
+      /^tests\/functional_tests\/test_cases\/[^/]+\/([^/]+)\/model_config\.yaml$/,
+    );
+    if (match) {
+      if (Object.hasOwn(required, match[1])) {
+        throw new Error(`Duplicate functional selection: ${match[1]}`);
+      }
+      required[match[1]] = 1;
+    }
+    if (entry.path === 'tests/functional_tests/test_cases/common/moe_perf/__main__.py') {
+      required.moe_perf = 1;
+    }
+  }
+  if (!Object.keys(required).length) {
+    throw new Error('No trusted functional selections found');
+  }
+  return required;
+}
+
+module.exports = {evaluateReport, renderReport, functionalSelections};
