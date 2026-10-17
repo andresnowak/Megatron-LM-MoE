@@ -310,6 +310,13 @@ function renderReport(report, gate) {
     ];
     lines.push(`| ${row.join(' | ')} |`);
   }
+  const blocked = report.selections.filter(selection => selection.outcome === 'BLOCKED');
+  if (blocked.length) {
+    lines.push('', `## Blocked selections (${blocked.length})`, '');
+    for (const selection of blocked) {
+      lines.push(`- ${escape(selection.name)} — ${escape(selection.reason || 'See run logs')}`);
+    }
+  }
   if (gate.unexpected.length) {
     lines.push('', '## New or changed failures', '');
     for (const test of gate.unexpected) {

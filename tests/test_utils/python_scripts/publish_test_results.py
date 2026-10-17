@@ -251,6 +251,7 @@ def build_report(directory, results, suite, sha, policy=None, policy_sha=None, e
             {
                 "name": name,
                 "outcome": row["result"],
+                "reason": row.get("reason", ""),
                 "expected_reporting_ranks": expected_ranks,
                 "junit": junit_results(group_dir, known_ids[name]),
             }
