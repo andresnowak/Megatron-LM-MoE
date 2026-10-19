@@ -2408,6 +2408,9 @@ def training_log(
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
+        if args.moe_router_quantile_balancing_method == 'marin_exact':
+            # Recorded once per optimizer step (scaled by num_microbatches at the source).
+            track_names.extend(['qb_exact_nonfinite_tokens', 'qb_exact_update_skipped'])
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
         if "seq_aux_loss" in args.moe_router_load_balancing_type:
