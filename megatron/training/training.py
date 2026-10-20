@@ -56,6 +56,11 @@ import torch.distributed
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from .log_handler import CustomHandler
+from .tranche import (
+    resolve_tranche_start, tranche_end_samples, tranche_finished,
+    tranche_identity, write_tranche_end,
+)
+from .utils import get_blend_and_blend_per_split
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -187,6 +192,12 @@ from megatron.core.optimizer.md_decoupling import get_megatron_mddecoupling_opti
 from megatron.core.optimizer.muon_logging import (
     collect_md_gain_stats,
     collect_muon_stats,
+)
+from megatron.core.transformer.moe import router_input_logging
+from megatron.core.optimizer.router_update_logging import (
+    collect_router_update_stats,
+    pop_router_update_stats,
+    snapshot_router_weights,
 )
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
@@ -1937,6 +1948,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     grad_norm = None
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        from megatron.training.nan_debug import nan_debug_new_step
+        # Reset diagnostics for every attempt, including reruns of the same step.
+        nan_debug_new_step(iteration + 1, model)
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2012,21 +2026,34 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for model_chunk in model:
             model_chunk.force_all_reduce = False
 
-        # Zero spurious non-finite grad elements (nan/inf -> 0) so a rare artifact
-        # (e.g. the fp8-offloading wgrad GEMM on a near-dead expert) can't poison
-        # the grad-norm below / the optimizer step. Gated by NAN_DEBUG_SANITIZE=1
-        # (a true no-op otherwise). Runs after backward, before prepare_grad_norm()
-        # and the optimizer consume the grads. To get mask-and-continue behavior,
-        # pair NAN_DEBUG_SANITIZE=1 with CHECK_NAN=0 (the param_and_grad_buffer
-        # NaN check is fatal and fires DURING backward, before this runs).
-        from megatron.training.nan_debug import nan_debug_sanitize_grads
-        nan_debug_sanitize_grads(model)
+        from megatron.training.nan_debug import (
+            nan_debug_check_grads,
+            nan_debug_sanitize_grads,
+            nan_debug_sanitize_after_grad_norm,
+        )
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        # Inspect before sanitization removes non-finite gradient evidence.
+        nan_debug_check_grads(model, iteration + 1)
+
+        use_checked_grad_norm = (
+            args.optimizer == 'md_decoupling'
+            and args.check_grad_norm
+            and isinstance(optimizer, LayerWiseDistributedOptimizer)
+        )
+        # MuonMD reuses its existing norm check; other paths retain the explicit
+        # finite check. CHECK_NAN=0 disables checks during backward before repair.
+        if not use_checked_grad_norm:
+            nan_debug_sanitize_grads(model, iteration + 1)
 
         if args.optimizer == 'md_decoupling' and args.check_grad_norm:
             from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
             from functools import partial
             if isinstance(optimizer, LayerWiseDistributedOptimizer):
                 found_inf_flag, grad_norm = optimizer.prepare_grad_norm()
+                found_inf_flag, grad_norm = nan_debug_sanitize_after_grad_norm(
+                    model, optimizer, iteration + 1, found_inf_flag, grad_norm
+                )
                 rerun_state_machine.validate_result(
                     result=(found_inf_flag, grad_norm),
                     rejection_func=partial(
@@ -2077,11 +2104,24 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     skip_reduce_check = args.skip_reduce_check and \
         (args.optimizer == 'md_decoupling' and isinstance(optimizer, LayerWiseDistributedOptimizer))
 
+    # Router relative-update logging: snapshot router rows before the step, compare after.
+    # `iteration` is the pre-increment count, so the logged step is iteration + 1.
+    log_router_update = (
+        args.router_update_log_interval
+        and iteration is not None
+        and (iteration + 1) % args.router_update_log_interval == 0
+    )
+    if log_router_update:
+        snapshot_router_weights(optimizer)
+
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.optimizer == 'md_decoupling' and args.check_grad_norm and isinstance(optimizer, LayerWiseDistributedOptimizer):
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step_after_grad_norm(grad_norm)
     else:
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+
+    if log_router_update:
+        collect_router_update_stats(args.num_layers + (args.mtp_num_layers or 0))
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
@@ -2368,14 +2408,19 @@ def training_log(
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
+        if args.moe_router_quantile_balancing_method == 'marin_exact':
+            # Recorded once per optimizer step (scaled by num_microbatches at the source).
+            track_names.extend(['qb_exact_nonfinite_tokens', 'qb_exact_update_skipped'])
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
         if "seq_aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("seq_load_balancing_loss")
         if "global_aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("global_load_balancing_loss")
-        if args.moe_z_loss_coeff is not None:
+        if args.moe_z_loss_coeff not in (None, 0.0) or args.moe_router_log_z_loss:
             track_names.append("z_loss")
+        if args.moe_expert_capacity_factor is not None:
+            track_names.append("dropped_token_fraction")
         if "mbs" in args.moe_router_violation_metrics:
             track_names.append("expert_max_violation")
             track_names.append("expert_min_violation")
@@ -2604,6 +2649,55 @@ def training_log(
     return report_memory_flag
 
 
+# Per-group learning rates for logging, beside the canonical 'learning-rate' (the base --lr
+# schedule). Each group is classified by the parameters it holds.
+_GROUP_LR_CATEGORIES = ("router", "matrix", "embedding", "output")
+
+
+def _param_group_category(group):
+    for param in group["params"]:
+        if getattr(param, "is_router", False):
+            return "router"
+        if getattr(param, "is_md_output_parameter", False):
+            return "output"
+        if getattr(param, "is_md_embedding_parameter", False) or getattr(
+            param, "is_embedding_or_output_parameter", False
+        ):
+            return "embedding"
+        if group.get("use_orthogonal_updates", False):
+            return "matrix"
+    return None
+
+
+@torch.no_grad()
+def _per_group_learning_rates(optimizer):
+    """Return {'learning-rate/<category>': lr}. Collective: call on every rank.
+
+    Under the layer-wise optimizer a rank only holds the groups' parameters it owns, so the
+    logging rank may hold no router or matrix parameter; each rank reports the lr of the groups
+    it can classify and a MAX all-reduce (absent = -1) merges them.
+    """
+    local = torch.full(
+        (len(_GROUP_LR_CATEGORIES),), -1.0, dtype=torch.float64,
+        device=torch.cuda.current_device() if torch.cuda.is_available() else "cpu",
+    )
+    if optimizer is not None:
+        for group in optimizer.param_groups:
+            category = _param_group_category(group)
+            lr = group.get("lr")
+            if category is None or lr is None:
+                continue
+            index = _GROUP_LR_CATEGORIES.index(category)
+            local[index] = max(float(local[index]), float(lr))
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(local, op=torch.distributed.ReduceOp.MAX)
+    return {
+        f"learning-rate/{name}": float(value)
+        for name, value in zip(_GROUP_LR_CATEGORIES, local.tolist())
+        if value >= 0
+    }
+
+
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
     args = get_args()
     if args.save is None:
@@ -2692,7 +2786,13 @@ def save_checkpoint_and_time(
     for model_chunk in model:
         if hasattr(model_chunk, 'free_overlap_buffers'):
             model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
+    # Only async saves need the headroom. A synchronous save copies shards from this
+    # process, and empty_cache() unmaps segments NCCL registered for pipeline-parallel
+    # P2P (see the note in load_checkpoint's caller) and forces the whole cache to be
+    # re-mapped on the first step after the save, which is where the tightest stage
+    # ran out of memory.
+    if args.async_save:
+        torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
@@ -2833,6 +2933,25 @@ def checkpoint_and_decide_exit(
     based on the return value of this function."""
     args = get_args()
     timers = get_timers()
+
+    if tranche_finished(
+        args.exit_on_tranche_end,
+        getattr(args, 'tranche_end_consumed_samples', None),
+        args.consumed_train_samples,
+    ):
+        # Handle this before interval saves: exactly one persistent checkpoint,
+        # even when the boundary coincides with a non-persistent save interval.
+        save_checkpoint_and_time(
+            iteration, model, optimizer, opt_param_scheduler,
+            num_floating_point_operations_so_far, checkpointing_context,
+            train_data_iterator=train_data_iterator,
+        )
+        print_datetime(
+            f'[TRANCHE-END] checkpointed iteration {iteration}; exiting at '
+            f'{args.consumed_train_samples} consumed samples'
+        )
+        args.tranche_completed = True
+        return True
 
     # Exit based on signal handler.
     saved_checkpoint = False
@@ -3239,6 +3358,19 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
+        # A resumed checkpoint may already be at the end, or fewer than one
+        # global batch may remain. Never let a pipeline rank fetch past it.
+        if tranche_finished(
+            args.exit_on_tranche_end,
+            getattr(args, 'tranche_end_consumed_samples', None),
+            args.consumed_train_samples,
+        ):
+            should_exit = checkpoint_and_decide_exit(
+                model, optimizer, opt_param_scheduler, iteration,
+                num_floating_point_operations_so_far, checkpointing_context,
+                train_data_iterator,
+            )
+            break
         if (args.profile 
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
@@ -3356,6 +3488,12 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
+            # Router-input diagnostics: record during this step's forwards; collected below.
+            log_router_input = bool(
+                args.router_input_log_interval
+                and (iteration + 1) % args.router_input_log_interval == 0
+            )
+            router_input_logging.set_active(log_router_input, args.router_diag_layers)
             (
                 loss_dict,
                 skipped_iter,
@@ -3485,6 +3623,21 @@ def train(
                     log_sparsity=args.log_muon_sparsity,
                     log_param_rms=args.log_muon_param_rms,
                 )
+        router_update_stats = pop_router_update_stats()
+        if router_update_stats:
+            md_gain_stats = {**(md_gain_stats or {}), **router_update_stats}
+        if router_input_logging.is_active():
+            router_input_stats = router_input_logging.collect(
+                model,
+                args.num_layers + (args.mtp_num_layers or 0),
+                zero_centered_gamma=getattr(config, "layernorm_zero_centered_gamma", False),
+            )
+            if router_input_stats:
+                md_gain_stats = {**(md_gain_stats or {}), **router_input_stats}
+        if args.tensorboard_log_interval and iteration % args.tensorboard_log_interval == 0:
+            group_lrs = _per_group_learning_rates(optimizer)
+            if group_lrs:
+                md_gain_stats = {**(md_gain_stats or {}), **group_lrs}
         if optimizer is not None:
             learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
         else:
@@ -3616,6 +3769,23 @@ def train(
     # a persistent async worker if persistent ckpt worker is enabled
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
+
+    if getattr(args, 'tranche_completed', False):
+        # Publish only after async checkpoint finalization. Propagate filesystem
+        # failures to every rank rather than leaving a partially successful exit.
+        marker_status = [None]
+        if torch.distributed.get_rank() == 0:
+            try:
+                write_tranche_end(
+                    args.save, args.tranche_id, args.tranche_start_samples,
+                    args.consumed_train_samples, iteration,
+                )
+            except Exception as error:
+                marker_status[0] = str(error)
+        torch.distributed.broadcast_object_list(marker_status, src=0)
+        if marker_status[0] is not None:
+            raise RuntimeError(f'Failed to write tranche completion marker: {marker_status[0]}')
+        print_rank_0(f'[TRANCHE-END] completion marker: {args.save}/tranche_end.txt')
 
     if args.log_energy:
         energy_monitor.lap()
@@ -3924,7 +4094,11 @@ def get_train_valid_test_num_samples():
     test_samples = args.eval_iters * args.global_batch_size
 
     # Get train_samples in current phase.
-    if args.phase_transition_iterations:
+    if args.exit_on_tranche_end:
+        # None tells the GPT/blended dataset builder to build exhaustive,
+        # single-epoch indices rather than repeat data to fill the run budget.
+        train_samples_in_current_phase = None
+    elif args.phase_transition_iterations:
         phase_transition_samples = [0] + [t * args.global_batch_size for t in args.phase_transition_iterations] + [args.train_samples]
         current_sample = args.iteration * args.global_batch_size
         last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
@@ -3976,6 +4150,23 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     else:
         consumed_train_samples_in_current_phase = args.consumed_train_samples
 
+    if args.exit_on_tranche_end:
+        blend, blend_per_split = get_blend_and_blend_per_split(args)
+        train_blend = blend if blend is not None else blend_per_split[0]
+        args.tranche_id = tranche_identity(train_blend[0], args.split if blend is not None else None)
+        args.tranche_start_samples = resolve_tranche_start(
+            args.load or args.save, args.tranche_id, args.consumed_train_samples,
+            explicit_start=args.tranche_start_samples,
+            fallback_start=args.consumed_train_samples - consumed_train_samples_in_current_phase,
+        )
+        consumed_train_samples_in_current_phase = (
+            args.consumed_train_samples - args.tranche_start_samples
+        )
+        if consumed_train_samples_in_current_phase < 0:
+            raise ValueError('--tranche-start-samples exceeds the checkpoint consumed-sample counter')
+
+    tranche_size = -1
+
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
 
@@ -3996,10 +4187,17 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             # Build datasets.
             train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+            if args.exit_on_tranche_end and train_ds is not None:
+                tranche_size = len(train_ds)
             if args.skip_train:
                 train_dataloader = None
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+                loader_consumed = consumed_train_samples_in_current_phase
+                if args.exit_on_tranche_end and tranche_size > 0 and loader_consumed >= tranche_size:
+                    # The sampler requires consumed < total. This iterator will
+                    # never be fetched: the train-loop boundary check exits first.
+                    loader_consumed = 0
+                train_dataloader = build_pretraining_data_loader(train_ds, loader_consumed)
             valid_dataloaders = []
             for valid_d in valid_ds:
                 if args.skip_train or args.full_validation:
@@ -4018,12 +4216,26 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 
         flags = torch.tensor(
-            [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
+            [int(do_train), int(do_valid), int(do_test), tranche_size], dtype=torch.long, device='cuda'
         )
     else:
-        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+        flags = torch.tensor([0, 0, 0, -1], dtype=torch.long, device='cuda')
 
     torch.distributed.broadcast(flags, 0)
+
+    if args.exit_on_tranche_end:
+        # PP/TP ranks without a local dataset must share the same stop decision.
+        tranche_size = int(flags[3].item())
+        args.tranche_end_consumed_samples = tranche_end_samples(
+            tranche_size, consumed_train_samples_in_current_phase,
+            args.consumed_train_samples, args.global_batch_size,
+        )
+        tail = max(0, tranche_size - consumed_train_samples_in_current_phase) % args.global_batch_size
+        print_rank_0(
+            f'[TRANCHE] samples={tranche_size}, consumed_in_tranche='
+            f'{consumed_train_samples_in_current_phase}, stop_consumed_samples='
+            f'{args.tranche_end_consumed_samples}, unused_tail_samples={tail}'
+        )
 
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()

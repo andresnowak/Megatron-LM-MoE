@@ -152,6 +152,18 @@ def _get_muon_scale_factor(size_out: int, size_in: int, mode: str = "spectral") 
     return _emerging_get_muon_scale_factor(size_out, size_in, mode=mode)
 
 
+def _tp_partition_dim(p: torch.Tensor) -> Optional[int]:
+    """Dimension along which TP shards ``p``, or None when ``p`` is not TP-sharded.
+
+    TE stamps ``partition_dim=0`` on duplicated-mode weights (e.g. the MoE latent projections)
+    that Megatron marks ``tensor_model_parallel=False``: every TP rank holds the full matrix.
+    """
+    if getattr(p, "tensor_model_parallel", None) is False:
+        return None
+    partition_dim = getattr(p, "partition_dim", None)
+    return None if partition_dim == -1 else partition_dim
+
+
 def _md_gain_retained_axes(gain_kind: str, model_ndim: int) -> tuple[int, ...]:
     """Return model-local axes represented by an MD gain tensor."""
     if model_ndim == 2:
@@ -464,6 +476,29 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                                         is_embedding=is_embedding, is_router=is_router,
                                         is_merged_offload_expert=is_merged_offload_expert)
 
+    def load_state_dict(self, state_dict):
+        """Load optimizer state, keeping this run's per-group LR bounds.
+
+        Param groups (including max_lr / min_lr) are saved in the checkpoint, and
+        torch.optim.Optimizer.load_state_dict restores the saved values, so a changed
+        --matrix-lr / --router-lr / --output-lr on resume would be silently ignored. The
+        scheduler recomputes group['lr'] from max_lr / min_lr every step, so restoring the
+        configured bounds after the load is enough. Groups are matched by position, which is
+        how torch pairs saved and current groups.
+        """
+        configured = [(g.get('max_lr'), g.get('min_lr')) for g in self.param_groups]
+        super().load_state_dict(state_dict)
+        for i, (group, (max_lr, min_lr)) in enumerate(zip(self.param_groups, configured)):
+            for key, value in (('max_lr', max_lr), ('min_lr', min_lr)):
+                if value is None:
+                    continue
+                if group.get(key) != value:
+                    logger.info(
+                        f"MDDecoupling param group {i}: {key} {group.get(key)} from checkpoint "
+                        f"-> {value} from current config"
+                    )
+                group[key] = value
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -660,7 +695,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         dim0 = x.size(0)
         if dim0 == total or (allow_groups and dim0 % total == 0):
             return shapes
-        if getattr(p, "partition_dim", None) != 0:
+        if _tp_partition_dim(p) != 0:
             return shapes
 
         tp_size = 1
@@ -713,9 +748,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
                         else self.pg_collection.tp)
         else:
             tp_group = None
-        norm_partition_dim = getattr(p, "partition_dim", None)
-        if norm_partition_dim == -1:
-            norm_partition_dim = None
+        norm_partition_dim = _tp_partition_dim(p)
         partition_dim = None if self.tp_mode == "blockwise" else norm_partition_dim
 
         split = self._split_param_tensor(p, grad, is_qkv)
@@ -969,9 +1002,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         is_merged_offload_expert: bool,
     ) -> tuple[list[torch.Tensor], Optional[int]]:
         """Return logical matrix blocks and their TP partition dimension."""
-        partition_dim = getattr(p, "partition_dim", None)
-        if partition_dim == -1:
-            partition_dim = None
+        partition_dim = _tp_partition_dim(p)
         split = self._split_param_tensor(p, tensor, is_qkv)
         if split is not None:
             return split[0], self._split_partition_dim(p, partition_dim)
@@ -1093,7 +1124,7 @@ class _MDDecouplingBase(torch.optim.Optimizer):
         if mode is None:
             return
 
-        partition_dim = getattr(p, "partition_dim", None)
+        partition_dim = _tp_partition_dim(p)
         radius_scale = self._resolve_radius_scale(is_out_proj)
 
         is_expert_tp = getattr(p, "expert_tp", False)
@@ -1333,7 +1364,7 @@ class MDDecoupling(_MDDecouplingBase):
         preserve = self.hypersphere_preserve_init
         # TP sharding info: the absorbed norm must be reduced across the TP group when it reduces
         # over the sharded dimension, else TP=1 and TP>1 absorb different magnitudes.
-        partition_dim = getattr(p, "partition_dim", None)
+        partition_dim = _tp_partition_dim(p)
         is_expert_tp = getattr(p, "expert_tp", False)
         layout = self._gain_layout(p)
 
@@ -1481,7 +1512,7 @@ class MDDecoupling(_MDDecouplingBase):
         if self.pg_collection is not None:
             # partition_dim=0 -> column parallel sharding.
             # partition_dim=1 -> row parallel sharding.
-            partition_dim = getattr(p, "partition_dim", None)
+            partition_dim = _tp_partition_dim(p)
             if partition_dim in {0, 1}:  # Otherwise, p is not sharded so we don't need to sync it.
                 tp_group = self.pg_collection.expt_tp if getattr(p, "expert_tp", False) else self.pg_collection.tp
                 if flat is not None:  # Flat gains always need to all-reduce to complete the decomposition.
@@ -1742,15 +1773,36 @@ def _mddecoupling_config_overrides(
     router_override: ParamGroupOverride = {}
     if config.md_router_use_orthogonal_updates is not None:
         router_override['use_orthogonal_updates'] = config.md_router_use_orthogonal_updates
-    if router_uses_adam:
-        # Adam routers use base lr (matrix_lr is Muon-tuned; doesn't fit Adam).
-        router_override['max_lr'] = config.lr
-        router_override['min_lr'] = _group_min_lr(config, config.lr)
+    # Router LR: explicit --router-lr wins on either branch; otherwise Adam routers use base lr
+    # (matrix_lr is Muon-tuned; doesn't fit Adam) and Muon routers fall through to matrix_lr.
+    router_lr = config.router_lr if config.router_lr is not None else (
+        config.lr if router_uses_adam else None
+    )
+    router_has_own_lr = router_lr is not None
+    if router_has_own_lr:
+        router_override['max_lr'] = router_lr
+        router_override['min_lr'] = _group_min_lr(config, router_lr)
+    if config.router_weight_decay is not None:
+        router_sphere = (
+            config.hypersphere_router_mode
+            if config.hypersphere_router_mode is not None
+            else config.hypersphere_mode
+        )
+        if router_sphere not in (None, 'none'):
+            raise ValueError(
+                f"--router-weight-decay has no effect on a hypersphere-normalized router "
+                f"(router mode {router_sphere!r}): the post-step projection undoes the decay. "
+                f"Use --hypersphere-router-mode none."
+            )
+        # Constant per-group decay via the scheduler's start_wd/end_wd group override.
+        router_override['start_wd'] = config.router_weight_decay
+        router_override['end_wd'] = config.router_weight_decay
     if router_override:
         overrides[ParamKey(attr='is_router')] = router_override
 
-    # Matrix LR for non-embedding/non-output matrix weights. Adam-branch routers are excluded — they
-    # get base lr from the router_override above.
+    # Matrix LR for non-embedding/non-output matrix weights. Routers with their own LR are
+    # excluded — they get it from the router_override above (two different max_lr overrides on
+    # one param would be a conflict).
     # Offloaded inplace-FP8 expert weights are stored as a merged 3D tensor (E, out, in),
     # but mathematically they are still per-expert matrices and must stay on the matrix LR schedule.
     non_emb_2d = ParamPredicate(
@@ -1758,7 +1810,7 @@ def _mddecoupling_config_overrides(
         fn=lambda p: (not getattr(p, "is_embedding_or_output_parameter", False)
                       and (len(p.shape) == 2 or getattr(p, "merged_offload_expert", False))
                       and not getattr(p, "is_kda_decay_parameter", False)
-                      and not (router_uses_adam and getattr(p, "is_router", False))),
+                      and not (router_has_own_lr and getattr(p, "is_router", False))),
     )
     overrides[ParamKey(predicate=non_emb_2d)] = {
         'max_lr': matrix_lr,

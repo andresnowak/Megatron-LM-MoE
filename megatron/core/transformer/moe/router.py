@@ -17,7 +17,9 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_router_token_dropping,
     compute_qb_histogram,
     compute_routing_scores_for_aux_loss,
+    dropped_token_fraction,
     get_tokens_per_expert_and_token_count,
+    marin_qb_histogram_update,
     pop_routing_oob_accum,
     qb_dual_update,
     router_gating_linear,
@@ -27,6 +29,7 @@ from megatron.core.transformer.moe.moe_utils import (
     topk_routing_with_score_function,
     z_loss_func,
 )
+from megatron.core.transformer.moe import router_input_logging
 from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -237,7 +240,15 @@ class TopKRouter(Router):
         # Quantile balancing uses a per-expert threshold `qb_beta`; it may be combined with
         # sequence-level aux loss through the load-balancing type list. The average method
         # accumulates per-microbatch quantiles, while the histogram method accumulates local
-        # counts and recovers the pooled quantile at the global-batch boundary.
+        # counts and recovers the pooled quantile at the global-batch boundary. marin_exact keeps
+        # every microbatch's raw-logit margins and runs Marin's estimator once per step.
+        self.qb_exact = (
+            "quantile_balancing" in self.routing_type
+            and self.config.moe_router_quantile_balancing_method == 'marin_exact'
+        )
+        self._qb_exact_margins = None  # [capacity, experts] fp32, host-pinned or device
+        self._qb_exact_valid = None  # [capacity] bool, same placement
+        self._qb_exact_rows = 0  # write cursor; reset once per optimizer step
         if "quantile_balancing" in self.routing_type:
             self.register_buffer(
                 'qb_beta',
@@ -260,6 +271,10 @@ class TopKRouter(Router):
                     ),
                     persistent=False,
                 )
+                self.qb_beta_accum = None
+                self.qb_beta_count = None
+            elif self.qb_exact:
+                self.qb_histogram = None
                 self.qb_beta_accum = None
                 self.qb_beta_count = None
             else:
@@ -300,6 +315,43 @@ class TopKRouter(Router):
         """Restore the snapshot taken by get_rerun_state()."""
         for n, saved in state.items():
             getattr(self, n).copy_(saved)
+        # A rejected/partial pass must not leave margins that its replay would append to.
+        self._qb_exact_rows = 0
+
+    def _store_marin_exact_margins(self, margins: torch.Tensor, padding_mask):
+        """Append this microbatch's margins to the step buffer without a host sync.
+
+        The buffer is sized for every microbatch of the step on first use and only grows
+        (synchronizing once) if a later step has more rows, e.g. under batch-size ramp-up.
+        """
+        rows = margins.shape[0]
+        start, end = self._qb_exact_rows, self._qb_exact_rows + rows
+        store, valid_store = self._qb_exact_margins, self._qb_exact_valid
+        if store is None or end > store.shape[0]:
+            capacity = max(end, get_num_microbatches() * rows)
+            on_host = self.config.moe_router_quantile_balancing_marin_exact_store == 'cpu'
+            kwargs = (
+                dict(device='cpu', pin_memory=torch.cuda.is_available())
+                if on_host
+                else dict(device=margins.device)
+            )
+            new_store = torch.empty((capacity, margins.shape[1]), dtype=torch.float32, **kwargs)
+            new_valid = torch.empty((capacity,), dtype=torch.bool, **kwargs)
+            if store is not None and start > 0:
+                if margins.is_cuda:
+                    torch.cuda.current_stream().synchronize()  # in-flight async copies
+                new_store[:start].copy_(store[:start])
+                new_valid[:start].copy_(valid_store[:start])
+            store = self._qb_exact_margins = new_store
+            valid_store = self._qb_exact_valid = new_valid
+        store[start:end].copy_(margins, non_blocking=True)
+        valid = (
+            torch.ones(rows, dtype=torch.bool, device=margins.device)
+            if padding_mask is None
+            else ~padding_mask.bool()
+        )
+        valid_store[start:end].copy_(valid, non_blocking=True)
+        self._qb_exact_rows = end
 
     def _maintain_float32_expert_bias(self):
         """
@@ -355,13 +407,23 @@ class TopKRouter(Router):
     def quantile_balancing(
         self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None
     ):
-        """Apply average or histogram quantile-balancing routing.
+        """Apply the configured quantile-balancing routing estimator.
 
         The average methods gather TP/CP values and accumulate one quantile per
         microbatch for later averaging. ``legacy_average`` uses raw logits for
         compatibility with older QB checkpoints, while ``average`` uses bounded
         router scores. The histogram method performs no forward-pass communication:
         it accumulates local counts that are pooled once at the batch boundary.
+        ``marin_histogram`` uses raw logits and a live global histogram per forward,
+        then token-weights its quantiles across microbatches at the batch boundary.
+        ``marin_exact`` uses raw logits too but retains every microbatch's margins and runs
+        Marin's single global-batch estimator once at the step boundary (no forward collectives).
+
+        Returns probs, routing_map and, when a capacity factor is set, the selection margin
+        ``(qb_scores - qb_beta) - alpha`` used to rank tokens for dropping, where ``alpha`` is
+        each token's Top-(k+1) biased score. It is the quantity whose per-expert quantile the
+        beta update estimates, so dropping the smallest margins acts like raising the
+        overloaded expert's threshold for this microbatch. It is None otherwise.
         """
         assert (
             not self.config.moe_router_fusion
@@ -391,21 +453,54 @@ class TopKRouter(Router):
             # This backwards compatibility should probably be removed in 1 or 2 months from this git blame
             qb_scores = (
                 logits_fp32
-                if self.config.moe_router_quantile_balancing_method == 'legacy_average'
+                if self.config.moe_router_quantile_balancing_method in (
+                    'legacy_average', 'marin_histogram', 'marin_exact'
+                )
                 else scores
             )
             biased_scores = qb_scores - self.qb_beta
             use_histogram = (
                 self.config.moe_router_quantile_balancing_method == 'histogram'
             )
-            if should_update_beta and use_histogram:
+            use_marin = self.config.moe_router_quantile_balancing_method == 'marin_histogram'
+            use_exact = self.config.moe_router_quantile_balancing_method == 'marin_exact'
+            compute_drop_priority = (
+                self.config.moe_expert_capacity_factor is not None
+                and self.config.moe_token_drop_policy == "probs"
+            )
+            if (
+                should_update_beta and (use_histogram or use_marin or use_exact)
+            ) or compute_drop_priority:
                 topk_result = biased_scores.topk(self.topk + 1, dim=1)
                 indices = topk_result.indices[:, : self.topk]
             else:
                 indices = biased_scores.topk(self.topk, dim=1).indices
+            drop_priority = None
+            if compute_drop_priority:
+                drop_priority = biased_scores - topk_result.values[:, -1:]
 
             if should_update_beta:
-                if use_histogram:
+                if use_marin:
+                    if self.tp_dp_cp_group is None:
+                        raise RuntimeError("marin_histogram requires a TP+DP+CP process group")
+                    beta_local, token_count = marin_qb_histogram_update(
+                        qb_scores,
+                        topk_result.values[:, -1],
+                        self.qb_beta,
+                        self.topk,
+                        self.config.moe_router_quantile_balancing_marin_num_bins,
+                        group=self.tp_dp_cp_group,
+                        padding_mask=padding_mask,
+                    )
+                    self.qb_beta_accum.add_(beta_local * token_count)
+                    self.qb_beta_count.add_(token_count)
+                elif use_exact:
+                    # No forward collectives: margins wait for the step boundary, where
+                    # Marin's estimator runs once over every token of the global batch.
+                    self._store_marin_exact_margins(
+                        qb_scores - topk_result.values[:, -1:], padding_mask
+                    )
+                elif use_histogram:
                     # Hand the mask down instead of compacting the rows here:
                     # scores[~padding_mask] lowers to nonzero(), which synchronizes the
                     # device and makes the shape data-dependent, so the router can no
@@ -468,7 +563,7 @@ class TopKRouter(Router):
                         self.qb_beta_count.add_(1)
 
         # QB only picks the experts; reuse the shared score function for the probs.
-        return topk_routing_with_score_function(
+        probs, routing_map = topk_routing_with_score_function(
             logits,
             self.topk,
             use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -476,7 +571,14 @@ class TopKRouter(Router):
             score_function=self.score_function,
             fused=False,
             precomputed_indices=indices,
+            sigmoid_normalization_epsilon=(
+                1e-9
+                if self.config.moe_router_quantile_balancing_method
+                in ('marin_histogram', 'marin_exact')
+                else 1e-20
+            ),
         )
+        return probs, routing_map, drop_priority
 
     def get_aux_loss_coeff(self, aux_loss_type: str) -> float:
         """Return the aux loss coeff for the given auxiliary loss type.
@@ -725,23 +827,31 @@ class TopKRouter(Router):
         Returns:
             torch.Tensor: The logits after applying the z-loss.
         """
-        if self.config.moe_z_loss_coeff is not None and self.training and torch.is_grad_enabled():
+        apply_penalty = self.config.moe_z_loss_coeff not in (None, 0.0)
+        if (apply_penalty or self.config.moe_router_log_z_loss) and self.training and torch.is_grad_enabled():
             # Skip Z loss calculations when using torch.no_grad() or checkpointing.
-            moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
-            z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
-            if self.calculate_per_token_loss:
-                # The expected final scaling for z_loss gradients is
-                # 1/(num_micro_batches * dp_size).
-                # After commit 02648000, Megatron started using the number of total tokens
-                # to scale gradients under the argument of calculate_per_token_loss,
-                # which scales both the main_loss gradient and z_loss gradient by
-                # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
-                # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
-                # Count valid tokens: sum of inverted mask (False -> True = valid)
-                num_tokens = (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
-                logits = MoEAuxLossAutoScaler.apply(logits, z_loss * num_tokens)
+            if apply_penalty:
+                moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
+                z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
+                if self.calculate_per_token_loss:
+                    # The expected final scaling for z_loss gradients is
+                    # 1/(num_micro_batches * dp_size).
+                    # After commit 02648000, Megatron started using the number of total tokens
+                    # to scale gradients under the argument of calculate_per_token_loss,
+                    # which scales both the main_loss gradient and z_loss gradient by
+                    # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
+                    # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
+                    # Count valid tokens: sum of inverted mask (False -> True = valid)
+                    num_tokens = (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
+                    logits = MoEAuxLossAutoScaler.apply(logits, z_loss * num_tokens)
+                else:
+                    logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+
             else:
-                logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
+                # Diagnostic only: retain no autograd graph and attach no auxiliary gradient.
+                moe_z_loss_coeff = 1.0
+                with torch.no_grad():
+                    z_loss = z_loss_func(logits.detach().float(), 1.0, padding_mask=padding_mask)
 
             # When using repeated MTP layers, the same MTP layer is called mtp_num_layers times.
             # To avoid accumulating the z_loss multiple times, we scale it by 1/mtp_num_layers
@@ -848,6 +958,37 @@ class TopKRouter(Router):
             self.seq_expert_load_samples.index_copy_(0, sample_index, seq_sample.unsqueeze(0))
         self.expert_load_sample_count.add_(1)
 
+    def _log_dropped_token_fraction(
+        self,
+        routing_map: torch.Tensor,
+        dropped_routing_map: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ):
+        """Log the fraction of valid token-expert assignments the capacity factor dropped.
+
+        Recorded only in training with grad enabled, like the aux losses: under activation
+        recompute the no-grad forward is skipped and the recompute is counted, so each
+        microbatch counts once. The logged value is the mean over microbatches and over
+        TP/DP/CP ranks, which equals the global fraction when every microbatch has the same
+        number of valid tokens.
+        """
+        if not (self.training and torch.is_grad_enabled()):
+            return
+        fraction = dropped_token_fraction(routing_map, dropped_routing_map, padding_mask)
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+        layer_number = (
+            self.layer_number + self.config.num_layers if self.is_mtp_layer else self.layer_number
+        )
+        save_to_aux_losses_tracker(
+            "dropped_token_fraction",
+            fraction,
+            layer_number,
+            num_layers,
+            avg_group=self.tp_dp_cp_group,
+        )
+
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """Top-k routing function
 
@@ -876,10 +1017,13 @@ class TopKRouter(Router):
         logits = self.apply_z_loss(logits, padding_mask=padding_mask)
 
         # Calculate probs and routing_map for token dispatching
+        drop_priority = None
         if self.routing_type == "sinkhorn":
             probs, routing_map = self.sinkhorn_load_balancing(logits)
         elif "quantile_balancing" in self.routing_type:
-            probs, routing_map = self.quantile_balancing(logits, padding_mask=padding_mask)
+            probs, routing_map, drop_priority = self.quantile_balancing(
+                logits, padding_mask=padding_mask
+            )
         else:
             probs, routing_map = topk_routing_with_score_function(
                 logits,
@@ -916,6 +1060,7 @@ class TopKRouter(Router):
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
+            dropless_routing_map = routing_map
             probs, routing_map = apply_router_token_dropping(
                 probs,
                 routing_map,
@@ -923,7 +1068,10 @@ class TopKRouter(Router):
                 capacity_factor=self.config.moe_expert_capacity_factor,
                 drop_policy=self.config.moe_token_drop_policy,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+                drop_priority=drop_priority,
+                padding_mask=padding_mask,
             )
+            self._log_dropped_token_fraction(dropless_routing_map, routing_map, padding_mask)
 
         # Apply each aux loss type and attach aux loss autograd function to probs
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
@@ -1037,6 +1185,13 @@ class TopKRouter(Router):
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
 
+        log_router_input = router_input_logging.is_active() and self.layer_number is not None
+        if log_router_input:
+            layer_index = self.layer_number - 1
+            if getattr(self, "is_mtp_layer", False):
+                layer_index += self.config.num_layers
+            router_input_logging.record(layer_index, input, logits, padding_mask)
+
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
@@ -1048,6 +1203,12 @@ class TopKRouter(Router):
             )
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
+
+        if log_router_input:
+            # Selected-expert statistics: the raw logits that actually feed the gates.
+            router_input_logging.record_selected(
+                layer_index, logits, probs, routing_map, padding_mask
+            )
 
         return probs, routing_map
 
@@ -1123,6 +1284,7 @@ class InferenceTopKRouter(TopKRouter):
         router_replay,
         dense_output,
         precomputed_indices,
+        sigmoid_normalization_epsilon=1e-20,
     ):
         return topk_routing_with_score_function(
             logits,
@@ -1137,6 +1299,7 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=router_replay,
             dense_output=dense_output,
             precomputed_indices=precomputed_indices,
+            sigmoid_normalization_epsilon=sigmoid_normalization_epsilon,
         )
 
     def _forward(self, input: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -1146,7 +1309,9 @@ class InferenceTopKRouter(TopKRouter):
         precomputed_indices = None
         if self.qb_beta is not None:
             logits_fp32 = logits.to(dtype=torch.float32)
-            if self.config.moe_router_quantile_balancing_method == 'legacy_average':
+            if self.config.moe_router_quantile_balancing_method in (
+                'legacy_average', 'marin_histogram', 'marin_exact'
+            ):
                 qb_scores = logits_fp32
             elif self.score_function == "sigmoid":
                 qb_scores = torch.sigmoid(logits_fp32)
@@ -1169,6 +1334,12 @@ class InferenceTopKRouter(TopKRouter):
             router_replay=self.router_replay,
             dense_output=True,
             precomputed_indices=precomputed_indices,
+            sigmoid_normalization_epsilon=(
+                1e-9 if self.qb_beta is not None
+                and self.config.moe_router_quantile_balancing_method
+                in ('marin_histogram', 'marin_exact')
+                else 1e-20
+            ),
         )
         return probs.squeeze(1), top_indices.squeeze(1)
 

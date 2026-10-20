@@ -60,6 +60,15 @@ class TrainingConfig:
     exit_interval: int | None = None
     """Exit the program after the iteration is divisible by this value."""
 
+    exit_on_tranche_end: bool = False
+    """Build one pass through the training data, checkpoint and exit at its last full global batch.
+    Preserves the full-run training budget and learning-rate schedule."""
+
+    tranche_start_samples: int | None = None
+    """Global consumed-sample counter at the start of this tranche. Requires exit_on_tranche_end.
+    When omitted, read tranche_end.txt from the checkpoint directory; fall back to the
+    existing phase-transition offset, or zero for the first tranche."""
+
     exit_duration_in_mins: int | None = None
     """Exit the program after this many minutes."""
 
@@ -227,6 +236,20 @@ class LoggerConfig:
 
     muon_log_interval: int | None = None
     """Muon logging interval. Defaults to log_interval when unset."""
+
+    router_update_log_interval: int | None = None
+    """If set, every N steps log per-layer MoE router update statistics: the per-expert relative
+    update ||dW_i|| / ||W_i||, the row rotation angle, and the row norm change. Costs one router
+    weight copy and one small all-reduce on logged steps. Disabled when unset."""
+
+    router_input_log_interval: int | None = None
+    """If set, every N steps log per-layer MoE router-input statistics (per-token input norm,
+    largest input channel and its pre-MLP RMSNorm gain, channel concentration, logsumexp
+    distribution) and the pre-MLP RMSNorm gain statistics. Disabled when unset."""
+
+    router_diag_layers: list[int] | None = None
+    """0-based global layer indices to restrict router-input / RMSNorm-gain logging to (e.g. 3).
+    All layers when unset."""
 
     muon_sparsity_thresholds: list[float] = field(
         default_factory=lambda: [1e-20, 1e-10, 1e-30]

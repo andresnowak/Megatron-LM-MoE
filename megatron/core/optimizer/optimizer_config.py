@@ -328,6 +328,16 @@ class OptimizerConfig:
     muon/dist_muon (the Muon-managed matrices; the scalar Adam/Lion group stays on --lr).
     Overrides muon_lr_factor * lr."""
 
+    router_lr: Optional[float] = None
+    """Absolute LR for MoE router weights under md_decoupling, on either the Muon or the Adam
+    branch. When unset, Muon-branch routers use the matrix LR and Adam-branch routers use the
+    base --lr."""
+
+    router_weight_decay: Optional[float] = None
+    """Decoupled weight decay for MoE router weights under md_decoupling, independent of
+    --weight-decay. Requires a non-hypersphere router (--hypersphere-router-mode none): the
+    post-step hypersphere projection would undo it. When unset, routers use the global decay."""
+
     embedding_lr_multiplier: Optional[float] = None
     """LR multiplier for embedding (and tied LM-head) params under md_decoupling. Final
     max_lr = embedding_lr_multiplier * lr. When unset, those params use the base --lr."""
