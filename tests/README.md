@@ -138,6 +138,26 @@ passing coverage. Phase logs use `prod.node-*.{out,err}` and
 `experimental.node-*.{out,err}`. Compiler-cache isolation does not
 isolate UCCL proxy state between cases in the same pytest process.
 
+### Unit fixtures
+
+NVIDIA's public v2.5 unit datasets and tokenizers are already installed at
+`/capstor/store/cscs/swissai/infra01/megatron-test-assets/unit-tests/`, alongside
+`source.json` and `SHA256SUMS`. The launcher copies them to
+`$LOG_DIR/unit-test-data` and mounts that **writable copy** at `/opt/data`.
+The shared source fixtures are never modified.
+
+Only when provisioning a **different, empty asset root**, download the fixtures
+(about 13 MB compressed) once inside the test container:
+
+```bash
+ASSET_ROOT="$SCRATCH/tmp/my-test-assets"
+source tests/test_utils/setup_environment.sh
+uv run --no-project --python "$PYTHON_BIN" python tests/test_utils/python_scripts/download_unit_tests_dataset.py \
+    --assets-dir "$ASSET_ROOT/unit-tests"
+```
+
+Then set `DATA_PATH="$ASSET_ROOT"` for runs using that alternate root.
+
 ## Functional tests
 
 ```bash
@@ -214,6 +234,40 @@ bash tests/run_tests.sh functional hybrid_mr_mcore_te_tp1_pp1_cp1_dgx_a100_1N8G
 Use `functional --list` with the appropriate recipe to see the other included
 configurations. These examples are functional test workloads, not a claim that
 all recipe entries currently pass.
+
+### GPT data
+
+The shared GPT data is **already prepared** at the default Capstor `DATA_PATH`;
+do not rebuild it for normal test runs. Only when provisioning a new asset root,
+run this once inside the test container:
+
+```bash
+DATA_ROOT="$SCRATCH/tmp/my-test-assets" \
+bash tools/common_pile_dataset/prepare_gpt_ci_data.sh
+```
+
+The [Alps launch example](../tools/common_pile_dataset/README.md#prepare-data-on-cscs-alps)
+has the full provisioning procedure. Test runs reuse the existing assets.
+
+| Property | Value |
+| --- | --- |
+| Source | `common-pile/comma_v0.1_training_dataset` |
+| Preparation | NVIDIA production settings; 12 million documents; GPT only |
+| Tokenizer | GPT-2 BPE |
+| Storage estimate | 24 GB final; 70–80 GB during streaming preparation |
+| Provenance | Source revisions, preparation settings, output checksums |
+
+```text
+/capstor/store/cscs/swissai/infra01/megatron-test-assets/
+└── text/common_pile/v01_filtered_data/
+    ├── my-gpt3_00_text_document.bin
+    ├── my-gpt3_00_text_document.idx
+    └── bpe/{vocab.json,merges.txt}
+```
+
+Numerical baselines depend on the exact data,
+config, image, and topology; matching preparation settings alone does not establish
+identical NVIDIA fixtures. Generated checkpoints and dataset caches stay in scratch.
 
 ## Updating Functional Test Golden Values
 
