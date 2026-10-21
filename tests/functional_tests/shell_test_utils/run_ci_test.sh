@@ -29,6 +29,11 @@ for ARGUMENT in "$@"; do
 done
 set -x
 
+PYTHON_CMD=(uv run --no-sync python)
+if [[ -n ${PYTHON_BIN:-} ]]; then
+    PYTHON_CMD=(uv run --no-project --python "$PYTHON_BIN" python)
+fi
+
 # Check that mandatory vars are set
 MANDATORY_VARS=(
     "TRAINING_SCRIPT_PATH"
@@ -146,7 +151,7 @@ synchronize_nodes() {
 
     SYNC_STEP=$((SYNC_STEP + 1))
     local port=$(( ${MASTER_PORT:-6000} + 100 + SYNC_STEP ))
-    uv run --no-sync python - "$NODE_RANK" "$nodes" "${MASTER_ADDR:-localhost}" "$port" <<'PY'
+    "${PYTHON_CMD[@]}" - "$NODE_RANK" "$nodes" "${MASTER_ADDR:-localhost}" "$port" <<'PY'
 import sys
 from datetime import timedelta
 
@@ -297,7 +302,7 @@ for i in $(seq 1 $N_REPEAT); do
         # Read test values from Tensorboard for non-inference tests.
         # Inference tests will load from JSON instead.
         if [[ "$MODE" == "pretraining" && $NODE_RANK -eq 0 ]]; then
-            uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+            "${PYTHON_CMD[@]}" $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                 --logs-dir $TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
                 --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
@@ -331,12 +336,12 @@ for i in $(seq 1 $N_REPEAT); do
         if [[ "$MODE" == "pretraining" && ("$TRAINING_EXIT_CODE" -eq 0 || "$TEST_TYPE" == "release") ]]; then
             if [[ "$TEST_TYPE" == "checkpoint-consistency" ]]; then
                 echo "Running checkpoint consistency check"
-                uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/test_optimizer_grads_match.py "${ITER_CHECKPOINT_DIRS[@]}"
+                "${PYTHON_CMD[@]}" $ROOT_DIR/tests/functional_tests/python_test_utils/test_optimizer_grads_match.py "${ITER_CHECKPOINT_DIRS[@]}"
             else
                 ACTUAL_VALUES_PATH="$OUTPUT_PATH/$(basename "$GOLDEN_VALUES_PATH")"
                 REFERENCE_VALUES_PATH=$GOLDEN_VALUES_PATH
                 if [[ "$RECORD_BASELINE" == true ]]; then
-                    uv run --no-sync python - "$ACTUAL_VALUES_PATH" "$TRAINING_PARAMS_PATH" <<'PY'
+                    "${PYTHON_CMD[@]}" - "$ACTUAL_VALUES_PATH" "$TRAINING_PARAMS_PATH" <<'PY'
 import json
 import math
 import sys
@@ -362,7 +367,7 @@ PY
                     REFERENCE_VALUES_PATH=$ACTUAL_VALUES_PATH
                 fi
 
-                uv run --no-sync python -m pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
+                "${PYTHON_CMD[@]}" -m pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_regular_pipeline.py \
                     -o "cache_dir=$OUTPUT_PATH/pytest-cache" \
                     --junitxml "$OUTPUT_PATH/regular-repeat-$REPEAT.xml" \
                     --golden-values-path "$REFERENCE_VALUES_PATH" \
@@ -376,7 +381,7 @@ PY
                 fi
 
                 if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
-                    uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+                    "${PYTHON_CMD[@]}" $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                         --logs-dir $TENSORBOARD_PATH \
                         --train-iters $TRAIN_ITERS \
                         --output-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
@@ -384,7 +389,7 @@ PY
                         "${EXTRACT_ARGS[@]}"
                             
                     echo "Running pytest 1st vs 2nd run comparison"
-                    uv run --no-sync python -m pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
+                    "${PYTHON_CMD[@]}" -m pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_pretraining_resume_checkpoint_pipeline.py \
                         -o "cache_dir=$OUTPUT_PATH/pytest-cache" \
                         --junitxml "$OUTPUT_PATH/resume-repeat-$REPEAT.xml" \
                         --actual-values-first-run-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
@@ -399,7 +404,7 @@ PY
         # For inference jobs
         if [[ "$MODE" == "inference" && ("$TRAINING_EXIT_CODE" -eq 0 || "$TEST_TYPE" == "release") ]]; then
             if [[ "$TEST_TYPE" == "frozen-start" ]]; then
-                uv run --no-sync python -m pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
+                "${PYTHON_CMD[@]}" -m pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_inference_regular_pipeline.py \
                     -o "cache_dir=$OUTPUT_PATH/pytest-cache" \
                     --golden-values-path $GOLDEN_VALUES_PATH \
                     --test-values-path $INFERENCE_OUTPUT_PATH \
@@ -413,12 +418,12 @@ PY
             if [[ "$TEST_TYPE" == "frozen-start" ]]; then
                 TRAIN_ITERS=$(cat $TRAINING_PARAMS_PATH |
                     yq '.MODEL_ARGS."--exit-interval" // "50"')
-                uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
+                "${PYTHON_CMD[@]}" $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
                     --logs-dir $TENSORBOARD_PATH \
                     --train-iters $TRAIN_ITERS \
                     --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                     "${EXTRACT_ARGS[@]}"
-                uv run --no-sync python -m pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_grpo_training_loop.py \
+                "${PYTHON_CMD[@]}" -m pytest -s -o log_cli=true --log-cli-level=info $ROOT_DIR/tests/functional_tests/python_test_utils/test_grpo_training_loop.py \
                     -o "cache_dir=$OUTPUT_PATH/pytest-cache" \
                     --golden-values-path $GOLDEN_VALUES_PATH \
                     --test-values-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \

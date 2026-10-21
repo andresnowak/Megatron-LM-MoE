@@ -180,12 +180,17 @@ DISTRIBUTED_ARGS=(
     --redirects "3"
 )
 
+PYTHON_CMD=(uv run --no-sync python)
+if [[ -n ${PYTHON_BIN:-} ]]; then
+    PYTHON_CMD=(uv run --no-project --python "$PYTHON_BIN" python)
+fi
+
 # Start training
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
-    uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
+    "${PYTHON_CMD[@]}" -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
         --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 else
-    uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
+    "${PYTHON_CMD[@]}" -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}" \
         --no-python bash tests/test_utils/run_python_worker.sh \
         "$TRAINING_SCRIPT_PATH" "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
 fi
