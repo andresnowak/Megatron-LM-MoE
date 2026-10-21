@@ -1,6 +1,7 @@
 name: Alps test results
 run-name: >-
   Alps ${{ inputs.suite }}
+  · ${{ inputs.tested_pr && format('PR #{0} · ', inputs.tested_pr) || '' }}${{ inputs.tested_branch || 'unknown branch' }}
   · ${{ inputs.tested_sha }}
 
 on:
@@ -17,6 +18,14 @@ on:
         description: Full commit SHA from the test run
         required: true
         type: string
+      tested_branch:
+        description: Branch recorded by the test launcher; empty if unknown
+        required: false
+        type: string
+      tested_pr:
+        description: PR verified against the tested branch and commit; empty if unknown
+        required: false
+        type: string
       report:
         description: Compact JSON report from tests/publish_results.sh
         required: true
@@ -24,6 +33,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
   statuses: write
 
 jobs:
@@ -38,6 +48,8 @@ jobs:
           ALPS_REPORT: ${{ inputs.report }}
           ALPS_SUITE: ${{ inputs.suite }}
           ALPS_TESTED_SHA: ${{ inputs.tested_sha }}
+          ALPS_TESTED_BRANCH: ${{ inputs.tested_branch }}
+          ALPS_TESTED_PR: ${{ inputs.tested_pr }}
           POLICY_SHA: ${{ github.workflow_sha }}
         with:
           script: |
@@ -45,10 +57,13 @@ jobs:
             const path = require('path');
             const suite = process.env.ALPS_SUITE;
             const testedSha = process.env.ALPS_TESTED_SHA;
+            const testedBranch = process.env.ALPS_TESTED_BRANCH || '';
+            const testedPr = process.env.ALPS_TESTED_PR || '';
 
             if (
               !['unit', 'functional'].includes(suite) ||
-              !/^[a-f0-9]{40}$/i.test(testedSha)
+              !/^[a-f0-9]{40}$/i.test(testedSha) ||
+              (testedPr && (!testedBranch || !/^[1-9][0-9]*$/.test(testedPr)))
             ) {
               throw new Error('Invalid suite or tested commit');
             }
@@ -89,11 +104,25 @@ jobs:
                 report.sha !== testedSha ||
                 report.version !== 2 ||
                 report.policy_sha !== process.env.POLICY_SHA ||
+                (report.tested_branch || '') !== testedBranch ||
+                String(report.tested_pr || '') !== testedPr ||
+                (report.tested_pr != null &&
+                  (!Number.isSafeInteger(report.tested_pr) || report.tested_pr < 1)) ||
                 !Array.isArray(report.selections) ||
                 !report.selections.length ||
                 report.selections.length > 256
               ) {
                 throw new Error('Invalid report or stale policy revision');
+              }
+
+              if (testedPr) {
+                const {data: pr} = await github.rest.pulls.get({
+                  ...context.repo,
+                  pull_number: Number(testedPr),
+                });
+                if (pr.head.sha !== testedSha || pr.head.ref !== testedBranch) {
+                  throw new Error('PR does not match the tested branch and commit');
+                }
               }
 
               const trustedFile = async file => {
@@ -126,6 +155,8 @@ jobs:
                   ...functionalSelections(tree),
                 };
               }
+              report.repository = `${context.repo.owner}/${context.repo.repo}`;
+              report.workflow_ref = context.ref;
               const gate = evaluateReport(report, policy);
               const markdown = renderReport(report, gate);
 

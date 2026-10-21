@@ -285,12 +285,21 @@ function renderReport(report, gate) {
   } else if (gate.incomplete.length) {
     heading = 'Test coverage incomplete';
   }
+  const repository = report.repository || '';
+  const pr = report.tested_pr;
+  const prLabel = Number.isSafeInteger(pr) && pr > 0 &&
+    /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)
+    ? `[#${pr}](https://github.com/${repository}/pull/${pr})`
+    : 'not identified';
   const lines = [
     `# ${heading}`,
     '',
     `${gate.unexpected.length} new · ${gate.known.length} known · ${gate.fixed.length} fixed`,
     '',
     `Tested commit: ${report.sha}`,
+    `Tested branch: ${report.tested_branch ? `\`${escape(report.tested_branch)}\`` : 'unknown (not recorded)'}`,
+    `Pull request: ${prLabel}`,
+    `Reporting workflow ref: ${escape(report.workflow_ref || 'unknown')}`,
     '',
     '| Selection | Result | Tests/rank | New | Known | Fixed | Skips/rank | Ranks |',
     '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |',

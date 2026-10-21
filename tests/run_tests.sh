@@ -402,6 +402,7 @@ fi
 {
     echo "Source: $REPO_ROOT"
     echo "Commit: $(git -C "$REPO_ROOT" rev-parse HEAD)"
+    echo "Branch: $(git -C "$REPO_ROOT" branch --show-current)"
     echo "EDF: $ENVIRONMENT"
     echo "Job: $SLURM_JOB_ID"
     echo "Logs: $LOG_DIR"

@@ -79,14 +79,46 @@ def gh_json(*arguments):
     return json.loads(completed.stdout)
 
 
+def git_output(*arguments, optional=False):
+    completed = subprocess.run(
+        ["git", *arguments], cwd=REPO_ROOT, text=True, capture_output=True, timeout=15
+    )
+    if completed.returncode and not (optional and completed.returncode == 1):
+        completed.check_returncode()
+    return completed.stdout.strip()
+
+
+def configured_repository(branch):
+    keys = ["remote.pushDefault"]
+    if branch:
+        keys.insert(0, f"branch.{branch}.pushRemote")
+        keys.append(f"branch.{branch}.remote")
+    remote = ""
+    for key in keys:
+        remote = git_output("config", "--get", key, optional=True)
+        if remote:
+            break
+    if not remote or remote == ".":
+        remote = "origin"
+    return git_output("remote", "get-url", "--push", remote)
+
+
+def launch_value(directory, name):
+    path = directory / "launch.txt"
+    if not path.is_file():
+        return None
+    prefix = f"{name}: "
+    for line in path.read_text().splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].strip() or None
+    return None
+
+
 def tested_sha(directory, override):
     if override:
         sha = override
     elif (directory / "launch.txt").is_file():
-        lines = (directory / "launch.txt").read_text().splitlines()
-        sha = next(
-            (line.removeprefix("Commit: ") for line in lines if line.startswith("Commit: ")), ""
-        )
+        sha = launch_value(directory, "Commit") or ""
     else:
         raise ValueError("No launch.txt: supply --sha with the recorded tested commit")
     if not re.fullmatch(r"[0-9a-fA-F]{7,40}", sha):
@@ -262,6 +294,8 @@ def build_report(directory, results, suite, sha, policy=None, policy_sha=None, e
         "sha": sha,
         "environment": environment or result_environment(directory),
         "policy_sha": policy_sha,
+        "tested_branch": launch_value(directory, "Branch"),
+        "tested_pr": None,
         "selections": selections,
     }
 
@@ -276,9 +310,10 @@ def main():
     parser.add_argument(
         "--results", default="results.tsv", help="Ledger filename relative to directory"
     )
-    parser.add_argument("--repo", help="OWNER/REPO; defaults to the current GitHub repository")
+    parser.add_argument("--repo", help="OWNER/REPO; defaults to the branch's configured remote")
     parser.add_argument(
-        "--ref", help="Branch containing the workflow; defaults to the default branch"
+        "--ref",
+        help="Workflow branch; defaults to the current branch, or repository default if detached",
     )
     parser.add_argument(
         "--policy-ref",
@@ -301,18 +336,28 @@ def main():
         print("Preview only. No GitHub writes; use --publish to dispatch the reporting workflow.")
         return
 
-    repo_info = gh_json(
-        "repo",
-        "view",
-        *([args.repo] if args.repo else []),
-        "--json",
-        "nameWithOwner,defaultBranchRef",
-    )
+    branch = git_output("branch", "--show-current")
+    repository = args.repo or configured_repository(branch)
+    repo_info = gh_json("repo", "view", repository, "--json", "nameWithOwner,defaultBranchRef")
     repo = repo_info["nameWithOwner"]
     report["sha"] = gh_json("api", f"repos/{repo}/commits/{sha}")["sha"]
+    report["repository"] = repo
+    if report["tested_branch"]:
+        pulls = gh_json("api", f"repos/{repo}/commits/{report['sha']}/pulls?per_page=100")
+        matches = [
+            pr
+            for pr in pulls
+            if pr["head"]["sha"] == report["sha"]
+            and pr["head"]["ref"] == report["tested_branch"]
+        ]
+        if len(matches) == 1:
+            report["tested_pr"] = matches[0]["number"]
+    workflow_ref = args.ref or branch or repo_info["defaultBranchRef"]["name"]
     inputs = {
         "suite": report["suite"],
         "tested_sha": report["sha"],
+        "tested_branch": report["tested_branch"] or "",
+        "tested_pr": str(report["tested_pr"] or ""),
         "report": json.dumps(report, separators=(",", ":")),
     }
     if len(inputs["report"].encode()) > 5_000_000:
@@ -333,7 +378,7 @@ def main():
             "--repo",
             repo,
             "--ref",
-            args.ref or repo_info["defaultBranchRef"]["name"],
+            workflow_ref,
             "--json",
         ],
         input=payload,

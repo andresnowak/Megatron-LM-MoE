@@ -45,7 +45,7 @@ Set these before a command to override its defaults:
 | `UNIT_TEST_COLLECT_ONLY` | `false` | Collect unit tests without running their bodies |
 | `UNIT_TEST_FAIL_FAST` | `true` | Stop a unit-test phase at its first failure |
 | `UNIT_TEST_TIMEOUT` | `30` | Deadline in minutes for each unit production or experimental phase |
-| `UNIT_TEST_TRACE` | `false` | Dump Python stacks after 120 seconds in a test and retain NCCL timeout traces |
+| `UNIT_TEST_TRACE` | `false` | Log per-rank test transitions and session cleanup; dump Python stacks after 120 seconds in a test and retain NCCL timeout traces |
 | `UNIT_TEST_DISABLE_TRITON_NVLS` | `false` (`true` in GH200 EDF) | Select the public NCCL fallback in optimized dynamic-engine tests (retaining TP/SP/CUDA graphs) and skip NVLS-specific MoE buffer/collective tests. This is a profile switch, not automatic capability detection; NVLS kernels are not validated. |
 
 For example, choose the partition and save all results to a known directory:
@@ -135,7 +135,8 @@ Missing dependencies must be supplied by the image, not installed during a test 
 `COMPLETED` requires successful steps and all expected per-rank JUnit/exit markers;
 JUnit records test passes and skips. `TIMED_OUT` and `INCOMPLETE` never count as
 passing coverage. Phase logs use `prod.node-*.{out,err}` and
-`experimental.node-*.{out,err}`. Compiler-cache isolation does not
+`experimental.node-*.{out,err}`. Failures are printed immediately in per-rank stderr,
+without waiting for pytest's final summary. Compiler-cache isolation does not
 isolate UCCL proxy state between cases in the same pytest process.
 
 ### Unit fixtures
@@ -269,7 +270,7 @@ Numerical baselines depend on the exact data,
 config, image, and topology; matching preparation settings alone does not establish
 identical NVIDIA fixtures. Generated checkpoints and dataset caches stay in scratch.
 
-## Updating Functional Test Golden Values
+## Updating Functional Test Golden Values (NVIDIA only)
 
 When adding new functional tests, it may be necessary to update the golden values used to verify if the test is
 passing as expected.
@@ -285,3 +286,82 @@ passing as expected.
     e. Ensure you are only checking-in golden values for tests are you updating
 
 The Github CI infra may not be appropriate for Perf tests. Perf tests may be more appropriate for nightly jobs on other infra.
+
+## GitHub reports
+
+| Task | Location |
+| --- | --- |
+| Run tests | Alps, through Slurm |
+| View reports | GitHub Actions |
+| View commit status | Tested commit; links to the Actions run |
+| Keep full logs and checkpoints | Scratch |
+
+The [report workflow](../.github/workflows/alps-test-results.yml) uses the existing
+`gh` login on the cluster. It does not need SSH access to Alps. `--publish` sends
+saved results to GitHub; it does not run GPU tests.
+
+The target repository follows the current branch's push remote, then
+`remote.pushDefault`, then the branch's tracking remote. It falls back to `origin`
+if none is set. It uses that remote's push URL. Use `--repo` to select another
+repository.
+
+The workflow runs from the current publisher branch, or the repository's default
+branch for a detached checkout. Use `--ref` to select another workflow branch.
+That branch must contain the reporting workflow and its trusted policy.
+
+The tested commit and branch come from the run's `launch.txt`, not the publisher's
+current checkout. The publisher identifies a PR only when one associated PR has
+the same head commit and branch. The run title shows the suite, tested branch,
+PR number when identified, and tested SHA. The summary links to the PR and shows
+the reporting workflow ref separately. Old runs without branch metadata show an
+unknown branch and no PR association; the publisher does not guess. PR lookup
+runs only during publication. Offline previews show the recorded branch and SHA.
+Use a clean checkout to validate a PR commit: the SHA does not include local
+changes. Unit runs save tracked test changes in `test-changes.patch`.
+
+Run tests:
+
+```bash
+export LOG_DIR="$SCRATCH/tmp/megatron-unit-results"
+bash tests/run_tests.sh unit rl
+```
+
+Preview the report. This command does not change GitHub:
+
+```bash
+bash tests/publish_results.sh "$LOG_DIR" \
+    --suite unit
+```
+
+Send the report:
+
+```bash
+bash tests/publish_results.sh "$LOG_DIR" \
+    --suite unit \
+    --publish
+```
+
+Publish functional results through the same workflow:
+
+```bash
+bash tests/publish_results.sh "$LOG_DIR" \
+    --suite functional \
+    --publish
+```
+
+Both suites get colored status tables, JSON/Markdown artifacts and stable checks:
+`alps/unit/regressions` and `alps/functional/regressions`. Large reports are
+compressed for transport; downloaded artifacts remain ordinary JSON/Markdown.
+The publisher reads the tested commit from `launch.txt`, not the current checkout.
+
+| Option | Use |
+| --- | --- |
+| `--results FILE` | Read another results ledger |
+| `--sha SHA` | Set the recorded tested commit when `launch.txt` is absent |
+| `--repo OWNER/REPO` | Override the repository selected from Git configuration |
+| `--ref BRANCH` | Override the automatically selected workflow branch |
+
+Reports show outcomes, JUnit counts per rank and failing test IDs. They do not
+contain raw logs, tokens or checkpoints. Actions keeps the JSON and Markdown
+reports for 30 days. Candidates, blockers and incomplete runs are not green.
+These are runner results, not an independent numerical audit.
