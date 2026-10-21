@@ -28,6 +28,12 @@ def pytest_addoption(parser):
     )
 
 
+def pytest_sessionstart(session):
+    # Bind before collection can allocate CUDA tensors or cache capture streams.
+    if torch.cuda.is_available():
+        torch.cuda.set_device(int(os.environ.get('LOCAL_RANK', '0')))
+
+
 @pytest.fixture(autouse=True)
 def experimental(request):
     """Simple fixture setting the experimental flag [CPU | GPU]"""
