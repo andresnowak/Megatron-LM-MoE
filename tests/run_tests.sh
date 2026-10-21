@@ -335,7 +335,11 @@ fi
 
 : "${SCRATCH:?Set SCRATCH to an Iopsstor scratch directory}"
 
-LOG_DIR=${LOG_DIR:-$SCRATCH/tmp/megatron-tests-$(date +%Y%m%dT%H%M%S)-$$}
+DEFAULT_LOG_ROOT=$SCRATCH/tmp
+if [[ "$TEST_SUITE" == functional ]]; then
+    DEFAULT_LOG_ROOT=/ritom/scratch/cscs/$USER/tmp
+fi
+LOG_DIR=${LOG_DIR:-$DEFAULT_LOG_ROOT/megatron-tests-$(date +%Y%m%dT%H%M%S)-$$}
 mkdir -p "$LOG_DIR"
 LOG_DIR=$(realpath "$LOG_DIR")
 if [[ -n $(find "$LOG_DIR" -mindepth 1 -maxdepth 1 -print -quit) ]]; then

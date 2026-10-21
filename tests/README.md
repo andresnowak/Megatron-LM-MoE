@@ -41,12 +41,17 @@ Set these before a command to override its defaults:
 | `NODES` | `2` (or existing allocation size) | Number of nodes |
 | `TIME` | `05:00:00` | Allocation time limit |
 | `ENVIRONMENT` | `tests/test_utils/recipes/gh200/environment.toml` | Container environment (EDF) |
-| `LOG_DIR` | New directory under `$SCRATCH/tmp/` | Output directory for results, logs, JUnit and coverage |
+| `LOG_DIR` | New scratch directory; see below | Output directory for results, logs, JUnit and coverage |
 | `UNIT_TEST_COLLECT_ONLY` | `false` | Collect unit tests without running their bodies |
 | `UNIT_TEST_FAIL_FAST` | `true` | Stop a unit-test phase at its first failure |
 | `UNIT_TEST_TIMEOUT` | `30` | Deadline in minutes for each unit production or experimental phase |
 | `UNIT_TEST_TRACE` | `false` | Log per-rank test transitions and session cleanup; dump Python stacks after 120 seconds in a test and retain NCCL timeout traces |
 | `UNIT_TEST_DISABLE_TRITON_NVLS` | `false` (`true` in GH200 EDF) | Select the public NCCL fallback in optimized dynamic-engine tests (retaining TP/SP/CUDA graphs) and skip NVLS-specific MoE buffer/collective tests. This is a profile switch, not automatic capability detection; NVLS kernels are not validated. |
+
+Functional runs use `/ritom/scratch/cscs/$USER/tmp/` for their default output
+directory, including generated checkpoints and dataset caches. Unit runs use
+`$SCRATCH/tmp/`. Set `LOG_DIR` to select another location.
+Shared source assets stay at `DATA_PATH`.
 
 For example, choose the partition and save all results to a known directory:
 
