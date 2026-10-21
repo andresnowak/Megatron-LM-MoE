@@ -382,6 +382,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     config = core_gpt_dataset_config_from_args(args)
 
+    if args.exit_on_tranche_end:
+        train_blend = config.blend if config.blend is not None else config.blend_per_split[0]
+        if train_blend is None or train_blend[1] is not None:
+            raise ValueError('--exit-on-tranche-end requires an unweighted training data blend')
+
 
     is_packed_sequence = False
     if args.sft:

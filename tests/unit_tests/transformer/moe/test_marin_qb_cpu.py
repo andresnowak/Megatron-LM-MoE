@@ -152,6 +152,28 @@ class TestMarinQB(unittest.TestCase):
         _, indices = infer(router, logits)
         torch.testing.assert_close(indices, (logits - beta).topk(2, dim=1).indices)
 
+        # Tiny sigmoid scores expose the denominator epsilon; ordinary scores
+        # cannot distinguish 1e-9 from the previous 1e-20 normalization.
+        tiny = torch.tensor([[-25., -26., -27., -28.]], requires_grad=True)
+        train_weights, train_selected = route(router, tiny)
+        infer_weights, infer_indices = infer(router, tiny)
+        scores = tiny.sigmoid().gather(1, infer_indices)
+        expected_weights = 2.5 * scores / (scores.sum(-1, keepdim=True) + 1e-9)
+        torch.testing.assert_close(infer_weights, expected_weights)
+        torch.testing.assert_close(train_weights.gather(1, infer_indices), expected_weights)
+        self.assertTrue(torch.equal(train_selected.nonzero()[:, 1], infer_indices.flatten()))
+        self.assertLess(infer_weights.sum().item(), 0.1)
+        train_weights.sum().backward()
+        self.assertTrue(torch.isfinite(tiny.grad).all())
+        self.assertGreater(tiny.grad.abs().sum().item(), 0.)
+
+        # Other callers retain the original epsilon by default.
+        default_weights, _ = combine(
+            tiny.detach(), 2, score_function="sigmoid", scaling_factor=2.5,
+            precomputed_indices=infer_indices, dense_output=True,
+        )
+        torch.testing.assert_close(default_weights.sum(), torch.tensor(2.5))
+
     def test_step_boundary_weighted_average_and_centering(self):
         ns = {"torch": torch, "List": List, "Optional": Optional,
               "TransformerConfig": SimpleNamespace,

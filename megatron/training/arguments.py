@@ -863,8 +863,9 @@ def validate_args(args, defaults={}):
 
     if args.overlap_param_gather:
         assert args.use_distributed_optimizer or args.use_megatron_fsdp \
-            or args.optimizer == 'dist_muon', \
-            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
+            or args.optimizer == 'dist_muon' \
+            or (args.optimizer == 'md_decoupling' and args.use_layer_wise_distributed_optimizer), \
+            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, dist_muon, or md_decoupling with the layer-wise distributed optimizer'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
@@ -1027,6 +1028,23 @@ def validate_args(args, defaults={}):
 
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
+
+    if args.exit_on_tranche_end:
+        assert args.save, '--exit-on-tranche-end requires --save'
+        assert args.dataloader_type == 'single', '--exit-on-tranche-end requires --dataloader-type single'
+        assert not args.rampup_batch_size, '--exit-on-tranche-end requires a fixed global batch size'
+        assert not args.decrease_batch_size_if_needed, '--exit-on-tranche-end does not support decreased batch sizes'
+        assert not args.mock_data and not args.perform_rl_step and not args.sft, (
+            '--exit-on-tranche-end requires a finite GPT pretraining dataset'
+        )
+        assert not args.skip_train, '--exit-on-tranche-end cannot be used with --skip-train'
+        assert args.rerun_strategy != 'skip_iteration', (
+            '--exit-on-tranche-end requires replaying the same batch, not --rerun-strategy skip_iteration'
+        )
+    if args.tranche_start_samples is not None:
+        assert args.exit_on_tranche_end and args.tranche_start_samples >= 0, (
+            '--tranche-start-samples requires --exit-on-tranche-end and a nonnegative offset'
+        )
 
     # data
     assert args.num_dataset_builder_threads > 0

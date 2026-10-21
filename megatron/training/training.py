@@ -56,6 +56,11 @@ import torch.distributed
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from .log_handler import CustomHandler
+from .tranche import (
+    resolve_tranche_start, tranche_end_samples, tranche_finished,
+    tranche_identity, write_tranche_end,
+)
+from .utils import get_blend_and_blend_per_split
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
@@ -2403,6 +2408,9 @@ def training_log(
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
+        if args.moe_router_quantile_balancing_method == 'marin_exact':
+            # Recorded once per optimizer step (scaled by num_microbatches at the source).
+            track_names.extend(['qb_exact_nonfinite_tokens', 'qb_exact_update_skipped'])
         if "aux_loss" in args.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
         if "seq_aux_loss" in args.moe_router_load_balancing_type:
@@ -2926,6 +2934,25 @@ def checkpoint_and_decide_exit(
     args = get_args()
     timers = get_timers()
 
+    if tranche_finished(
+        args.exit_on_tranche_end,
+        getattr(args, 'tranche_end_consumed_samples', None),
+        args.consumed_train_samples,
+    ):
+        # Handle this before interval saves: exactly one persistent checkpoint,
+        # even when the boundary coincides with a non-persistent save interval.
+        save_checkpoint_and_time(
+            iteration, model, optimizer, opt_param_scheduler,
+            num_floating_point_operations_so_far, checkpointing_context,
+            train_data_iterator=train_data_iterator,
+        )
+        print_datetime(
+            f'[TRANCHE-END] checkpointed iteration {iteration}; exiting at '
+            f'{args.consumed_train_samples} consumed samples'
+        )
+        args.tranche_completed = True
+        return True
+
     # Exit based on signal handler.
     saved_checkpoint = False
     if args.exit_signal_handler:
@@ -3331,6 +3358,19 @@ def train(
     # Run training iterations till done.
     buffered_rollouts = None
     while iteration < args.train_iters:
+        # A resumed checkpoint may already be at the end, or fewer than one
+        # global batch may remain. Never let a pipeline rank fetch past it.
+        if tranche_finished(
+            args.exit_on_tranche_end,
+            getattr(args, 'tranche_end_consumed_samples', None),
+            args.consumed_train_samples,
+        ):
+            should_exit = checkpoint_and_decide_exit(
+                model, optimizer, opt_param_scheduler, iteration,
+                num_floating_point_operations_so_far, checkpointing_context,
+                train_data_iterator,
+            )
+            break
         if (args.profile 
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
@@ -3730,6 +3770,23 @@ def train(
     maybe_finalize_async_save(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
+    if getattr(args, 'tranche_completed', False):
+        # Publish only after async checkpoint finalization. Propagate filesystem
+        # failures to every rank rather than leaving a partially successful exit.
+        marker_status = [None]
+        if torch.distributed.get_rank() == 0:
+            try:
+                write_tranche_end(
+                    args.save, args.tranche_id, args.tranche_start_samples,
+                    args.consumed_train_samples, iteration,
+                )
+            except Exception as error:
+                marker_status[0] = str(error)
+        torch.distributed.broadcast_object_list(marker_status, src=0)
+        if marker_status[0] is not None:
+            raise RuntimeError(f'Failed to write tranche completion marker: {marker_status[0]}')
+        print_rank_0(f'[TRANCHE-END] completion marker: {args.save}/tranche_end.txt')
+
     if args.log_energy:
         energy_monitor.lap()
         total_energy = energy_monitor.get_total()
@@ -4037,7 +4094,11 @@ def get_train_valid_test_num_samples():
     test_samples = args.eval_iters * args.global_batch_size
 
     # Get train_samples in current phase.
-    if args.phase_transition_iterations:
+    if args.exit_on_tranche_end:
+        # None tells the GPT/blended dataset builder to build exhaustive,
+        # single-epoch indices rather than repeat data to fill the run budget.
+        train_samples_in_current_phase = None
+    elif args.phase_transition_iterations:
         phase_transition_samples = [0] + [t * args.global_batch_size for t in args.phase_transition_iterations] + [args.train_samples]
         current_sample = args.iteration * args.global_batch_size
         last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
@@ -4089,6 +4150,23 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     else:
         consumed_train_samples_in_current_phase = args.consumed_train_samples
 
+    if args.exit_on_tranche_end:
+        blend, blend_per_split = get_blend_and_blend_per_split(args)
+        train_blend = blend if blend is not None else blend_per_split[0]
+        args.tranche_id = tranche_identity(train_blend[0], args.split if blend is not None else None)
+        args.tranche_start_samples = resolve_tranche_start(
+            args.load or args.save, args.tranche_id, args.consumed_train_samples,
+            explicit_start=args.tranche_start_samples,
+            fallback_start=args.consumed_train_samples - consumed_train_samples_in_current_phase,
+        )
+        consumed_train_samples_in_current_phase = (
+            args.consumed_train_samples - args.tranche_start_samples
+        )
+        if consumed_train_samples_in_current_phase < 0:
+            raise ValueError('--tranche-start-samples exceeds the checkpoint consumed-sample counter')
+
+    tranche_size = -1
+
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
 
@@ -4109,10 +4187,17 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             # Build datasets.
             train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+            if args.exit_on_tranche_end and train_ds is not None:
+                tranche_size = len(train_ds)
             if args.skip_train:
                 train_dataloader = None
             else:
-                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+                loader_consumed = consumed_train_samples_in_current_phase
+                if args.exit_on_tranche_end and tranche_size > 0 and loader_consumed >= tranche_size:
+                    # The sampler requires consumed < total. This iterator will
+                    # never be fetched: the train-loop boundary check exits first.
+                    loader_consumed = 0
+                train_dataloader = build_pretraining_data_loader(train_ds, loader_consumed)
             valid_dataloaders = []
             for valid_d in valid_ds:
                 if args.skip_train or args.full_validation:
@@ -4131,12 +4216,26 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
             do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
 
         flags = torch.tensor(
-            [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
+            [int(do_train), int(do_valid), int(do_test), tranche_size], dtype=torch.long, device='cuda'
         )
     else:
-        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+        flags = torch.tensor([0, 0, 0, -1], dtype=torch.long, device='cuda')
 
     torch.distributed.broadcast(flags, 0)
+
+    if args.exit_on_tranche_end:
+        # PP/TP ranks without a local dataset must share the same stop decision.
+        tranche_size = int(flags[3].item())
+        args.tranche_end_consumed_samples = tranche_end_samples(
+            tranche_size, consumed_train_samples_in_current_phase,
+            args.consumed_train_samples, args.global_batch_size,
+        )
+        tail = max(0, tranche_size - consumed_train_samples_in_current_phase) % args.global_batch_size
+        print_rank_0(
+            f'[TRANCHE] samples={tranche_size}, consumed_in_tranche='
+            f'{consumed_train_samples_in_current_phase}, stop_consumed_samples='
+            f'{args.tranche_end_consumed_samples}, unused_tail_samples={tail}'
+        )
 
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
