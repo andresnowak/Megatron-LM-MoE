@@ -326,6 +326,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_router_inference_violation_metrics": [],
     "moe_router_log_z_loss": False,
     "moe_router_quantile_balancing_ema": 0.0,
+    "moe_router_quantile_balancing_marin_exact_store": "cpu",
     "moe_router_quantile_balancing_marin_num_bins": 10000,
     "moe_router_quantile_balancing_method": "histogram",
     "moe_router_quantile_balancing_num_bins": 1000,
