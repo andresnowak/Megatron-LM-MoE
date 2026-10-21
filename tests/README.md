@@ -42,6 +42,7 @@ Set these before a command to override its defaults:
 | `TIME` | `05:00:00` | Allocation time limit |
 | `ENVIRONMENT` | `tests/test_utils/recipes/gh200/environment.toml` | Container environment (EDF) |
 | `LOG_DIR` | New scratch directory; see below | Output directory for results, logs, JUnit and coverage |
+| `PUBLISH_RESULTS` | `false` | Dispatch the GitHub report workflow after a unit or functional run |
 | `UNIT_TEST_COLLECT_ONLY` | `false` | Collect unit tests without running their bodies |
 | `UNIT_TEST_FAIL_FAST` | `true` | Stop a unit-test phase at its first failure |
 | `UNIT_TEST_TIMEOUT` | `30` | Deadline in minutes for each unit production or experimental phase |
@@ -330,6 +331,23 @@ Run tests:
 export LOG_DIR="$SCRATCH/tmp/megatron-unit-results"
 bash tests/run_tests.sh unit rl
 ```
+
+Run tests and publish their results automatically:
+
+```bash
+PUBLISH_RESULTS=true bash tests/run_tests.sh unit all
+PUBLISH_RESULTS=true bash tests/run_tests.sh functional all
+```
+
+This option supports both suites and individual selections. It uses the
+publisher's repository and workflow branch defaults. The launcher host requires
+`gh`, `uv`, and a GitHub login with workflow-dispatch permission. The reporting
+branch must be pushed before the run.
+
+Results are published on exit, including failed or blocked runs. Test failures
+keep their exit code. If tests pass but dispatch fails, the launcher returns the
+dispatch error. It does not wait for the workflow to finish. Forced termination
+can prevent publication; saved results can be published separately.
 
 Preview the report. This command does not change GitHub:
 

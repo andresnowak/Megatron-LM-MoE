@@ -15,6 +15,7 @@ usage() {
     echo "          UNIT_TEST_COLLECT_ONLY=true checks unit collection without running tests"
     echo "          UNIT_TEST_FAIL_FAST=false continues tests and marker phases after failures"
     echo "          UNIT_TEST_TIMEOUT=30 bounds each unit marker phase in minutes"
+    echo "          PUBLISH_RESULTS=true dispatches a GitHub report after either suite"
     echo "Dependencies and tools are used directly from the test image."
     echo "NODES is the allocation size. Each node has four GH200 GPUs."
 }
@@ -292,6 +293,19 @@ run_groups() {
     return "$suite_exit_code"
 }
 
+publish_results_on_exit() {
+    local test_code=$? publish_code=0
+    bash "$REPO_ROOT/tests/publish_results.sh" "$LOG_DIR" \
+        --suite "$TEST_SUITE" --publish || publish_code=$?
+    if (( publish_code != 0 )); then
+        echo "GitHub report dispatch failed (exit $publish_code); results remain in $LOG_DIR" >&2
+    fi
+    if (( test_code != 0 )); then
+        exit "$test_code"
+    fi
+    exit "$publish_code"
+}
+
 case "${1:-}" in
     --help)
         usage
@@ -335,6 +349,20 @@ fi
 
 : "${SCRATCH:?Set SCRATCH to an Iopsstor scratch directory}"
 
+export PUBLISH_RESULTS=${PUBLISH_RESULTS:-false}
+if [[ "$PUBLISH_RESULTS" != true && "$PUBLISH_RESULTS" != false ]]; then
+    echo "PUBLISH_RESULTS must be true or false" >&2
+    exit 1
+fi
+if [[ "$PUBLISH_RESULTS" == true ]]; then
+    for tool in gh uv; do
+        if ! command -v "$tool" >/dev/null; then
+            echo "PUBLISH_RESULTS=true requires $tool on the launcher host" >&2
+            exit 1
+        fi
+    done
+fi
+
 DEFAULT_LOG_ROOT=$SCRATCH/tmp
 if [[ "$TEST_SUITE" == functional ]]; then
     DEFAULT_LOG_ROOT=/ritom/scratch/cscs/$USER/tmp
@@ -360,6 +388,13 @@ fi
 if [[ "$TEST_SUITE" == functional ]] && ! has_runnable_functional_case; then
     mkdir "$LOG_DIR/.run-lock"
     cp "$RECIPE" "$LOG_DIR/recipe.yaml"
+    if [[ "$PUBLISH_RESULTS" == true ]]; then
+        {
+            echo "Commit: $(git -C "$REPO_ROOT" rev-parse HEAD)"
+            echo "Branch: $(git -C "$REPO_ROOT" branch --show-current)"
+        } > "$LOG_DIR/launch.txt"
+        trap publish_results_on_exit EXIT
+    fi
     run_groups
     exit
 fi
@@ -431,4 +466,7 @@ if [[ $(realpath "$ENVIRONMENT") != "$LOG_DIR/environment.toml" ]]; then
     cp "$ENVIRONMENT" "$LOG_DIR/environment.toml"
 fi
 
+if [[ "$PUBLISH_RESULTS" == true ]]; then
+    trap publish_results_on_exit EXIT
+fi
 run_groups
