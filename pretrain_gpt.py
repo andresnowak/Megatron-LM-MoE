@@ -27,6 +27,7 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.doc_aware_cp import get_doc_aware_batch_on_this_cp_rank
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.models.gpt import GPTModel
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import (
@@ -156,6 +157,22 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 local_multiple=16 if args.fp8 else 1,
             )
             cu_seqlens_padded = cu_seqlens
+
+    # For middle pipeline stages with packed sequences, only cu_seqlens and
+    # max_seqlen plus any MoE padding mask are needed; skip the full batch.
+    # Without CP this is main's path; with CP the stages need the padded layout below.
+    if (
+        not is_first_last
+        and is_packed_sequence
+        and parallel_state.get_context_parallel_world_size() == 1
+    ):
+        return None, None, None, None, None, batch.get('padding_mask'), PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=int(max_seqlen[0].item()),
+            max_seqlen_kv=int(max_seqlen[0].item()),
+            qkv_format='thd',
+        )
 
     if cu_seqlens is None and local_cp_size is None:
         # slice batch along sequence dimension for context parallelism

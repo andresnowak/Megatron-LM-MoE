@@ -1343,8 +1343,9 @@ class KimiDeltaAttention(GatedDeltaNet):
             kda_kwargs["cp_context"] = cp_context
         elif cu_seqlens is not None:
             kda_kwargs["cu_seqlens"] = cu_seqlens
-            if _KDA_SUPPORTS_CU_SEQLENS_CPU:
-                # Lets FLA build its chunk index without a device sync.
+            if _KDA_SUPPORTS_CU_SEQLENS_CPU and self.cp_size > 1:
+                # Lets FLA build its chunk index without a device sync (CP only, so the
+                # CP=1 path stays exactly main's).
                 kda_kwargs["cu_seqlens_cpu"] = self._cu_seqlens_cpu_for(cu_seqlens)
 
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
