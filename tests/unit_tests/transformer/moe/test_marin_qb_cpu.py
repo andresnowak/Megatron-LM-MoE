@@ -155,7 +155,7 @@ class TestMarinQB(unittest.TestCase):
         # Tiny sigmoid scores expose the denominator epsilon; ordinary scores
         # cannot distinguish 1e-9 from the previous 1e-20 normalization.
         tiny = torch.tensor([[-25., -26., -27., -28.]], requires_grad=True)
-        train_weights, train_selected = route(router, tiny)
+        train_weights, train_selected, _ = route(router, tiny)
         infer_weights, infer_indices = infer(router, tiny)
         scores = tiny.sigmoid().gather(1, infer_indices)
         expected_weights = 2.5 * scores / (scores.sum(-1, keepdim=True) + 1e-9)
