@@ -126,39 +126,12 @@
           ]
         },
         {
-          "selection": "checkpoint-optimizer",
-          "test_id": "tests.unit_tests.dist_checkpointing.test_optimizer.TestOptimizer::test_optimizer_custom_state_sharding",
-          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
-          "blocking": true,
-          "error_signatures": [
-            "torch.distributed.DistNetworkError: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?"
-          ]
-        },
-        {
-          "selection": "checkpoint-optimizer",
-          "test_id": "tests.unit_tests.dist_checkpointing.test_optimizer.TestOptimizer::test_optimizer_params",
-          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
-          "blocking": true,
-          "error_signatures": [
-            "RuntimeError: Gloo connectFullMesh failed with [/opt/pytorch/pytorch/third_party/gloo/gloo/transport/tcp/pair.cc:547] Connection closed by peer [<peer>]"
-          ]
-        },
-        {
           "selection": "checkpointing",
           "test_id": "tests.unit_tests.dist_checkpointing.test_async_save.TestAsyncSave::test_async_is_equivalent_to_sync[False-False]",
           "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
           "blocking": true,
           "error_signatures": [
             "OSError: [Errno 116] Stale file handle: '.metadata'"
-          ]
-        },
-        {
-          "selection": "data",
-          "test_id": "tests.unit_tests.data.test_builder::test_fast_builder[0.005-131072-True-True-True-True-False]",
-          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
-          "blocking": true,
-          "error_signatures": [
-            "OSError: [Errno 116] Stale file handle: 'dataset'"
           ]
         },
         {
@@ -189,40 +162,12 @@
           ]
         },
         {
-          "selection": "models",
-          "test_id": "tests.unit_tests.models.test_mamba_model.TestMambaModel::test_constructor",
-          "reason": "Optional Mamba backend is absent from the pinned image.",
-          "blocking": false,
-          "error_signatures": [
-            "ImportError: MambaSSM is not installed. Please install it with `pip install mamba-ssm`. when instantiating MambaMixer when instantiating MambaLayer when instantiating MambaStack"
-          ]
-        },
-        {
           "selection": "moe",
           "test_id": "::tests.unit_tests.transformer.moe.test_activation_offload",
           "reason": "Existing test imports the removed ActivationOffloadHandle API.",
           "blocking": false,
           "error_signatures": [
             "ImportError: cannot import name 'ActivationOffloadHandle' from 'megatron.core.transformer.moe.moe_offload' (<path>)"
-          ]
-        },
-        {
-          "selection": "pipeline",
-          "test_id": "tests.unit_tests.pipeline_parallel.test_pipeline_layout::test_forward_vpp[tp_pp_vpp2-pp_layout2-False-False]",
-          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
-          "blocking": true,
-          "error_signatures": [
-            "OSError: [Errno 116] Stale file handle: '.metadata'"
-          ]
-        },
-        {
-          "selection": "pipeline",
-          "test_id": "tests.unit_tests.pipeline_parallel.test_pipeline_layout::test_forward_vpp[tp_pp_vpp3-pp_layout3-True-False]",
-          "reason": "Pre-existing filesystem or distributed failure; cause unresolved and remains blocking.",
-          "blocking": true,
-          "error_signatures": [
-            "torch.distributed.DistBackendError: [2] is setting up NCCL communicator and retrieving ncclUniqueId from [0] via c10d key-value store by key '0', but store->get('0') got error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?",
-            "torch.distributed.DistBackendError: [3] is setting up NCCL communicator and retrieving ncclUniqueId from [0] via c10d key-value store by key '0', but store->get('0') got error: Failed to recv, got 0 bytes. Connection was likely closed. Did the remote server shutdown or crash?"
           ]
         },
         {
