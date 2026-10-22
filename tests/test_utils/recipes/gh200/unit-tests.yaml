@@ -27,7 +27,7 @@ products:
     test_case: [tests/unit_tests/models/**/*.py]
 
   - name: data
-    ranks: 8
+    ranks: 4
     test_case: [tests/unit_tests/data/**/*.py]
 
   - name: checkpoint-optimizer
