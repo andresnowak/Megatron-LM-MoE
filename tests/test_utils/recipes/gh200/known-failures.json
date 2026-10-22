@@ -11,7 +11,7 @@
       "pipeline-multimodule": 8,
       "pipeline-two-ranks": 2,
       "models": 8,
-      "data": 8,
+      "data": 4,
       "checkpoint-optimizer": 8,
       "checkpointing": 8,
       "checkpoint-models": 8,
