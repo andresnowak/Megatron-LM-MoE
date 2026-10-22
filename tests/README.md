@@ -356,6 +356,9 @@ bash tests/publish_results.sh "$LOG_DIR" \
     --suite unit
 ```
 
+Reports check only the groups or cases they contain. Unreported groups do not
+fail a report. Failures or incomplete results within reported groups still do.
+
 Send the report:
 
 ```bash
@@ -373,8 +376,10 @@ bash tests/publish_results.sh "$LOG_DIR" \
 ```
 
 Both suites get colored status tables, JSON/Markdown artifacts and stable checks:
-`alps/unit/regressions` and `alps/functional/regressions`. Large reports are
-compressed for transport; downloaded artifacts remain ordinary JSON/Markdown.
+`alps/unit/regressions` and `alps/functional/regressions` for full-suite reports.
+Selected reports use `alps/<suite>/selected`.
+Large reports are compressed for transport; downloaded artifacts remain ordinary
+JSON/Markdown.
 The publisher reads the tested commit from `launch.txt`, not the current checkout.
 
 | Option | Use |

@@ -214,6 +214,8 @@ function evaluateSelection(selection, policy, environment, suite) {
 function evaluateReport(report, policy) {
   if (
     policy.version !== 1 ||
+    !Array.isArray(report.selections) ||
+    !report.selections.length ||
     !Array.isArray(policy.scopes) ||
     !policy.required_selections[report.suite]
   ) {
@@ -224,11 +226,9 @@ function evaluateReport(report, policy) {
   const known = [];
   const fixed = [];
   const incomplete = [];
+  const warnings = [];
   const selections = [];
   const seen = new Set();
-  if (!policy.environments.includes(report.environment)) {
-    incomplete.push('Unknown test environment');
-  }
   for (const selection of report.selections) {
     if (!/^[A-Za-z0-9_.-]+$/.test(selection.name) || seen.has(selection.name)) {
       throw new Error('Invalid or duplicate selection');
@@ -250,8 +250,12 @@ function evaluateReport(report, policy) {
 
   const required = Object.keys(policy.required_selections[report.suite]);
   const missing = required.filter(name => !seen.has(name));
+  const scope = missing.length ? 'selected' : 'full';
+  if (!policy.environments.includes(report.environment)) {
+    (scope === 'selected' ? warnings : incomplete).push('Unknown test environment');
+  }
   if (missing.length) {
-    incomplete.push(`${missing.length} required selections not reported`);
+    warnings.push(`${missing.length} selections outside this report were not validated`);
   }
   let state = 'success';
   if (unexpected.length) {
@@ -261,6 +265,8 @@ function evaluateReport(report, policy) {
   }
   return {
     state,
+    scope,
+    warnings,
     unexpected,
     known,
     fixed,
@@ -279,7 +285,8 @@ function renderReport(report, gate) {
     FIXED: '🟢 **FIXED**',
   };
   const escape = value => String(value).replace(/[|<>`\r\n]/g, ' ');
-  let heading = 'No new regressions';
+  let heading = gate.scope === 'selected' && !gate.known.length
+    ? 'Selected tests passed' : 'No new regressions';
   if (gate.unexpected.length) {
     heading = `NEW / UNEXPECTED FAILURES: ${gate.unexpected.length}`;
   } else if (gate.incomplete.length) {
@@ -300,6 +307,7 @@ function renderReport(report, gate) {
     `Tested branch: ${report.tested_branch ? `\`${escape(report.tested_branch)}\`` : 'unknown (not recorded)'}`,
     `Pull request: ${prLabel}`,
     `Reporting workflow ref: ${escape(report.workflow_ref || 'unknown')}`,
+    `Report scope: ${gate.scope === 'selected' ? 'selected tests only; not full-suite validation' : 'full suite'}`,
     '',
     '| Selection | Result | Tests/rank | New | Known | Fixed | Skips/rank | Ranks |',
     '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |',
@@ -343,6 +351,12 @@ function renderReport(report, gate) {
     lines.push('', '## Fixed', '');
     for (const test of gate.fixed) {
       lines.push(`- ${escape(test.test_id)}`);
+    }
+  }
+  if (gate.warnings?.length) {
+    lines.push('', '## Scope and baseline warnings', '');
+    for (const warning of gate.warnings) {
+      lines.push(`- ${escape(warning)}`);
     }
   }
   if (gate.incomplete.length) {

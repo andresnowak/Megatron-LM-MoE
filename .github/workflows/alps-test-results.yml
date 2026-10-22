@@ -75,7 +75,8 @@ jobs:
               'actions/runs',
               context.runId,
             ].join('/');
-            const stableContext = `alps/${suite}/regressions`;
+            const runContext = `alps/${suite}/${context.runId}`;
+            let stableContext = runContext;
             const status = (state, description, name = stableContext) => {
               return github.rest.repos.createCommitStatus({
                 ...context.repo,
@@ -158,6 +159,8 @@ jobs:
               report.repository = `${context.repo.owner}/${context.repo.repo}`;
               report.workflow_ref = context.ref;
               const gate = evaluateReport(report, policy);
+              stableContext = gate.scope === 'selected'
+                ? `alps/${suite}/selected` : `alps/${suite}/regressions`;
               const markdown = renderReport(report, gate);
 
               for (const test of gate.unexpected.slice(0, 20)) {
@@ -178,11 +181,12 @@ jobs:
                 `${gate.known.length} known`,
                 `${gate.fixed.length} fixed`,
               ].join(', ');
-              const coverage = gate.incomplete.length ? '; coverage incomplete.' : '.';
+              const coverage = gate.incomplete.length ? '; selected coverage incomplete.'
+                : gate.scope === 'selected' ? '; selected tests only.' : '.';
               const description = counts + coverage;
 
               await status(gate.state, description);
-              await status(gate.state, description, `alps/${suite}/${context.runId}`);
+              await status(gate.state, description, runContext);
             } catch (error) {
               await status('error', 'Report could not be validated.');
               throw error;
