@@ -5,8 +5,6 @@ run-name: >-
   · ${{ inputs.tested_sha }}
 
 on:
-  push:
-    branches: [alps-unit-results-reporting]
   workflow_dispatch:
     inputs:
       suite:
@@ -40,7 +38,6 @@ permissions:
 
 jobs:
   report:
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
