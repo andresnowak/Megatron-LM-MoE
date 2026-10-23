@@ -1143,15 +1143,26 @@ def validate_args(args, defaults={}):
             '--dataloader-inter-document-masking and --sft both produce cu_seqlens; '
             'SFT packing already restricts attention to each packed sequence.'
         )
-        assert args.context_parallel_size == 1, (
-            '--dataloader-inter-document-masking does not support context parallelism '
-            'yet: document boundaries are not guaranteed to be divisible by '
-            '2 * context-parallel-size, which the THD CP partitioning requires.'
-        )
+        if args.context_parallel_size > 1 and args.pipeline_model_parallel_size > 1:
+            # Per-document CP padding makes the physical sequence length vary per microbatch.
+            args.variable_seq_lengths = True
         assert not args.hybrid_context_parallel, (
             '--dataloader-inter-document-masking does not support hybrid context '
             'parallelism yet.'
         )
+    if args.cp_doc_aware:
+        assert args.dataloader_inter_document_masking, (
+            '--cp-doc-aware needs --dataloader-inter-document-masking (packed THD batches).'
+        )
+        assert args.context_parallel_size > 1, '--cp-doc-aware needs --context-parallel-size > 1.'
+        assert args.micro_batch_size == 1, '--cp-doc-aware needs --micro-batch-size 1.'
+        assert args.cp_comm_type is None or all(
+            c in ('p2p', 'a2a') for c in (
+                args.cp_comm_type if isinstance(args.cp_comm_type, list) else [args.cp_comm_type]
+            )
+        ), '--cp-doc-aware supports --cp-comm-type p2p or a2a (TE THD CP).'
+        assert not args.mtp_num_layers, '--cp-doc-aware does not support multi-token prediction.'
+        assert not args.hybrid_context_parallel, '--cp-doc-aware replaces hybrid CP.'
 
     # TE's `auto` backend picks cuDNN fused attention for THD batches, which is much slower than
     # flash on the segment shapes BFD packing produces (whole documents). Only `auto` is overridden.
@@ -3553,6 +3564,19 @@ def _add_data_args(parser):
                        help='Return cu_seqlens marking document boundaries '
                        'within each sample so that attention is restricted '
                        'to individual documents.')
+    group.add_argument('--cp-doc-aware', action='store_true',
+                       help='Document-aware context parallelism (needs '
+                       '--dataloader-inter-document-masking): keep documents of at '
+                       'most --cp-doc-aware-max-local-len tokens whole on one CP rank '
+                       '(no CP communication for them) and split only the long ones '
+                       'over the CP group. See megatron/core/doc_aware_cp.py.')
+    group.add_argument('--cp-doc-aware-max-local-len', type=int, default=None,
+                       help='Longest document kept on one CP rank '
+                       '(default: seq_length / context_parallel_size).')
+    group.add_argument('--cp-doc-aware-max-padding', type=float, default=0.01,
+                       help='Largest padding, as a fraction of the sample, accepted to '
+                       'balance the local documents over the CP ranks before the '
+                       'largest one is split over the CP group instead.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')
