@@ -11,6 +11,7 @@ from megatron.core.parallel_state import (
 )
 
 from .utils import VocabUtility
+from megatron.core.transformer import output_logit_logging
 
 
 class VocabParallelCrossEntropy:
@@ -130,6 +131,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         torch.distributed.all_reduce(
             logits_max, op=torch.distributed.ReduceOp.MAX, group=get_tensor_model_parallel_group()
         )
+        diagnostic_margin = output_logit_logging.prepare_margin(
+            vocab_parallel_logits, get_tensor_model_parallel_group()
+        )
 
         # Get the partition's vocab indices
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
@@ -182,6 +186,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
             loss = (1.0 - smoothing) * loss - smoothing * mean_log_probs
 
         ctx.label_smoothing, ctx.vocab_size = label_smoothing, vocab_size
+        output_logit_logging.record_ce(logits_max, sum_exp_logits, loss, diagnostic_margin)
 
         # Store softmax, target-mask and masked-target for backward pass.
         ctx.save_for_backward(exp_logits, target_mask, masked_target_1d)

@@ -7,6 +7,7 @@ import torch
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.cross_entropy import VocabParallelCrossEntropy
 from megatron.core.tensor_parallel.utils import VocabUtility
+from megatron.core.transformer import output_logit_logging
 
 
 @jit_fuser
@@ -92,6 +93,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         """
         vocab_parallel_logits, logits_max = calculate_logits_max(vocab_parallel_logits)
         torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+        diagnostic_margin = output_logit_logging.prepare_margin(vocab_parallel_logits, tp_group)
 
         # Get the partition's vocab indices
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
@@ -114,6 +116,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         )
 
         exp_logits, loss = calculate_cross_entropy_loss(exp_logits, predicted_logits_sum_exp_logits)
+        if diagnostic_margin is not None:
+            sum_exp_logits = predicted_logits_sum_exp_logits.chunk(2, dim=0)[1]
+            output_logit_logging.record_ce(logits_max, sum_exp_logits, loss, diagnostic_margin)
 
         # Store softmax, target-mask and masked-target for backward pass.
         ctx.save_for_backward(exp_logits, target_mask, masked_target_1d)

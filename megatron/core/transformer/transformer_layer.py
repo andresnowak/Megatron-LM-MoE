@@ -18,6 +18,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer import activation_norm_logging
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
@@ -706,6 +707,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        activation_norm_logging.record(
+            self.layer_number - 1, "residual_input", hidden_states,
+            padding_mask, training=self.training and not self.is_mtp_layer,
+        )
+
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -755,6 +761,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
+
+        activation_norm_logging.record(
+            self.layer_number - 1, "attention_output", attention_output_with_bias[0],
+            padding_mask, attention_output_with_bias[1],
+            training=self.training and not self.is_mtp_layer,
+        )
 
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
@@ -967,6 +979,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
 
         nvtx_range_pop(suffix="mlp")
+
+        activation_norm_logging.record(
+            self.layer_number - 1, "mlp_output", mlp_output_with_bias[0],
+            padding_mask, mlp_output_with_bias[1],
+            training=self.training and not self.is_mtp_layer,
+        )
 
         if (
             self.is_moe_layer

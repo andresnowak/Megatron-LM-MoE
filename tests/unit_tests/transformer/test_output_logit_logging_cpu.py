@@ -1,0 +1,230 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Standalone CPU checks; no Megatron, TE, or CUDA imports.
+
+python tests/unit_tests/transformer/test_output_logit_logging_cpu.py
+"""
+
+import ast
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+import tempfile
+from typing import Tuple
+import unittest
+from unittest.mock import patch
+
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
+ROOT = Path(__file__).resolve().parents[3]
+spec = importlib.util.spec_from_file_location(
+    "output_logit_logging", ROOT / "megatron/core/transformer/output_logit_logging.py"
+)
+logging = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(logging)
+
+
+class SingleRank:
+    def rank(self):
+        return 0
+
+    def size(self):
+        return 1
+
+
+def extracted(path, name, namespace):
+    tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
+    node = next(n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name == name)
+    node.decorator_list = []
+    exec(compile(ast.Module(body=[node], type_ignores=[]), path, "exec"), namespace)
+    return namespace[name]
+
+
+def ce_implementation(fused):
+    """Execute the actual changed CE implementations, including backward."""
+    base = "megatron/core/tensor_parallel/cross_entropy.py"
+    ns = {
+        "torch": torch, "Tuple": Tuple, "output_logit_logging": logging,
+        "get_tensor_model_parallel_group": lambda: None,
+        "get_tensor_model_parallel_rank": lambda: 0,
+        "get_tensor_model_parallel_world_size": lambda: 1,
+        "VocabUtility": SimpleNamespace(
+            vocab_range_from_per_partition_vocab_size=lambda size, rank, world: (size * rank, size * (rank + 1))
+        ),
+    }
+    extracted(base, "VocabParallelCrossEntropy", ns)
+    if fused:
+        base = "megatron/core/fusions/fused_cross_entropy.py"
+        for name in ("calculate_logits_max", "calculate_predicted_logits", "calculate_cross_entropy_loss", "calculate_gradients"):
+            extracted(base, name, ns)
+    cls = extracted(base, "_VocabParallelCrossEntropy", ns)
+    return lambda x, y: cls.apply(x, y, SingleRank() if fused else 0.0)
+
+
+def observe(logits, loss_mask=None, group=None):
+    with logging.loss_scope(loss_mask):
+        margin = logging.prepare_margin(logits, group)
+        maximum = logits.max(-1).values
+        sum_exp = (logits - maximum.unsqueeze(-1)).exp().sum(-1)
+        target = logits[..., 0]
+        loss = sum_exp.log() + maximum - target
+        logging.record_ce(maximum, sum_exp, loss, margin)
+
+
+def worker(rank, rendezvous):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
+    groups = [dist.new_group([0]), dist.new_group([1])]
+    try:
+        # TP: global runner-up can be in another vocab shard, including a tie.
+        full = torch.tensor([[[10., 1., 9., 0.]], [[5., 0., 5., -1.]]])
+        logging.set_active(True)
+        with logging.forward_scope(), logging.loss_scope(None):
+            margin = logging.prepare_margin(full.chunk(2, -1)[rank], dist.group.WORLD)
+            if rank == 0:
+                torch.testing.assert_close(margin, torch.tensor([[1.], [0.]]))
+            maximum = full.max(-1).values
+            sums = (full - maximum.unsqueeze(-1)).exp().sum(-1)
+            logging.record_ce(maximum, sums, sums.log(), margin)
+        stats = logging.collect(torch.device("cpu"), dist.group.WORLD, groups[rank], True)
+        assert stats["output_logits/max"] == 10.0
+        assert abs(stats["output_logits/top1_top2_margin_p999"] - 0.999) < 1e-7
+
+        # DP/CP: unequal token counts and sharply different margin distributions.
+        local = torch.tensor([[[1., 0.]], [[2., 0.]], [[3., 0.]]]) if rank == 0 else torch.tensor([[[100., 0.]]])
+        logging.set_active(True)
+        with logging.forward_scope():
+            observe(local, group=groups[rank])
+        stats = logging.collect(torch.device("cpu"), groups[rank], dist.group.WORLD, True)
+        expected = torch.quantile(torch.tensor([1., 2., 3., 100.], dtype=torch.float64), 0.999).item()
+        assert abs(stats["output_logits/top1_top2_margin_p999"] - expected) < 1e-7
+        assert stats["output_logits/top1_top2_margin_max"] == 100.0
+    finally:
+        dist.destroy_process_group()
+
+
+class TestOutputLogitLogging(unittest.TestCase):
+    def tearDown(self):
+        logging.set_active(False)
+
+    def collect(self):
+        return logging.collect(torch.device("cpu"), None, None, True)
+
+    def test_default_disabled_and_per_step_opt_in(self):
+        self.assertFalse(any(logging.should_log(s) for s in range(1, 1000)))
+        self.assertTrue(all(logging.should_log(s, 1) for s in range(1, 1000)))
+        self.assertFalse(logging.should_log(199, 200))
+        self.assertTrue(logging.should_log(200, 200))
+
+    def test_no_tensor_access_when_disabled(self):
+        logging.set_active(False)
+        with logging.forward_scope(), logging.loss_scope(None):
+            self.assertIsNone(logging.prepare_margin(object(), None))
+            logging.record_hidden(object(), None, None, False)
+            logging.record_ce(object(), object(), object(), None)
+
+    def test_stats_match_direct_fp32_reference(self):
+        x = torch.tensor([[[100., 0., -1.], [2., 1., 0.]], [[3., 1., -2.], [1., 1., 1.]]])
+        logging.set_active(True)
+        with logging.forward_scope():
+            observe(x)
+        stats = self.collect()
+        lse = x.logsumexp(-1)
+        margin = x.topk(2, -1).values.diff(dim=-1).neg().squeeze(-1)
+        self.assertEqual(stats["output_logits/max"], 100.0)
+        self.assertAlmostEqual(stats["output_logits/lse_mean"], lse.double().mean().item(), places=6)
+        self.assertAlmostEqual(stats["output_logits/lse_max"], lse.max().item(), places=6)
+        self.assertAlmostEqual(stats["output_logits/top1_top2_margin_p999"], torch.quantile(margin.double(), .999).item())
+        self.assertEqual(stats["output_logits/zero_loss_fraction"], .25)
+
+    def test_masked_zero_losses_do_not_count(self):
+        x = torch.tensor([[[100., 0.]], [[1., 0.]], [[100., 0.]]])
+        logging.set_active(True)
+        with logging.forward_scope():
+            observe(x, torch.tensor([[0., .5, 0.]]))
+        stats = self.collect()
+        self.assertEqual(stats["output_logits/zero_loss_fraction"], 0.)
+        self.assertEqual(stats["output_logits/max"], 1.)
+        self.assertEqual(stats["output_logits/top1_top2_margin_p999"], 1.)
+
+    def test_all_masked_omitted(self):
+        logging.set_active(True)
+        with logging.forward_scope():
+            observe(torch.tensor([[[float("nan"), 0.]]]), torch.zeros(1, 1))
+        self.assertEqual(self.collect(), {})
+
+    def test_hidden_token_l2_norm_and_mask(self):
+        hidden = torch.tensor([[[3., 4.]], [[0., 10.]], [[100., 0.]]])
+        logging.set_active(True)
+        with logging.forward_scope():
+            logging.record_hidden(hidden, torch.tensor([[1., 1., 0.]]), None, False)
+        stats = self.collect()
+        self.assertEqual(stats["output_logits/final_hidden_norm_mean"], 7.5)
+        self.assertEqual(stats["output_logits/final_hidden_norm_max"], 10.)
+
+    def test_rerun_and_scope_reset(self):
+        logging.set_active(True)
+        with logging.forward_scope():
+            observe(torch.tensor([[[100., 0.]]]))
+        logging.reset_attempt()
+        with logging.forward_scope():
+            observe(torch.tensor([[[1., 0.]]]))
+        observe(torch.tensor([[[999., 0.]]]))  # backward recompute: outside forward
+        self.assertEqual(self.collect()["output_logits/max"], 1.)
+
+    def test_mtp_unscoped_and_eval_losses_are_ignored(self):
+        logging.set_active(True)
+        with logging.forward_scope():
+            self.assertIsNone(logging.prepare_margin(object(), None))
+            with logging.loss_scope(None, enabled=False):
+                self.assertIsNone(logging.prepare_margin(object(), None))
+        self.assertEqual(self.collect(), {})
+
+    def test_exact_percentile_tail_merge(self):
+        g = torch.Generator().manual_seed(52)
+        for n in (1, 2, 999, 1000, 1001, 10000):
+            values = torch.randn(n, generator=g)
+            k = logging.percentile_tail_size(n)
+            tail = torch.cat([p.topk(min(k, p.numel())).values for p in values.tensor_split(7)])
+            expected = torch.quantile(values.double(), .999)
+            torch.testing.assert_close(logging.percentile_from_tail(tail, n), expected)
+
+    def test_logs_only_token_vectors_not_vocab(self):
+        x = torch.randn(5, 2, 100)
+        original = x.clone()
+        logging.set_active(True)
+        with logging.forward_scope():
+            observe(x)
+        self.assertEqual(sum(t.numel() for t in logging._margins), 10)
+        self.assertTrue(all(t.grad_fn is None for t in logging._margins))
+        self.assertIsNone(logging._loss_mask)
+        torch.testing.assert_close(x, original, rtol=0, atol=0)
+
+    def test_native_and_unfused_ce_losses_and_gradients_unchanged(self):
+        inputs = torch.tensor([[[100., 0., -2., -3.]], [[1., 2., 3., 4.]]], dtype=torch.bfloat16)
+        labels = torch.tensor([[0], [1]])
+        for fused in (False, True):
+            fn = ce_implementation(fused)
+            observations = []
+            for enabled in (False, True):
+                logging.set_active(enabled)
+                x = inputs.clone().requires_grad_()
+                with patch.object(dist, "all_reduce", lambda *args, **kwargs: None):
+                    with logging.forward_scope(), logging.loss_scope(torch.ones(1, 2)):
+                        loss = fn(x, labels)
+                    loss.sum().backward()
+                observations.append((loss.detach().clone(), x.grad.clone()))
+                if enabled:
+                    self.assertEqual(self.collect()["output_logits/zero_loss_fraction"], .5)
+            for a, b in zip(*observations):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "Gloo unavailable")
+    def test_distributed_tp_candidates_and_dp_percentile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mp.spawn(worker, args=(Path(tmp, "rendezvous").resolve().as_uri(),), nprocs=2, join=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
