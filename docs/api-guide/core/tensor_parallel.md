@@ -29,5 +29,5 @@ therefore reduces the non-target terms separately and computes
 - the loss as `softplus(log(sum_exp_others) - predicted_logit)`, and
 - the target gradient as `-sum_exp_others / sum_exp_logits`,
 
-which stay accurate at any confidence. Both sums come from one reduction per rank and are
+which preserve the small terms until exponential underflow. Both sums come from one reduction per rank and are
 all-reduced in the same call as before.

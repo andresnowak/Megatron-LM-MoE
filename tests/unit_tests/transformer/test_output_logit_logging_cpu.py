@@ -50,6 +50,8 @@ def ce_implementation(fused, group=None):
         "get_tensor_model_parallel_group": lambda: group,
         "get_tensor_model_parallel_rank": lambda: 0 if group is None else group.rank(),
         "get_tensor_model_parallel_world_size": lambda: 1 if group is None else group.size(),
+        "get_pg_rank": lambda pg: 0 if pg is None else pg.rank(),
+        "get_pg_size": lambda pg: 1 if pg is None else pg.size(),
         "VocabUtility": SimpleNamespace(
             vocab_range_from_per_partition_vocab_size=lambda size, rank, world: (size * rank, size * (rank + 1))
         ),
@@ -57,10 +59,17 @@ def ce_implementation(fused, group=None):
     extracted(base, "VocabParallelCrossEntropy", ns)
     if fused:
         base = "megatron/core/fusions/fused_cross_entropy.py"
+        ns.update({
+            "_gather_predicted_logits": ns["VocabParallelCrossEntropy"].gather_predicted_logits,
+            "_exp_logits_inplace": ns["VocabParallelCrossEntropy"].exp_logits_inplace,
+            "_scale_gradients_inplace": ns["VocabParallelCrossEntropy"].scale_gradients_inplace,
+        })
         for name in ("calculate_logits_max", "calculate_predicted_logits", "calculate_cross_entropy_loss", "calculate_gradients"):
             extracted(base, name, ns)
     cls = extracted(base, "_VocabParallelCrossEntropy", ns)
-    return lambda x, y: cls.apply(x, y, (SingleRank() if group is None else group) if fused else 0.0)
+    if fused:
+        return lambda x, y: cls.apply(x, y, SingleRank() if group is None else group)
+    return lambda x, y, smoothing=0.0: cls.apply(x, y, smoothing, group)
 
 
 def observe(logits, loss_mask=None, group=None, labels=None):
@@ -111,6 +120,18 @@ def worker(rank, rendezvous):
                     loss = fn(x, labels)
                 loss.sum().backward()
                 results.append((loss.detach().clone(), x.grad.clone()))
+                reference_logits = full.double().requires_grad_()
+                target_logit = reference_logits.gather(-1, labels.unsqueeze(-1))
+                competitors = (reference_logits - target_logit).scatter(
+                    -1, labels.unsqueeze(-1), -float("inf")
+                )
+                reference_loss = torch.nn.functional.softplus(competitors.logsumexp(-1))
+                reference_loss.sum().backward()
+                torch.testing.assert_close(loss.double(), reference_loss.detach(), rtol=1e-5, atol=1e-7)
+                torch.testing.assert_close(
+                    x.grad, reference_logits.grad.chunk(2, -1)[rank].to(x.dtype),
+                    rtol=.01, atol=1e-30,
+                )
                 if enabled:
                     stats = logging.collect(torch.device("cpu"), dist.group.WORLD, groups[rank], True)
                     assert abs(stats["output_logits/target_margin_max"] - expected_margins.max().item()) < 1e-5
@@ -271,9 +292,71 @@ class TestOutputLogitLogging(unittest.TestCase):
                     loss.sum().backward()
                 observations.append((loss.detach().clone(), x.grad.clone()))
                 if enabled:
-                    self.assertEqual(self.collect()["output_logits/zero_loss_fraction"], .5)
+                    self.assertEqual(self.collect()["output_logits/zero_loss_fraction"], 0.)
             for a, b in zip(*observations):
                 torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    def test_corrected_ce_preserves_confident_loss_and_target_gradient(self):
+        # The old CE returned zero loss/target gradient above the FP32 cliff.
+        for fused in (False, True):
+            for dtype in (torch.float32, torch.bfloat16, torch.float16):
+                logits = torch.zeros(6, 1, 16, dtype=dtype)
+                labels = torch.tensor([[0], [3], [5], [15], [9], [7]])
+                logits.scatter_(-1, labels.unsqueeze(-1),
+                                torch.tensor([5., 10., 17., 20., 40., 80.], dtype=dtype).view(6, 1, 1))
+                z = logits.double().requires_grad_()
+                target = z.gather(-1, labels.unsqueeze(-1))
+                others = (z - target).scatter(-1, labels.unsqueeze(-1), -float("inf"))
+                expected = torch.nn.functional.softplus(others.logsumexp(-1))
+                expected.sum().backward()
+                x = logits.clone().requires_grad_()
+                logging.set_active(False)
+                with patch.object(dist, "all_reduce", lambda *args, **kwargs: None):
+                    loss = ce_implementation(fused)(x, labels)
+                    loss.sum().backward()
+                torch.testing.assert_close(loss.double(), expected.detach(), rtol=1e-5, atol=0)
+                # FP16 legitimately underflows some tiny gradients when returned
+                # in the input dtype; compare against the same final cast.
+                torch.testing.assert_close(
+                    x.grad, z.grad.to(dtype),
+                    rtol=1e-5 if dtype == torch.float32 else .01, atol=0,
+                )
+                self.assertTrue((loss > 0).all())
+                if dtype != torch.float16:
+                    self.assertTrue((x.grad.gather(-1, labels.unsqueeze(-1)) < 0).all())
+                if dtype == torch.float32:
+                    self.assertTrue((x.grad.double().sum(-1).abs() <
+                                     1e-5 * z.grad.abs().sum(-1)).all())
+
+    def test_target_free_sum_restores_input_and_replays_exactly(self):
+        ns = {"torch": torch, "Tuple": Tuple}
+        cls = extracted("megatron/core/tensor_parallel/cross_entropy.py", "VocabParallelCrossEntropy", ns)
+        exp = torch.tensor([[[1., 1e-9, 1e-10]], [[.1, .2, .3]]])
+        before = exp.clone()
+        mask, indices = torch.tensor([[False], [True]]), torch.tensor([0, 0])
+        sums = cls.sum_exp_logits_excluding_target(exp, mask, indices)
+        torch.testing.assert_close(exp, before, rtol=0, atol=0)
+        expected = before.clone()
+        expected[0, 0, 0] = 0.
+        torch.testing.assert_close(sums[1], expected.sum(-1), rtol=0, atol=0)
+        repeat = cls.sum_exp_logits_excluding_target(exp, mask, indices)
+        for first, second in zip(sums, repeat):
+            torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+    def test_corrected_label_smoothing_matches_fp64(self):
+        x = torch.tensor([[[20., 0., 0., 0.]], [[1., 3., -1., 0.]]], requires_grad=True)
+        labels = torch.tensor([[0], [2]])
+        z = x.detach().double().requires_grad_()
+        logp = z.log_softmax(-1)
+        smoothing = .1 * 4 / 3
+        expected = -(1 - smoothing) * logp.gather(-1, labels.unsqueeze(-1)).squeeze(-1) - smoothing * logp.mean(-1)
+        expected.sum().backward()
+        logging.set_active(False)
+        with patch.object(dist, "all_reduce", lambda *args, **kwargs: None):
+            loss = ce_implementation(False)(x, labels, .1)
+            loss.sum().backward()
+        torch.testing.assert_close(loss.double(), expected.detach(), rtol=1e-5, atol=1e-7)
+        torch.testing.assert_close(x.grad.double(), z.grad, rtol=1e-5, atol=1e-7)
 
     @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "Gloo unavailable")
     def test_distributed_tp_candidates_and_dp_percentile(self):

@@ -38,7 +38,14 @@ It uses the actual label, so confidently incorrect predictions have negative mar
 It replaces the previous `top1_top2_margin_*` metrics with new keys: their historical
 values are not comparable. The cliff fraction is a theoretical risk indicator,
 not a measurement of backward gradients; actual CE rounding depends on the reduction.
-`zero_loss_fraction` continues to measure the actual existing CE, not a corrected loss.
+`zero_loss_fraction` measures the actual training CE. This branch now includes the
+native fused/unfused CE correction from [NVIDIA/Megatron-LM #8477](https://github.com/NVIDIA/Megatron-LM/pull/8477):
+non-target exponentials are summed separately, loss uses `softplus`, and the target
+gradient uses `-sum_exp_others / sum_exp_logits`. This correction is active even
+when diagnostics are disabled. Consequently, zero-loss values before and after
+the fix are not directly comparable. The target-margin cliff fraction still
+measures exposure to the old formula's rounding regime; a nonzero fraction does
+not mean the corrected CE is collapsing. TE CE and attention are unaffected.
 
 ## Cost and precision
 
@@ -70,7 +77,7 @@ Logging is disabled with a one-time warning for TE CE, CUDA graphs, or MoE EP
 communication-overlap schedules: those paths require separate integration to
 observe their internal intermediates/split execution safely. The current
 implementation supports standard GPT native/unfused CE with CPU expert
-offloading. Existing loss values and backward formulas are unchanged.
+offloading. Diagnostics do not modify the corrected loss or its gradients.
 
 ## Validation
 
