@@ -3682,9 +3682,9 @@ def train(
         if output_logit_logging.is_active():
             output_stats = output_logit_logging.collect(
                 device=torch.device('cuda', torch.cuda.current_device()),
-                tp_group=parallel_state.get_tensor_model_parallel_group(),
-                dp_cp_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
-                is_last_stage=parallel_state.is_pipeline_last_stage(ignore_virtual=True),
+                tp_group=mpu.get_tensor_model_parallel_group(),
+                dp_cp_group=mpu.get_data_parallel_group(with_context_parallel=True),
+                is_last_stage=mpu.is_pipeline_last_stage(ignore_virtual=True),
             )
             md_gain_stats = {**(md_gain_stats or {}), **output_stats}
         if args.tensorboard_log_interval and iteration % args.tensorboard_log_interval == 0:
