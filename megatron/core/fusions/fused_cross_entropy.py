@@ -93,7 +93,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         """
         vocab_parallel_logits, logits_max = calculate_logits_max(vocab_parallel_logits)
         torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
-        diagnostic_margin = output_logit_logging.prepare_margin(vocab_parallel_logits, tp_group)
+        diagnostic_margin = output_logit_logging.prepare_margin(vocab_parallel_logits, target, tp_group)
 
         # Get the partition's vocab indices
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size

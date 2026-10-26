@@ -23,7 +23,8 @@ token, rather than reweighting the diagnostic distribution.
 | `max` | Maximum output logit over valid tokens and all TP vocabulary shards |
 | `lse_mean`, `lse_max` | Mean/maximum per-token `log(sum(exp(logits)))` |
 | `zero_loss_fraction` | Fraction of valid tokens whose actual FP32 CE loss equals exactly zero, before training loss scaling/masking |
-| `top1_top2_margin_p999`, `top1_top2_margin_max` | Exact pooled 99.9th percentile/maximum of largest minus second-largest vocabulary logit |
+| `target_margin_p999`, `target_margin_max` | Exact pooled 99.9th percentile/maximum of `z_target - logsumexp(z_non_target)`, the margin in Barron et al. |
+| `target_margin_gt_fp32_cliff_fraction` | Fraction of valid tokens with target margin greater than `24*ln(2)` (approximately 16.636), the theoretical FP32 rounding cliff |
 | `final_hidden_norm_mean`, `final_hidden_norm_max` | Mean/maximum per-token L2 norm of the final hidden vector supplied to the output projection (after the decoder final norm) |
 
 Means are token-weighted across microbatches and DP/CP ranks. TP replicas count
@@ -32,13 +33,24 @@ sequence parallelism is active; otherwise only TP rank zero counts them.
 MTP/unscoped cross-entropy calls and backward recomputation are excluded. Every
 rerun clears the previous attempt's diagnostics.
 
+The margin follows Equation (2) of [A Fix for Softmax and Cross-Entropy](https://arxiv.org/html/2610.31642v1).
+It uses the actual label, so confidently incorrect predictions have negative margins.
+It replaces the previous `top1_top2_margin_*` metrics with new keys: their historical
+values are not comparable. The cliff fraction is a theoretical risk indicator,
+not a measurement of backward gradients; actual CE rounding depends on the reduction.
+`zero_loss_fraction` continues to measure the actual existing CE, not a corrected loss.
+
 ## Cost and precision
 
 Native fused and unfused vocabulary-parallel CE already produce FP32 logits,
 global token maxima, and global exponential sums. Diagnostics reuse those
-values before CE overwrites logits. The only additional vocabulary scan is
-local top-2; its TP collective exchanges two candidates per token, not full
-vocabulary tensors. LSE and zero-loss statistics require only token-sized work.
+values before CE overwrites logits. To measure the paper's margin even when CE
+has rounded its denominator to one, diagnostics separately exclude the target
+and make two vocabulary passes: a non-target maximum, then a shifted exponential
+sum. Three TP reductions combine target logits, non-target maxima, and sums;
+only token vectors cross the network. Each scratch tile is bounded to about 32 MiB
+or one vocabulary row if larger. This costs more than the old top-two gap and
+only runs on sampled steps. LSE and zero-loss statistics reuse CE intermediates.
 
 No full logits or hidden states are retained. Each output-stage TP0 rank retains
 one FP32 margin per local token until step end. To compute an **exact** pooled
@@ -69,6 +81,7 @@ python tests/unit_tests/transformer/test_output_logit_logging_cpu.py
 ```
 
 Standalone CPU tests cover the native and unfused production CE function bodies,
-loss/gradient invariance, masking, zero losses, hidden norms, rerun/scope reset,
+loss/gradient invariance including real TP2 collectives, masking, zero losses,
+wrong targets, tied logits, large margins, hidden norms, rerun/scope reset,
 exact tail percentiles, and two-process Gloo TP/DP reductions. CUDA/NCCL,
 offloading integration and throughput additionally need cluster validation.

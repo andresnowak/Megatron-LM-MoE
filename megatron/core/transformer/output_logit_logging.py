@@ -8,6 +8,7 @@ retained for an exact distributed percentile, plus scalar sums and maxima.
 
 from contextlib import contextmanager
 from functools import wraps
+import math
 from typing import Callable, Dict, Iterator, Optional
 
 import torch
@@ -20,9 +21,13 @@ _sums: Optional[torch.Tensor] = None
 _maxima: Optional[torch.Tensor] = None
 _margins: list[torch.Tensor] = []
 _CHUNK_ELEMENTS = 262144
+# Larger vocabulary tiles avoid thousands of tiny launches per microbatch.
+_MARGIN_CHUNK_ELEMENTS = 8388608  # 32 MiB FP32 scratch per tile
+FP32_PRECISION_CLIFF = 24 * math.log(2.0)
 
-# sums: token count, LSE sum, zero-loss count, hidden-token count, hidden-norm sum
-# maxima: logit max, LSE max, top1-top2 margin max, hidden-norm max, margin p99.9
+# sums: token count, LSE sum, zero-loss count, hidden-token count, hidden-norm sum,
+#       count of target-versus-rest margins above the theoretical FP32 cliff
+# maxima: logit max, LSE max, target margin max, hidden-norm max, margin p99.9
 
 
 def should_log(step: int, interval: int = 0) -> bool:
@@ -94,7 +99,7 @@ def _rank(group) -> int:
 def _initialize(device: torch.device) -> None:
     global _sums, _maxima
     if _sums is None:
-        _sums = torch.zeros(5, dtype=torch.float64, device=device)
+        _sums = torch.zeros(6, dtype=torch.float64, device=device)
         _maxima = torch.full((5,), float("-inf"), dtype=torch.float64, device=device)
 
 
@@ -107,25 +112,59 @@ def _valid(shape: tuple, device: torch.device) -> torch.Tensor:
     return mask.to(device=device) > 0
 
 
-def prepare_margin(logits: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
-    """Get global top1-top2 from FP32 vocab shards BEFORE CE overwrites logits.
+def prepare_margin(logits: torch.Tensor, target: torch.Tensor, tp_group) -> Optional[torch.Tensor]:
+    """Compute Barron et al.'s m = z_target - LSE(non-target logits).
 
     Every TP rank participates; only rank zero keeps the resulting token vector.
-    The extra collective exchanges two values per token/rank, never the vocabulary.
+    Exclude the target BEFORE summation: subtracting its exponential from CE's
+    rounded denominator would lose precisely the small values we need to measure.
+    Two bounded-workspace passes find the non-target maximum and exponential sum.
+    TP communicates token vectors only; model logits are never modified.
     """
     if not (_active and _in_forward and _in_loss):
         return None
     with torch.no_grad():
-        top = logits.detach().topk(min(2, logits.shape[-1]), dim=-1).values
-        if top.shape[-1] == 1:
-            top = torch.cat((top, torch.full_like(top, float("-inf"))), dim=-1)
+        vocab = logits.shape[-1]
+        flat = logits.detach().reshape(-1, vocab)
+        labels = target.reshape(-1)
+        offset = _rank(tp_group) * vocab
+        local_labels = labels - offset
+        owned = (local_labels >= 0) & (local_labels < vocab)
+        indices = local_labels.clamp(0, vocab - 1).long()
+        rows = max(1, _MARGIN_CHUNK_ELEMENTS // vocab)
+        target_logits = torch.empty(flat.shape[0], device=logits.device, dtype=torch.float32)
+        rest_max = torch.empty_like(target_logits)
+
+        def excluding_target(start, end):
+            chunk = flat[start:end].to(dtype=torch.float32, copy=True)
+            index = indices[start:end, None]
+            selected = chunk.gather(1, index)
+            chunk.scatter_(1, index, torch.where(owned[start:end, None], -float("inf"), selected))
+            return chunk, selected.squeeze(-1)
+
+        for start in range(0, flat.shape[0], rows):
+            end = min(start + rows, flat.shape[0])
+            chunk, selected = excluding_target(start, end)
+            target_logits[start:end] = torch.where(owned[start:end], selected, 0.0)
+            rest_max[start:end] = chunk.amax(dim=-1)
+            del chunk, selected
         if _size(tp_group) > 1:
-            shards = [torch.empty_like(top) for _ in range(_size(tp_group))]
-            torch.distributed.all_gather(shards, top, group=tp_group)
-            top = torch.cat(shards, dim=-1).topk(2, dim=-1).values
+            torch.distributed.all_reduce(target_logits, group=tp_group)
+            torch.distributed.all_reduce(rest_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+        # Handle a vocabulary with no finite competitors without -inf - -inf.
+        shift = torch.where(rest_max == -float("inf"), 0.0, rest_max)
+        rest_sum = torch.empty_like(target_logits)
+        for start in range(0, flat.shape[0], rows):
+            end = min(start + rows, flat.shape[0])
+            chunk, _ = excluding_target(start, end)
+            chunk.sub_(shift[start:end, None]).exp_()
+            rest_sum[start:end] = chunk.sum(dim=-1)
+            del chunk
+        if _size(tp_group) > 1:
+            torch.distributed.all_reduce(rest_sum, group=tp_group)
         if _rank(tp_group) != 0:
             return None
-        return top[..., 0] - top[..., 1]
+        return (target_logits - shift - rest_sum.log()).reshape(target.shape)
 
 
 def record_ce(
@@ -146,6 +185,7 @@ def record_ce(
         _sums[0].add_(valid.sum())
         _sums[1].add_(torch.where(valid, lse, 0.0).sum(dtype=torch.float64))
         _sums[2].add_(((loss.detach() == 0) & valid).sum())
+        _sums[5].add_(((margin > FP32_PRECISION_CLIFF) & valid).sum())
         maxima = torch.stack(
             [torch.where(valid, t.detach(), float("-inf")).amax()
              for t in (logits_max, lse, margin)]
@@ -241,8 +281,9 @@ def collect(device: torch.device, tp_group, dp_cp_group, is_last_stage: bool) ->
             "output_logits/lse_mean": counts[1] / token_count,
             "output_logits/lse_max": maxima[1],
             "output_logits/zero_loss_fraction": counts[2] / token_count,
-            "output_logits/top1_top2_margin_max": maxima[2],
-            "output_logits/top1_top2_margin_p999": maxima[4],
+            "output_logits/target_margin_max": maxima[2],
+            "output_logits/target_margin_p999": maxima[4],
+            "output_logits/target_margin_gt_fp32_cliff_fraction": counts[5] / token_count,
         })
     if counts[3]:
         stats.update({

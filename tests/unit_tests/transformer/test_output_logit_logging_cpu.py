@@ -42,14 +42,14 @@ def extracted(path, name, namespace):
     return namespace[name]
 
 
-def ce_implementation(fused):
+def ce_implementation(fused, group=None):
     """Execute the actual changed CE implementations, including backward."""
     base = "megatron/core/tensor_parallel/cross_entropy.py"
     ns = {
         "torch": torch, "Tuple": Tuple, "output_logit_logging": logging,
-        "get_tensor_model_parallel_group": lambda: None,
-        "get_tensor_model_parallel_rank": lambda: 0,
-        "get_tensor_model_parallel_world_size": lambda: 1,
+        "get_tensor_model_parallel_group": lambda: group,
+        "get_tensor_model_parallel_rank": lambda: 0 if group is None else group.rank(),
+        "get_tensor_model_parallel_world_size": lambda: 1 if group is None else group.size(),
         "VocabUtility": SimpleNamespace(
             vocab_range_from_per_partition_vocab_size=lambda size, rank, world: (size * rank, size * (rank + 1))
         ),
@@ -60,15 +60,17 @@ def ce_implementation(fused):
         for name in ("calculate_logits_max", "calculate_predicted_logits", "calculate_cross_entropy_loss", "calculate_gradients"):
             extracted(base, name, ns)
     cls = extracted(base, "_VocabParallelCrossEntropy", ns)
-    return lambda x, y: cls.apply(x, y, SingleRank() if fused else 0.0)
+    return lambda x, y: cls.apply(x, y, (SingleRank() if group is None else group) if fused else 0.0)
 
 
-def observe(logits, loss_mask=None, group=None):
+def observe(logits, loss_mask=None, group=None, labels=None):
+    if labels is None:
+        labels = torch.zeros(logits.shape[:-1], dtype=torch.long)
     with logging.loss_scope(loss_mask):
-        margin = logging.prepare_margin(logits, group)
+        margin = logging.prepare_margin(logits, labels, group)
         maximum = logits.max(-1).values
         sum_exp = (logits - maximum.unsqueeze(-1)).exp().sum(-1)
-        target = logits[..., 0]
+        target = logits.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
         loss = sum_exp.log() + maximum - target
         logging.record_ce(maximum, sum_exp, loss, margin)
 
@@ -77,19 +79,43 @@ def worker(rank, rendezvous):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=2)
     groups = [dist.new_group([0]), dist.new_group([1])]
     try:
-        # TP: global runner-up can be in another vocab shard, including a tie.
-        full = torch.tensor([[[10., 1., 9., 0.]], [[5., 0., 5., -1.]]])
+        # TP: labels on both shards, a confidently wrong prediction, and collapse.
+        full = torch.tensor([[[10., 1., 9., 0.]], [[5., 0., 5., -1.]],
+                             [[30., 0., 0., 0.]], [[0., 0., 0., 120.]]])
+        labels = torch.tensor([[0], [3], [0], [3]])
+        others = full.double().scatter(-1, labels.unsqueeze(-1), -float("inf"))
+        expected_margins = full.double().gather(-1, labels.unsqueeze(-1)).squeeze(-1) - others.logsumexp(-1)
         logging.set_active(True)
         with logging.forward_scope(), logging.loss_scope(None):
-            margin = logging.prepare_margin(full.chunk(2, -1)[rank], dist.group.WORLD)
+            margin = logging.prepare_margin(full.chunk(2, -1)[rank], labels, dist.group.WORLD)
             if rank == 0:
-                torch.testing.assert_close(margin, torch.tensor([[1.], [0.]]))
+                torch.testing.assert_close(margin.double(), expected_margins)
             maximum = full.max(-1).values
             sums = (full - maximum.unsqueeze(-1)).exp().sum(-1)
             logging.record_ce(maximum, sums, sums.log(), margin)
         stats = logging.collect(torch.device("cpu"), dist.group.WORLD, groups[rank], True)
-        assert stats["output_logits/max"] == 10.0
-        assert abs(stats["output_logits/top1_top2_margin_p999"] - 0.999) < 1e-7
+        assert stats["output_logits/max"] == 120.0
+        expected = torch.quantile(expected_margins.flatten(), .999).item()
+        assert abs(stats["output_logits/target_margin_p999"] - expected) < 1e-5
+        assert stats["output_logits/target_margin_gt_fp32_cliff_fraction"] == .5
+
+        # Exercise production fused/unfused CE with real TP2 collectives, and
+        # verify that enabling diagnostics leaves the existing training unchanged.
+        for fused in (False, True):
+            fn = ce_implementation(fused, dist.group.WORLD)
+            results = []
+            for enabled in (False, True):
+                logging.set_active(enabled)
+                x = full.chunk(2, -1)[rank].to(torch.bfloat16).contiguous().requires_grad_()
+                with logging.forward_scope(), logging.loss_scope(None):
+                    loss = fn(x, labels)
+                loss.sum().backward()
+                results.append((loss.detach().clone(), x.grad.clone()))
+                if enabled:
+                    stats = logging.collect(torch.device("cpu"), dist.group.WORLD, groups[rank], True)
+                    assert abs(stats["output_logits/target_margin_max"] - expected_margins.max().item()) < 1e-5
+            for before, after in zip(*results):
+                torch.testing.assert_close(before, after, rtol=0, atol=0)
 
         # DP/CP: unequal token counts and sharply different margin distributions.
         local = torch.tensor([[[1., 0.]], [[2., 0.]], [[3., 0.]]]) if rank == 0 else torch.tensor([[[100., 0.]]])
@@ -98,8 +124,8 @@ def worker(rank, rendezvous):
             observe(local, group=groups[rank])
         stats = logging.collect(torch.device("cpu"), groups[rank], dist.group.WORLD, True)
         expected = torch.quantile(torch.tensor([1., 2., 3., 100.], dtype=torch.float64), 0.999).item()
-        assert abs(stats["output_logits/top1_top2_margin_p999"] - expected) < 1e-7
-        assert stats["output_logits/top1_top2_margin_max"] == 100.0
+        assert abs(stats["output_logits/target_margin_p999"] - expected) < 1e-7
+        assert stats["output_logits/target_margin_max"] == 100.0
     finally:
         dist.destroy_process_group()
 
@@ -120,7 +146,7 @@ class TestOutputLogitLogging(unittest.TestCase):
     def test_no_tensor_access_when_disabled(self):
         logging.set_active(False)
         with logging.forward_scope(), logging.loss_scope(None):
-            self.assertIsNone(logging.prepare_margin(object(), None))
+            self.assertIsNone(logging.prepare_margin(object(), object(), None))
             logging.record_hidden(object(), None, None, False)
             logging.record_ce(object(), object(), object(), None)
 
@@ -131,12 +157,13 @@ class TestOutputLogitLogging(unittest.TestCase):
             observe(x)
         stats = self.collect()
         lse = x.logsumexp(-1)
-        margin = x.topk(2, -1).values.diff(dim=-1).neg().squeeze(-1)
+        margin = x[..., 0] - x[..., 1:].logsumexp(-1)
         self.assertEqual(stats["output_logits/max"], 100.0)
         self.assertAlmostEqual(stats["output_logits/lse_mean"], lse.double().mean().item(), places=6)
         self.assertAlmostEqual(stats["output_logits/lse_max"], lse.max().item(), places=6)
-        self.assertAlmostEqual(stats["output_logits/top1_top2_margin_p999"], torch.quantile(margin.double(), .999).item())
+        self.assertAlmostEqual(stats["output_logits/target_margin_p999"], torch.quantile(margin.double(), .999).item(), places=5)
         self.assertEqual(stats["output_logits/zero_loss_fraction"], .25)
+        self.assertEqual(stats["output_logits/target_margin_gt_fp32_cliff_fraction"], .25)
 
     def test_masked_zero_losses_do_not_count(self):
         x = torch.tensor([[[100., 0.]], [[1., 0.]], [[100., 0.]]])
@@ -146,7 +173,7 @@ class TestOutputLogitLogging(unittest.TestCase):
         stats = self.collect()
         self.assertEqual(stats["output_logits/zero_loss_fraction"], 0.)
         self.assertEqual(stats["output_logits/max"], 1.)
-        self.assertEqual(stats["output_logits/top1_top2_margin_p999"], 1.)
+        self.assertEqual(stats["output_logits/target_margin_p999"], 1.)
 
     def test_all_masked_omitted(self):
         logging.set_active(True)
@@ -176,9 +203,9 @@ class TestOutputLogitLogging(unittest.TestCase):
     def test_mtp_unscoped_and_eval_losses_are_ignored(self):
         logging.set_active(True)
         with logging.forward_scope():
-            self.assertIsNone(logging.prepare_margin(object(), None))
+            self.assertIsNone(logging.prepare_margin(object(), object(), None))
             with logging.loss_scope(None, enabled=False):
-                self.assertIsNone(logging.prepare_margin(object(), None))
+                self.assertIsNone(logging.prepare_margin(object(), object(), None))
         self.assertEqual(self.collect(), {})
 
     def test_exact_percentile_tail_merge(self):
@@ -200,6 +227,34 @@ class TestOutputLogitLogging(unittest.TestCase):
         self.assertTrue(all(t.grad_fn is None for t in logging._margins))
         self.assertIsNone(logging._loss_mask)
         torch.testing.assert_close(x, original, rtol=0, atol=0)
+
+    def test_paper_margin_handles_wrong_targets_ties_and_tiny_competitors(self):
+        x = torch.tensor([[[18., 0., 0.]], [[120., 0., 0.]],
+                          [[20., 0., 0.]], [[1., 1., 1.]], [[-120., -121., -122.]]])
+        labels = torch.tensor([[0], [0], [1], [2], [2]])
+        original = x.clone()
+        others = x.double().scatter(-1, labels.unsqueeze(-1), -float("inf"))
+        reference = x.double().gather(-1, labels.unsqueeze(-1)).squeeze(-1) - others.logsumexp(-1)
+        logging.set_active(True)
+        # Force multiple workspace chunks to check chunk boundaries as well.
+        with patch.object(logging, "_MARGIN_CHUNK_ELEMENTS", 6):
+            with logging.forward_scope(), logging.loss_scope(None):
+                margin = logging.prepare_margin(x, labels, None)
+        torch.testing.assert_close(margin.double(), reference)
+        torch.testing.assert_close(x, original, rtol=0, atol=0)
+        self.assertLess(margin[2].item(), 0.)  # Confidently wrong is not collapse.
+        self.assertTrue(torch.isfinite(margin).all())
+
+    def test_many_competitors_are_not_a_top_two_gap(self):
+        x = torch.zeros(1, 1, 1001)
+        x[..., 0] = 20.
+        logging.set_active(True)
+        with logging.forward_scope():
+            observe(x)
+        stats = self.collect()
+        self.assertAlmostEqual(stats["output_logits/target_margin_max"], 20. - torch.log(torch.tensor(1000.)).item(), places=5)
+        self.assertEqual(stats["output_logits/target_margin_gt_fp32_cliff_fraction"], 0.)
+        self.assertNotIn("output_logits/top1_top2_margin_max", stats)
 
     def test_native_and_unfused_ce_losses_and_gradients_unchanged(self):
         inputs = torch.tensor([[[100., 0., -2., -3.]], [[1., 2., 3., 4.]]], dtype=torch.bfloat16)
