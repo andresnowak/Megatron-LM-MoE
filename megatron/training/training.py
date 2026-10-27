@@ -194,6 +194,8 @@ from megatron.core.optimizer.muon_logging import (
     collect_muon_stats,
 )
 from megatron.core.transformer.moe import router_input_logging
+from megatron.core.transformer import activation_norm_logging
+from megatron.core.transformer import output_logit_logging
 from megatron.core.optimizer.router_update_logging import (
     collect_router_update_stats,
     pop_router_update_stats,
@@ -1951,6 +1953,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         from megatron.training.nan_debug import nan_debug_new_step
         # Reset diagnostics for every attempt, including reruns of the same step.
         nan_debug_new_step(iteration + 1, model)
+        activation_norm_logging.reset_attempt()
+        output_logit_logging.reset_attempt()
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -2006,8 +2010,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
         pp_seq_length, pp_micro_batch_size = _pipeline_shape_args(args)
+        diagnostic_forward_step = forward_step_func
+        if activation_norm_logging.is_active():
+            diagnostic_forward_step = activation_norm_logging.wrap_forward_step(diagnostic_forward_step)
+        if output_logit_logging.is_active():
+            diagnostic_forward_step = output_logit_logging.wrap_forward_step(diagnostic_forward_step)
         losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
+            forward_step_func=diagnostic_forward_step,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=get_num_microbatches(),
@@ -3488,6 +3497,36 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
+            log_activation_norms = activation_norm_logging.should_log(
+                iteration + 1, args.activation_norm_log_interval
+            )
+            if log_activation_norms and (
+                config.cuda_graph_impl != "none" or config.overlap_moe_expert_parallel_comm
+            ):
+                if not getattr(args, '_activation_norm_unsupported_warned', False):
+                    print_rank_0(
+                        "WARNING: activation norm logging requires CUDA graphs and "
+                        "MoE EP communication overlap to be disabled; skipping diagnostics."
+                    )
+                    args._activation_norm_unsupported_warned = True
+                log_activation_norms = False
+            activation_norm_logging.set_active(log_activation_norms)
+            log_output_logits = output_logit_logging.should_log(
+                iteration + 1, args.output_logit_log_interval
+            )
+            if log_output_logits and (
+                config.cuda_graph_impl != "none"
+                or config.overlap_moe_expert_parallel_comm
+                or (config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl != 'native')
+            ):
+                if not getattr(args, '_output_logit_unsupported_warned', False):
+                    print_rank_0(
+                        "WARNING: output-logit diagnostics require native/unfused CE, "
+                        "CUDA graphs off, and MoE EP communication overlap off; skipping."
+                    )
+                    args._output_logit_unsupported_warned = True
+                log_output_logits = False
+            output_logit_logging.set_active(log_output_logits)
             # Router-input diagnostics: record during this step's forwards; collected below.
             log_router_input = bool(
                 args.router_input_log_interval
@@ -3634,6 +3673,20 @@ def train(
             )
             if router_input_stats:
                 md_gain_stats = {**(md_gain_stats or {}), **router_input_stats}
+        if activation_norm_logging.is_active():
+            activation_stats = activation_norm_logging.collect(
+                args.num_layers,
+                device=torch.device('cuda', torch.cuda.current_device()),
+            )
+            md_gain_stats = {**(md_gain_stats or {}), **activation_stats}
+        if output_logit_logging.is_active():
+            output_stats = output_logit_logging.collect(
+                device=torch.device('cuda', torch.cuda.current_device()),
+                tp_group=mpu.get_tensor_model_parallel_group(),
+                dp_cp_group=mpu.get_data_parallel_group(with_context_parallel=True),
+                is_last_stage=mpu.is_pipeline_last_stage(ignore_virtual=True),
+            )
+            md_gain_stats = {**(md_gain_stats or {}), **output_stats}
         if args.tensorboard_log_interval and iteration % args.tensorboard_log_interval == 0:
             group_lrs = _per_group_learning_rates(optimizer)
             if group_lrs:

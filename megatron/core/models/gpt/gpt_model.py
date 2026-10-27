@@ -24,6 +24,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.transformer import output_logit_logging
 from megatron.core.transformer.enums import CudaGraphScope, ModelType
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
@@ -678,6 +679,12 @@ class GPTModel(LanguageModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
+        if self.training and labels is not None:
+            output_logit_logging.record_hidden(
+                hidden_states, loss_mask, self.pg_collection.tp,
+                sequence_parallel=self.output_layer.sequence_parallel,
+            )
+
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
@@ -710,7 +717,8 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        with output_logit_logging.loss_scope(loss_mask, enabled=self.training):
+            loss = self.compute_language_model_loss(labels, logits)
 
         return loss
 

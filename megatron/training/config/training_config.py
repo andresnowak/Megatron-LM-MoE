@@ -247,6 +247,16 @@ class LoggerConfig:
     largest input channel and its pre-MLP RMSNorm gain, channel concentration, logsumexp
     distribution) and the pre-MLP RMSNorm gain statistics. Disabled when unset."""
 
+    activation_norm_log_interval: int = 0
+    """Every N steps log globally pooled per-layer residual-input, attention-output,
+    and MLP-output RMS. Set 0 to disable. Requires eager execution without expert
+    parallel communication overlap; no activation tensors are retained."""
+
+    output_logit_log_interval: int = 0
+    """Every N steps log primary GPT output-logit/LSE statistics, exact-zero CE loss
+    fraction, top1-top2 margin p99.9/max, and final hidden token L2 norm mean/max.
+    Set 1 for per-step logging, 0 (default) to disable. Native/unfused CE only."""
+
     router_diag_layers: list[int] | None = None
     """0-based global layer indices to restrict router-input / RMSNorm-gain logging to (e.g. 3).
     All layers when unset."""
